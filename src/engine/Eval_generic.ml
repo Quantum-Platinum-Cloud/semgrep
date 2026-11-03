@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2019-2022 r2c
+ * Copyright (C) 2019-2022 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -16,8 +16,7 @@ open Common
 module G = AST_generic
 module MV = Metavariable
 module J = JSON
-
-let logger = Logging.get_logger [ __MODULE__ ]
+module Log = Log_engine.Log
 
 (*****************************************************************************)
 (* Prelude *)
@@ -37,11 +36,9 @@ let logger = Logging.get_logger [ __MODULE__ ]
 (*****************************************************************************)
 (* Types *)
 (*****************************************************************************)
-
-(* This is the (partially parsed/evaluated) content of a metavariable *)
 type value =
   | Bool of bool
-  | Int of int
+  | Int of int64
   | Float of float
   | String of string (* string without the enclosing '"' *)
   | List of value list
@@ -53,7 +50,16 @@ type value =
 (* less: Id of string (* simpler to merge with AST *) *)
 [@@deriving show]
 
-type env = { mvars : (MV.mvar, value) Hashtbl.t; constant_propagation : bool }
+type env = {
+  mvars : (MV.mvar, value) Base.Hashtbl.t;
+  constant_propagation : bool;
+  file : Fpath.t;
+      (** The file that we are currently matching the AST of. We need this so that
+        `eval` can call the `Metavariable_regex` logic, whcih needs to produce
+        matches that have position data localized to the originating file,
+        rather than the originating match.
+      *)
+}
 
 (* we restrict ourselves to simple expressions for now *)
 type code = AST_generic.expr
@@ -64,8 +70,8 @@ exception NotInEnv of Metavariable.mvar
 (*****************************************************************************)
 (* JSON Parsing *)
 (*****************************************************************************)
-let metavar_of_json s = function
-  | J.Int i -> Int i
+let metavar_of_json s : J.t -> value = function
+  | J.Int i -> Int (Int64.of_int i)
   | J.Bool b -> Bool b
   | J.String s -> String s
   | J.Float f -> Float f
@@ -76,33 +82,34 @@ let metavar_of_json s = function
  * so this format is not used anymore in semgrep-python, but we still
  * use it for some of our regression tests in tests/eval/.
  *)
-let parse_json file =
-  let json = JSON.load_json file in
+let parse_json (file : string) : env * code =
+  let json = UChan.with_open_in (Fpath.v file) JSON.json_of_chan in
   match json with
   | J.Object xs -> (
-      match Common.sort_by_key_lowfirst xs with
+      match Assoc.sort_by_key_lowfirst xs with
       | [
        ("code", J.String code);
        ("language", J.String lang);
        ("metavars", J.Object xs);
       ] ->
           let lang =
-            try Hashtbl.find Lang.lang_map lang with
+            try ROHashtbl.Base.find Lang.lang_map lang with
             | Not_found -> failwith (spf "unsupported language %s" lang)
           in
           (* less: could also use Parse_pattern *)
           let code =
             match Parse_pattern.parse_pattern lang code with
-            | G.E e -> e
+            | Ok (G.E e) -> e
             | _ -> failwith "only expressions are supported"
           in
           let metavars =
-            xs |> Common.map (fun (s, json) -> (s, metavar_of_json s json))
+            xs |> List.map (fun (s, json) -> (s, metavar_of_json s json))
           in
           let env =
             {
-              mvars = Common.hash_of_list metavars;
+              mvars = Hashtbl_.Base.hash_of_list metavars;
               constant_propagation = true;
+              file = Fpath.v file;
             }
           in
           (env, code)
@@ -114,35 +121,122 @@ let parse_json file =
 (*****************************************************************************)
 
 (* alt: could use exit code, or return JSON *)
-let print_result xopt =
+let print_result (xopt : value option) =
   match xopt with
-  | None -> pr "NONE"
+  (* nosem *)
+  | None -> UCommon.pr "NONE"
   | Some v -> (
       match v with
-      | Bool b -> pr (string_of_bool b)
+      (* nosem *)
+      | Bool b -> UCommon.pr (string_of_bool b)
       (* allow to abuse int to encode boolean ... ugly C tradition *)
-      | Int 0 -> pr (string_of_bool false)
-      | Int _ -> pr (string_of_bool true)
-      | _ -> pr "NONE")
-  [@@action]
+      (* nosem *)
+      | Int 0L -> UCommon.pr (string_of_bool false)
+      (* nosem *)
+      | Int _ -> UCommon.pr (string_of_bool true)
+      (* nosem *)
+      | _ -> UCommon.pr "NONE")
+[@@action]
 
 (*****************************************************************************)
 (* Eval algorithm *)
 (*****************************************************************************)
 
-let value_of_lit ~code x =
+(* Helper function to convert string date to Epoch time, currently supports only yyyy-mm-dd format *)
+let string_to_date s code : value =
+  let yyyy_mm_dd = String.split_on_char '-' s in
+  match yyyy_mm_dd with
+  | [ y; m; d ] -> (
+      match (int_of_string_opt y, int_of_string_opt m, int_of_string_opt d) with
+      | Some yv, Some mv, Some dv when CalendarLib.Date.is_valid_date yv mv dv
+        ->
+          (*ok to put in arbitrary values for last 3 arguments since they are ignored *)
+          let time : Unix.tm =
+            {
+              tm_sec = 0;
+              tm_min = 0;
+              tm_hour = 0;
+              tm_mday = dv;
+              tm_mon = mv;
+              tm_year = yv - 1900;
+              tm_wday = 0;
+              tm_yday = 0;
+              tm_isdst = false;
+            }
+          in
+          Float (fst (Unix.mktime time))
+      | _ -> raise (NotHandled code))
+  | _ -> raise (NotHandled code)
+
+(*
+   Helper function to convert string duration into milliseconds for comparison.
+   See https://prometheus.io/docs/prometheus/latest/querying/basics/#time-durations
+   We do accept more duration strings here then prometheus which is okay.
+*)
+let string_duration_to_milliseconds s code : value =
+  let int_of_string s =
+    if s = "" then raise (NotHandled code) else int_of_string s
+  in
+  let l = String.length s in
+  let rec loop (x, v) i =
+    if i >= l then if x = "" then v else raise (NotHandled code)
+    else
+      let c = String.get s i in
+      match c with
+      | '0' .. '9' -> loop (x ^ (String.get s i |> String.make 1), v) (i + 1)
+      | 's' ->
+          let d = int_of_string x in
+          loop ("", v + (d * 1000)) (i + 1)
+      | 'm' ->
+          let d = int_of_string x in
+          if i < l - 1 then
+            match String.get s (i + 1) with
+            | 's' -> loop ("", v + d) (i + 2)
+            | _ -> loop ("", v + (d * 60 * 1000)) (i + 1)
+          else loop ("", v + (d * 60 * 1000)) (i + 1)
+      | 'h' ->
+          let d = int_of_string x in
+          loop ("", v + (d * 60 * 60 * 1000)) (i + 1)
+      | 'd' ->
+          let d = int_of_string x in
+          loop ("", v + (d * 24 * 60 * 60 * 1000)) (i + 1)
+      | 'w' ->
+          let d = int_of_string x in
+          loop ("", v + (d * 7 * 24 * 60 * 60 * 1000)) (i + 1)
+      | 'y' ->
+          let d = int_of_string x in
+          loop ("", v + (d * 365 * 24 * 60 * 60 * 1000)) (i + 1)
+      | _ -> raise (NotHandled code)
+  in
+  if s = "" then raise (NotHandled code)
+  else Int (Int64.of_int (loop ("", 0) 0))
+
+let value_of_lit ~code x : value =
   match x with
   | G.Bool (b, _t) -> Bool b
-  | G.String (s, _t) -> String s
+  | G.String (_, (s, _t), _) -> String s
   (* big integers or floats can't be evaluated (Int (None, ...)) *)
-  | G.Int (Some i, _t) -> Int i
+  | G.Int (Some i, _) -> Int i
   | G.Float (Some f, _t) -> Float f
   | _ -> raise (NotHandled code)
+
+let eval_regexp_matches ?(base_offset = 0) ~file ~regexp:re str =
+  (* alt: take the text range of the metavariable in the original file,
+   * and enforce e1 can only be an Id metavariable.
+   * alt: let s = value_to_string v in
+   * to convert anything in a string before using regexps on it
+   *)
+  (* The regex here comes from a rule's metavariable-comparison expression and
+     is not validated at rule-parse time, so compilation can genuinely fail.
+     [compile_exn]'s message carries the pattern and the compile error; the
+     exception surfaces as a per-target error. *)
+  let regexp = Pcre2_.compile_exn ~options:[ `ANCHORED ] re in
+  Xpattern_match_regexp.regexp_matcher ~base_offset str file regexp
 
 let rec eval env code =
   match code.G.e with
   | G.L x -> value_of_lit ~code x
-  | G.N (G.Id ((_, _), { id_svalue = { contents = Some (G.Lit lit) }; _ }))
+  | G.N (G.Id ((_, _), { id_svalue = { contents = G.Lit lit }; _ }))
   (* coupling: Constant_propagation.eval *)
   | G.Call
       ( { e = G.N (G.Id (("!dockerfile_expand!", _), _)); _ },
@@ -152,9 +246,7 @@ let rec eval env code =
               {
                 e =
                   G.N
-                    (G.Id
-                      ( (_, _),
-                        { id_svalue = { contents = Some (G.Lit lit) }; _ } ));
+                    (G.Id ((_, _), { id_svalue = { contents = G.Lit lit }; _ }));
                 _;
               };
           ],
@@ -168,14 +260,16 @@ let rec eval env code =
   | G.DotAccess
       ( { e = G.N (Id ((("local" | "var"), _), _)); _ },
         _,
-        FN (Id (_, { id_svalue = { contents = Some (Lit lit); _ }; _ })) )
+        FN (Id (_, { id_svalue = { contents = Lit lit; _ }; _ })) )
     when env.constant_propagation ->
       value_of_lit ~code lit
+  | G.Call ({ e = Special (ConcatString op, _); _ }, (_, args, _)) ->
+      String (eval_concat_string_op env code op args)
   | G.N (G.Id ((s, _t), _idinfo))
-    when MV.is_metavar_name s || MV.is_metavar_ellipsis s -> (
-      try Hashtbl.find env.mvars s with
+    when Mvar.is_metavar_name s || Mvar.is_metavar_ellipsis s -> (
+      try Hashtbl_.Base.find env.mvars s with
       | Not_found ->
-          logger#trace "could not find a value for %s in env" s;
+          Log.warn (fun m -> m "could not find a value for %s in env" s);
           raise (NotInEnv s))
   (* Python int() operator *)
   | G.Call ({ e = G.N (G.Id (("int", _), _)); _ }, (_, [ Arg e ], _)) -> (
@@ -183,25 +277,53 @@ let rec eval env code =
       match v with
       | Int _ -> v
       | String s -> (
-          match int_of_string_opt s with
-          | None -> raise (NotHandled code)
-          | Some i -> Int i)
+          match Parsed_int.of_string_opt s with
+          | Some (Some i, _) -> Int i
+          | _ -> raise (NotHandled code))
       | __else__ -> raise (NotHandled code))
-  | G.Call ({ e = G.IdSpecial (G.Op op, _t); _ }, (_, args, _)) ->
+  | G.Call ({ e = G.Special (G.Op op, _t); _ }, (_, args, _)) ->
       let values =
         args
-        |> Common.map (function
-             | G.Arg e -> eval env e
-             | _ -> raise (NotHandled code))
+        |> List.map (function
+          | G.Arg e -> eval env e
+          | _ -> raise (NotHandled code))
       in
       eval_op op values code
   | G.Container (G.List, (_, xs, _)) ->
-      let vs = Common.map (eval env) xs in
+      let vs = List.map (eval env) xs in
       List vs
   (* Emulate Python str just enough *)
   | G.Call ({ e = G.N (G.Id (("str", _), _)); _ }, (_, [ G.Arg e ], _)) ->
       let v = eval env e in
-      eval_str env ~code v
+      String (eval_str env ~code v)
+  (* Convert string to date *)
+  | G.Call ({ e = G.N (G.Id (("strptime", _), _)); _ }, (_, [ Arg e ], _)) -> (
+      let v = eval env e in
+      match v with
+      | String s -> string_to_date s code
+      | __else__ -> raise (NotHandled code))
+  | G.Call ({ e = G.N (G.Id (("today", _), _)); _ }, (_, _, _)) ->
+      Float (Unix.time ())
+  (* Convert prometheus duration strings to integer milliseconds*)
+  | G.Call
+      ( { e = G.N (G.Id (("parse_promql_duration", _), _)); _ },
+        (_, [ Arg e ], _) ) -> (
+      let v = eval env e in
+      match v with
+      | String s -> string_duration_to_milliseconds s code
+      | __else__ -> raise (NotHandled code))
+  (* Emulate Python lower *)
+  | G.Call ({ e = G.N (G.Id (("lower", _), _)); _ }, (_, [ Arg e ], _)) -> (
+      let v = eval env e in
+      match v with
+      | String s -> String (String.lowercase_ascii s)
+      | __else__ -> raise (NotHandled code))
+  (* Emulate Python upper *)
+  | G.Call ({ e = G.N (G.Id (("upper", _), _)); _ }, (_, [ Arg e ], _)) -> (
+      let v = eval env e in
+      match v with
+      | String s -> String (String.uppercase_ascii s)
+      | __else__ -> raise (NotHandled code))
   (* Emulate Python re.match just enough *)
   | G.Call
       ( {
@@ -212,90 +334,135 @@ let rec eval env code =
                 FN (Id (("match", _), _)) );
           _;
         },
-        (_, [ G.Arg { e = G.L (G.String (re, _)); _ }; G.Arg e2 ], _) ) -> (
-      (* alt: take the text range of the metavariable in the original file,
-       * and enforce e1 can only be an Id metavariable.
-       * alt: let s = value_to_string v in
-       * to convert anything in a string before using regexps on it
-       *)
-      let v = eval env e2 in
-
-      match v with
-      | String s ->
-          (* todo? factorize with Matching_generic.regexp_matcher_of_regexp_.. *)
-          let regexp = SPcre.regexp ~flags:[ `ANCHORED ] re in
-          let res = SPcre.pmatch_noerr ~rex:regexp s in
-          let v = Bool res in
-          logger#info "regexp %s on %s return %s" re s (show_value v);
+        (_, [ G.Arg { e = G.L (G.String (_, (re, _), _)); _ }; G.Arg e ], _) )
+    -> (
+      match eval env e with
+      | String str ->
+          let v : value =
+            match eval_regexp_matches ~file:env.file ~regexp:re str with
+            | [] -> Bool false
+            | _ -> Bool true
+          in
+          Log.debug (fun m ->
+              m "regexp %s on %s return %s" re str (show_value v));
           v
-      | _ -> raise (NotHandled code))
+      | _ -> raise (NotHandled e))
+  | _ -> raise (NotHandled code)
+
+and eval_concat_string_op env code _op args =
+  (* The op appears to not be important. We can just concatenate all the
+     arguments.
+  *)
+  args |> List.map (eval_concat_string_element env code) |> String.concat ""
+
+and eval_concat_string_element env code arg =
+  match arg with
+  | G.Arg { e = L (G.String (_, (s, _), _)); _ } -> s
+  | G.Arg
+      { e = G.Call ({ e = Special (ConcatString op, _); _ }, (_, args, _)); _ }
+    ->
+      eval_concat_string_op env code op args
+  | G.Arg
+      {
+        e =
+          Call
+            ({ e = Special (InterpolatedElement, _); _ }, (_, [ G.Arg elem ], _));
+        _;
+      }
+  | G.Arg elem ->
+      let v = eval env elem in
+      eval_str env ~code v
   | _ -> raise (NotHandled code)
 
 and eval_op op values code =
   match (op, values) with
   | _op, [ AST _; _ ]
   | _op, [ _; AST _ ] ->
-      (* To compare `AST` values one needs to explicitly use the `str()` function!
-       * Otherwise we would introduce regressions. *)
+      (* To compare `AST` values one needs to explicitly use the `str()`
+       * function! Otherwise we would introduce regressions. *)
       raise (NotHandled code)
+  (* Our Python parser (which we use for metavariable comparison expressions)
+   * will parse `x or y or z` not as two separate binary expressions but as a
+   * single call to the special `Or` operation with three arguments. `and` is
+   * the same. Account for that when evaluating these operations. *)
+  | (G.Or | G.And), x1 :: x2 :: (_ :: _ as tl) ->
+      let first_result = eval_op op [ x1; x2 ] code in
+      eval_op op (first_result :: tl) code
   | G.And, [ Bool b1; Bool b2 ] -> Bool (b1 && b2)
   | G.Not, [ Bool b1 ] -> Bool (not b1)
   | G.Or, [ Bool b1; Bool b2 ] -> Bool (b1 || b2)
   | G.Gt, [ Int i1; Int i2 ] -> Bool (i1 > i2)
   | G.Gt, [ Float i1; Float i2 ] -> Bool (i1 > i2)
-  | G.Gt, [ Int i1; Float i2 ] -> Bool (float_of_int i1 > i2)
-  | G.Gt, [ Float i1; Int i2 ] -> Bool (i1 > float_of_int i2)
+  | G.Gt, [ Int i1; Float i2 ] -> Bool (Int64.to_float i1 > i2)
+  | G.Gt, [ Float i1; Int i2 ] -> Bool (i1 > Int64.to_float i2)
   | G.GtE, [ Int i1; Int i2 ] -> Bool (i1 >= i2)
   | G.GtE, [ Float i1; Float i2 ] -> Bool (i1 >= i2)
-  | G.GtE, [ Int i1; Float i2 ] -> Bool (float_of_int i1 >= i2)
-  | G.GtE, [ Float i1; Int i2 ] -> Bool (i1 >= float_of_int i2)
+  | G.GtE, [ Int i1; Float i2 ] -> Bool (Int64.to_float i1 >= i2)
+  | G.GtE, [ Float i1; Int i2 ] -> Bool (i1 >= Int64.to_float i2)
   | G.Lt, [ Int i1; Int i2 ] -> Bool (i1 < i2)
   | G.Lt, [ Float i1; Float i2 ] -> Bool (i1 < i2)
-  | G.Lt, [ Int i1; Float i2 ] -> Bool (float_of_int i1 < i2)
-  | G.Lt, [ Float i1; Int i2 ] -> Bool (i1 < float_of_int i2)
+  | G.Lt, [ Int i1; Float i2 ] -> Bool (Int64.to_float i1 < i2)
+  | G.Lt, [ Float i1; Int i2 ] -> Bool (i1 < Int64.to_float i2)
   | G.LtE, [ Int i1; Int i2 ] -> Bool (i1 <= i2)
   | G.LtE, [ Float i1; Float i2 ] -> Bool (i1 <= i2)
-  | G.LtE, [ Int i1; Float i2 ] -> Bool (float_of_int i1 <= i2)
-  | G.LtE, [ Float i1; Int i2 ] -> Bool (i1 <= float_of_int i2)
-  | G.Div, [ Int i1; Int i2 ] -> Int (i1 / i2)
+  | G.LtE, [ Int i1; Float i2 ] -> Bool (Int64.to_float i1 <= i2)
+  | G.LtE, [ Float i1; Int i2 ] -> Bool (i1 <= Int64.to_float i2)
+  | G.Div, [ Int i1; Int i2 ] -> Int Int64_.(i1 / i2)
   | G.Div, [ Float i1; Float i2 ] -> Float (i1 /. i2)
-  | G.Div, [ Int i1; Float i2 ] -> Float (float_of_int i1 /. i2)
-  | G.Div, [ Float i1; Int i2 ] -> Float (i1 /. float_of_int i2)
-  | G.Minus, [ Int i1 ] -> Int (-i1)
+  | G.Div, [ Int i1; Float i2 ] -> Float (Int64.to_float i1 /. i2)
+  | G.Div, [ Float i1; Int i2 ] -> Float (i1 /. Int64.to_float i2)
+  | G.Minus, [ Int i1 ] -> Int (Int64.neg i1)
   | G.Minus, [ Float i1 ] -> Float (-.i1)
-  | G.Minus, [ Int i1; Int i2 ] -> Int (i1 - i2)
+  | G.Minus, [ Int i1; Int i2 ] -> Int Int64_.(i1 - i2)
   | G.Minus, [ Float i1; Float i2 ] -> Float (i1 -. i2)
-  | G.Minus, [ Int i1; Float i2 ] -> Float (float_of_int i1 -. i2)
-  | G.Minus, [ Float i1; Int i2 ] -> Float (i1 -. float_of_int i2)
-  | G.Mod, [ Int i1; Int i2 ] -> Int (i1 mod i2)
+  | G.Minus, [ Int i1; Float i2 ] -> Float (Int64.to_float i1 -. i2)
+  | G.Minus, [ Float i1; Int i2 ] -> Float (i1 -. Int64.to_float i2)
+  | G.Mod, [ Int i1; Int i2 ] -> Int Int64_.(i1 mod i2)
   | G.Mod, [ Float i1; Float i2 ] -> Float (Float.rem i1 i2)
-  | G.Mod, [ Int i1; Float i2 ] -> Float (Float.rem (float_of_int i1) i2)
-  | G.Mod, [ Float i1; Int i2 ] -> Float (Float.rem i1 (float_of_int i2))
-  | G.Mult, [ Int i1; Int i2 ] -> Int (i1 * i2)
+  | G.Mod, [ Int i1; Float i2 ] -> Float (Float.rem (Int64.to_float i1) i2)
+  | G.Mod, [ Float i1; Int i2 ] -> Float (Float.rem i1 (Int64.to_float i2))
+  | G.Mult, [ Int i1; Int i2 ] -> Int Int64_.(i1 * i2)
   | G.Mult, [ Float i1; Float i2 ] -> Float (i1 *. i2)
-  | G.Mult, [ Int i1; Float i2 ] -> Float (float_of_int i1 *. i2)
-  | G.Mult, [ Float i1; Int i2 ] -> Float (i1 *. float_of_int i2)
+  | G.Mult, [ Int i1; Float i2 ] -> Float (Int64.to_float i1 *. i2)
+  | G.Mult, [ Float i1; Int i2 ] -> Float (i1 *. Int64.to_float i2)
   | G.Plus, [ Int i1 ] -> Int i1
   | G.Plus, [ Float i1 ] -> Float i1
-  | G.Plus, [ Int i1; Int i2 ] -> Int (i1 + i2)
+  | G.Plus, [ Int i1; Int i2 ] -> Int Int64_.(i1 + i2)
   | G.Plus, [ Float i1; Float i2 ] -> Float (i1 +. i2)
-  | G.Plus, [ Int i1; Float i2 ] -> Float (float_of_int i1 +. i2)
-  | G.Plus, [ Float i1; Int i2 ] -> Float (i1 +. float_of_int i2)
-  | G.Eq, [ Int v1; Float v2 ] -> Bool (float_of_int v1 =*= v2)
-  | G.Eq, [ Float v1; Int v2 ] -> Bool (v1 =*= float_of_int v2)
+  | G.Plus, [ Int i1; Float i2 ] -> Float (Int64.to_float i1 +. i2)
+  | G.Plus, [ Float i1; Int i2 ] -> Float (i1 +. Int64.to_float i2)
+  | G.Pow, [ Int i1; Int i2 ] -> Int (Int64_.power i1 i2)
+  | G.Pow, [ Float i1; Int i2 ] -> Float (i1 ** Int64.to_float i2)
+  | G.Pow, [ Int i1; Float i2 ] -> Float (Int64.to_float i1 ** i2)
+  | G.Pow, [ Float i1; Float i2 ] -> Float (i1 ** i2)
+  | G.BitNot, [ Int i1 ] -> Int (Int64.lognot i1)
+  | G.BitAnd, [ Int i1; Int i2 ] -> Int (Int64.logand i1 i2)
+  | G.BitOr, [ Int i1; Int i2 ] -> Int (Int64.logor i1 i2)
+  | G.BitXor, [ Int i1; Int i2 ] -> Int (Int64.logxor i1 i2)
+  | G.LSL, [ Int i1; Int i2 ] -> Int (Int64.shift_left i1 (Int64.to_int i2))
+  | G.ASR, [ Int i1; Int i2 ] -> Int (Int64.shift_right i1 (Int64.to_int i2))
+  | G.LSR, [ Int i1; Int i2 ] ->
+      Int (Int64.shift_right_logical i1 (Int64.to_int i2))
+  | G.Eq, [ Int v1; Float v2 ] -> Bool (Int64.to_float v1 =*= v2)
+  | G.Eq, [ Float v1; Int v2 ] -> Bool (v1 =*= Int64.to_float v2)
   (* TODO? dangerous use of polymorphic =*= ? *)
   | G.Eq, [ v1; v2 ] -> Bool (v1 =*= v2)
-  | G.NotEq, [ Int v1; Float v2 ] -> Bool (float_of_int v1 <> v2)
-  | G.NotEq, [ Float v1; Int v2 ] -> Bool (v1 <> float_of_int v2)
+  | G.NotEq, [ Int v1; Float v2 ] -> Bool (Int64.to_float v1 <> v2)
+  | G.NotEq, [ Float v1; Int v2 ] -> Bool (v1 <> Int64.to_float v2)
   (* TODO? dangerous use of polymorphic <> ? *)
   | G.NotEq, [ v1; v2 ] -> Bool (v1 <> v2)
   | G.In, [ v1; v2 ] -> (
-      match v2 with
-      | List xs -> Bool (List.mem v1 xs)
+      match (v1, v2) with
+      | _, List xs -> Bool (List.mem v1 xs)
+      | String v1, String v2 ->
+          Bool (Common2.string_match_substring (Str.regexp_string v1) v2)
       | _ -> Bool false)
   | G.NotIn, [ v1; v2 ] -> (
-      match v2 with
-      | List xs -> Bool (not (List.mem v1 xs))
+      match (v1, v2) with
+      | _, List _
+      | String _, String _ ->
+          (* Just negate the "in" *)
+          eval_op G.Not [ eval_op G.In values code ] code
       | _ -> Bool false)
   (* less: it would be better to show the actual values not handled,
    * rather than the code, because this may differ as the code does not
@@ -306,19 +473,17 @@ and eval_str _env ~code v =
   let str =
     match v with
     | Bool b -> string_of_bool b
-    | Int i -> string_of_int i
+    | Int i -> Int64.to_string i
     | Float f -> string_of_float f
     | String s -> s
     | AST s -> s
     | List _ -> raise (NotHandled code)
   in
-  String str
+  str
 
 (*****************************************************************************)
 (* Env builders *)
 (*****************************************************************************)
-
-(* when called from the new semgrep-full-rule-in-ocaml *)
 
 let text_of_binding mvar mval =
   match mval with
@@ -326,65 +491,96 @@ let text_of_binding mvar mval =
       (* Note that `text` may be produced by constant folding, in which
        * case we will not have range info. *)
       Some text
+  (* There are a few places in Pattern_vs_code where we build artificial
+   * code on-the-fly (e.g., a Name from an ImportedEntity), in which case the
+   * tokens in this code should not be used to get the string content
+   * of the code. Unfortunately, a metavariable can be bound to such
+   * code.
+   * In that case, it's better to pretty print the code rather than using
+   * Visitor_AST.range_of_any_opt and Range.contents_at_range below.
+   *
+   * The 'not is_fake' guard is to avoid to pretty print
+   * artificial identifiers such as "builtin__include" in PHP that
+   * we generate during parsing.
+   * TODO: get rid of the ugly __builtin__ once we've fixed
+   * ast_php.ml and removed the builtin() function.
+   *
+   * TODO: handle also MV.Name, MV.E of DotAccess; maybe use
+   * Pretty_print/Ugly_print to factorize work.
+   *)
+  | MV.Id ((s, _tok), Some { id_flags; _ })
+    when (not (s =~ "^__builtin.*")) && not (IdFlags.is_fake !id_flags) ->
+      Some s
+  | MV.Id ((s, _tok), None) when not (s =~ "^__builtin.*") -> Some s
   | _ -> (
       let any = MV.mvalue_to_any mval in
-      match Visitor_AST.range_of_any_opt any with
+      match AST_generic_helpers.range_of_any_opt any with
       | None ->
           (* TODO: Report a warning to the user? *)
-          logger#error "We lack range info for metavariable %s: %s" mvar
-            (G.show_any any);
+          Logs_.msg_with_detail ~src:Log_engine.src Logs.Warning
+            (spf "We lack range info for metavariable %s" mvar) (fun () ->
+              G.show_any any);
           None
       | Some (min, max) ->
-          let file = min.Parse_info.file in
+          let file = min.Loc.pos.file in
           let range = Range.range_of_token_locations min max in
           Some (Range.content_at_range file range))
 
 let string_of_binding mvar mval =
   let* x = text_of_binding mvar mval in
-  Some (mvar, AST x)
+  Some (mvar, (AST x : value))
 
-let bindings_to_env (config : Config_semgrep.t) bindings =
+let bindings_to_env (config : Rule_options.t) ~file bindings =
   let constant_propagation = config.constant_propagation in
   let mvars =
     bindings
-    |> Common.map_filter (fun (mvar, mval) ->
-           let try_bind_to_exp e =
-             try
-               Some
-                 ( mvar,
-                   eval { mvars = Hashtbl.create 0; constant_propagation } e )
-             with
-             | NotHandled _
-             | NotInEnv _ ->
-                 (* These are expressions like `x` or `os.getenv("FOO")` that cannot
-                  * be evaluated. Previously we just filtered out all these cases, but
-                  * in some cases it's interesting to make comparisons based on the
-                  * string representation of these expressions. For example, given
-                  * $X and $Y binding to two code variables we may want to check
-                  * whether both code variables have the same name (even if they are
-                  *  in fact different variables). So, if we can obtain such a
-                  * string representation, we add it to the environment here. *)
-                 string_of_binding mvar mval
-           in
-           match mval with
-           (* this way we can leverage the constant propagation analysis
-              * in metavariable-comparison: too! This simplifies some rules.
-           *)
-           | MV.Id (i, Some id_info) ->
-               try_bind_to_exp (G.e (G.N (G.Id (i, id_info))))
-           | MV.E e -> try_bind_to_exp e
-           | x -> string_of_binding mvar x)
-    |> Common.hash_of_list
+    |> List.filter_map (fun (mvar, mval) ->
+        let try_bind_to_exp e =
+          try
+            Some
+              ( mvar,
+                eval
+                  {
+                    mvars = Base.Hashtbl.Poly.create ~size:0 ();
+                    constant_propagation;
+                    file;
+                  }
+                  e )
+          with
+          | NotHandled _
+          | NotInEnv _ ->
+              (* These are expressions like `x` or `os.getenv("FOO")` that cannot
+               * be evaluated. Previously we just filtered out all these cases, but
+               * in some cases it's interesting to make comparisons based on the
+               * string representation of these expressions. For example, given
+               * $X and $Y binding to two code variables we may want to check
+               * whether both code variables have the same name (even if they are
+               *  in fact different variables). So, if we can obtain such a
+               * string representation, we add it to the environment here. *)
+              string_of_binding mvar mval
+        in
+        match mval with
+        (* this way we can leverage the constant propagation analysis
+         * in metavariable-comparison: too! This simplifies some rules.
+         *)
+        | MV.Id (i, Some id_info) ->
+            try_bind_to_exp (G.e (G.N (G.Id (i, id_info))))
+        | MV.E e -> try_bind_to_exp e
+        | MV.Text (s, _, _) -> Some (mvar, String s)
+        | x -> string_of_binding mvar x)
+    |> Hashtbl_.Base.hash_of_list
   in
-  { mvars; constant_propagation }
 
-let bindings_to_env_just_strings (config : Config_semgrep.t) xs =
+  { mvars; constant_propagation; file }
+
+let bindings_to_env_just_strings (config : Rule_options.t) ~file xs =
   let mvars =
     xs
-    |> Common.map_filter (fun (mvar, mval) -> string_of_binding mvar mval)
-    |> Common.hash_of_list
+    |> List.filter_map (fun (mvar, mval) -> string_of_binding mvar mval)
+    |> Hashtbl_.Base.hash_of_list
   in
-  { mvars; constant_propagation = config.constant_propagation }
+
+  { mvars; constant_propagation = config.constant_propagation; file }
 
 (*****************************************************************************)
 (* Entry points *)
@@ -398,7 +594,8 @@ let test_eval file =
     print_result (Some res)
   with
   | NotHandled e ->
-      pr2 (G.show_expr e);
+      Logs_.msg_with_detail ~src:Log_engine.src Logs.Warning
+        "expr not handled in test_eval" (fun () -> G.show_expr e);
       raise (NotHandled e)
 
 (* We need to swallow most exns in eval_bool(). This is because the
@@ -414,20 +611,40 @@ let test_eval file =
  * code like `os.getenv('a', 'defaulta')` where $BITS will bind
  * to a string literal, which can't be compared with '<= 0o650'.
  *)
-let eval_bool env e =
-  try
-    let res = eval env e in
-    match res with
-    | Bool b -> b
-    | _ ->
-        logger#trace "not a boolean: %s" (show_value res);
-        false
-  with
+let eval_opt env e =
+  try Some (eval env e) with
   (* this can happen when a metavar is bound to a complex expression,
    * in which case it's filtered in bindings_to_env(), in which case
    * it generates a NotInEnv when we run eval with such an environment.
    *)
-  | NotInEnv _ -> false
+  | NotInEnv _ -> None
   | NotHandled e ->
-      logger#trace "NotHandled: %s" (G.show_expr e);
-      false
+      Logs_.msg_with_detail ~src:Log_engine.src Logs.Error
+        "NotHandled in eval_opt" (fun () -> G.show_expr e);
+      None
+
+let eval_bool env e facts bindings =
+  let res = eval_opt env e in
+  match res with
+  | Some (Bool b) -> b
+  | Some res -> (
+      Logs_.msg_with_detail ~src:Log_engine.src Logs.Error
+        "eval_bool: result is not a boolean" (fun () -> show_value res);
+      (* facts_satisfy_e is just a stub, but we intend to prioritize the results of
+       * eval_bool, so if eval_opt returns a bool, that will be the source of truth.
+       * otherwise (i.e. if eval_opt fails), we will resort to pattern when (if the
+       * pro flag is enabled).
+       *
+       * TODO: eventually we should merge this into eval_opt. consider the condition
+       * $X == 0 && $Y > 0, maybe $X == 0 needs const-prop info to be resolved,
+       * and $Y > 0 needs the facts. perhaps instead of raise (NotHandled code) in
+       * eval_op, we can first try to find a fact that implies $X > 0 or its negation.
+       *)
+      match Hook.get Dataflow_when.hook_facts_satisfy_e with
+      | None -> false
+      | Some facts_satisfy_e -> facts_satisfy_e bindings facts e)
+  | None -> (
+      Log.err (fun m -> m "got exn during eval_bool");
+      match Hook.get Dataflow_when.hook_facts_satisfy_e with
+      | None -> false
+      | Some facts_satisfy_e -> facts_satisfy_e bindings facts e)

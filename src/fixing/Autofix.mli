@@ -1,8 +1,34 @@
-(* Attempts to render a fix. If successful, returns the edit that should occur
- * in the target file. If unsuccessful, returns None. *)
-val render_fix : Pattern_match.t -> Textedit.t option
+(*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(* core algorithm, using AST-based or basic or regex fix strategy *)
+val render_fix : Core_match.t -> Textedit.t option
+
+(* Produce the fixes for the list of matches. Currently used for tests but
+ * also in the Pre_post_core_scan.Autofix_processor now that we handle
+ * autofix mostly in semgrep-core.
+ *)
+val produce_autofixes :
+  Core_result.processed_match list -> Core_result.processed_match list
+
+val produce_autofix : Core_result.processed_match -> Core_result.processed_match
 
 (* Apply the fix for the list of matches to the given file, returning the
- * resulting file contents. Currently used only for tests, but with some changes
- * could be used in production as well. *)
-val apply_fixes_to_file : Pattern_match.t list -> file:string -> string
+   resulting file contents. Currently used only for tests.
+
+   Raises an exception in case of a conflict.
+*)
+val apply_fixes_to_file_exn : Fpath.t -> Textedit.t list -> string
+
+(* for use by osemgrep *)
+val apply_fixes_of_core_matches :
+  ?dryrun:bool -> Semgrep_output_v1_t.core_match list -> unit

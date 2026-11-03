@@ -1,4 +1,16 @@
 (*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    Detect regexps vulnerable to denial-of-service attacks (ReDoS) by static
    analysis.
 *)
@@ -7,7 +19,7 @@ open Parser_regexp
 
 let parse_regexp conf re_str =
   try Some (Parse.string ~conf re_str) with
-  | Parse_info.Parsing_error _ -> None
+  | Parsing_error.Syntax_error _ -> None
 
 (* Iterate over all the nodes of a regexp *)
 let rec iter f (x : AST.t) =
@@ -126,42 +138,42 @@ let matches_not_everywhere (x : AST.t) =
   let match_constraints =
     x
     |> find_all (function
-         | Empty _ -> false
-         | Char _ -> true
-         | Special (_loc, x) -> (
-             match x with
-             | Beginning_of_line
-             (* ^ *)
-             | End_of_line
-             (* $ *)
-             | Beginning_of_input
-             (* \A *)
-             | End_of_last_line
-             (* \Z *)
-             | End_of_input
-             (* \z *)
-             | Beginning_of_match
-             (* \G *)
-             | Numeric_back_reference _
-             | Named_back_reference _
-             | Word_boundary
-             (* \b *)
-             | Not_word_boundary (* \B *) ->
-                 (* possibly *) true
-             | Match_point_reset (* \K *) -> false
-             | Set_option _ -> false
-             | Clear_option _ -> false
-             | Callout _ -> (* presumably *) true
-             | Recurse_pattern _ -> (* hopefully *) true
-             | Call_subpattern_by_abs_number _
-             | Call_subpattern_by_rel_number _
-             | Call_subpattern_by_name _ ->
-                 (* presumably *) true)
-         | Seq _ -> false
-         | Alt _ -> false
-         | Repeat _ -> false
-         | Group _ -> false
-         | Conditional _ -> false)
+      | Empty _ -> false
+      | Char _ -> true
+      | Special (_loc, x) -> (
+          match x with
+          | Beginning_of_line
+          (* ^ *)
+          | End_of_line
+          (* $ *)
+          | Beginning_of_input
+          (* \A *)
+          | End_of_last_line
+          (* \Z *)
+          | End_of_input
+          (* \z *)
+          | Beginning_of_match
+          (* \G *)
+          | Numeric_back_reference _
+          | Named_back_reference _
+          | Word_boundary
+          (* \b *)
+          | Not_word_boundary (* \B *) ->
+              (* possibly *) true
+          | Match_point_reset (* \K *) -> false
+          | Set_option _ -> false
+          | Clear_option _ -> false
+          | Callout _ -> (* presumably *) true
+          | Recurse_pattern _ -> (* hopefully *) true
+          | Call_subpattern_by_abs_number _
+          | Call_subpattern_by_rel_number _
+          | Call_subpattern_by_name _ ->
+              (* presumably *) true)
+      | Seq _ -> false
+      | Alt _ -> false
+      | Repeat _ -> false
+      | Group _ -> false
+      | Conditional _ -> false)
   in
   match_constraints <> []
 
@@ -188,9 +200,9 @@ let safe_sub s pos sublen =
 *)
 let recover_source re_str node =
   let start, end_ = AST.location node in
-  let first_tok_pos = Parse_info.pos_of_info start in
-  let last_tok_pos = Parse_info.pos_of_info end_ in
-  let last_tok_str = Parse_info.str_of_info end_ in
+  let first_tok_pos = Tok.bytepos_of_tok start in
+  let last_tok_pos = Tok.bytepos_of_tok end_ in
+  let last_tok_str = Tok.content_of_tok end_ in
   let len = last_tok_pos + String.length last_tok_str - first_tok_pos in
   safe_sub re_str first_tok_pos len
 
@@ -199,7 +211,7 @@ let find_vulnerable_subpatterns ?(dialect = Dialect.PCRE) re_str =
   match parse_regexp conf re_str with
   | None -> Error ()
   | Some re_ast ->
-      Ok (find_vulnerable_nodes re_ast |> Common.map (recover_source re_str))
+      Ok (find_vulnerable_nodes re_ast |> List.map (recover_source re_str))
 
 let regexp_may_be_vulnerable ?dialect re_str =
   match find_vulnerable_subpatterns ?dialect re_str with

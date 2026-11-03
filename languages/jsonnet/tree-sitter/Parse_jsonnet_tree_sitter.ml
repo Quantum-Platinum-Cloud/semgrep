@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (c) 2022 R2C
+ * Copyright (c) 2022-2023 r2c
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -13,9 +13,9 @@
  * LICENSE for more details.
  *)
 open Common
+open Fpath_.Operators
 module CST = Tree_sitter_jsonnet.CST
 module H = Parse_tree_sitter_helpers
-module PI = Parse_info
 open AST_jsonnet
 module J = AST_jsonnet
 
@@ -49,6 +49,11 @@ let tat_optional env v =
    to another type of tree.
 *)
 
+let map_id (env : env) (x : CST.id) : ident =
+  match x with
+  | `Id tok -> (* pattern [_a-zA-Z][_a-zA-Z0-9]* *) str env tok
+  | `Semg_meta tok -> str env tok
+
 let map_unaryop (env : env) (x : CST.unaryop) : unary_op wrap =
   match x with
   | `DASH tok -> (UMinus, (* "-" *) token env tok)
@@ -71,7 +76,7 @@ let map_h (env : env) (x : CST.h) : hidden wrap =
   | `COLONCOLONCOLON tok -> (ForcedVisible, (* ":::" *) token env tok)
 
 let map_str_single (env : env) (xs : CST.str_single) : string_content =
-  Common.map
+  List.map
     (fun x ->
       match x with
       | `Imm_tok_prec_p1_pat_59587ce x -> map_imm_tok_prec_p1_pat_59587ce env x
@@ -79,7 +84,7 @@ let map_str_single (env : env) (xs : CST.str_single) : string_content =
     xs
 
 let map_str_double (env : env) (xs : CST.str_double) =
-  Common.map
+  List.map
     (fun x ->
       match x with
       | `Imm_tok_prec_p1_pat_c7f65b4 x -> map_imm_tok_prec_p1_pat_c7f65b4 env x
@@ -124,10 +129,11 @@ let map_string_ (env : env) (x : CST.string_) : string_ =
         | "|||", "|||" -> TripleBar
         | x, y when x = y ->
             raise
-              (PI.Other_error (spf "unrecognized string delimiter: %s" x, t1))
+              (Parsing_error.Other_error
+                 (spf "unrecognized string delimiter: %s" x, t1))
         | x, y ->
             raise
-              (PI.Other_error
+              (Parsing_error.Other_error
                  (spf "unmatched string delimiter: '%s' and '%s'" x y, t1))
       in
       (tat, kind, (t1, [ content ], t2))
@@ -138,17 +144,17 @@ let rec map_args (env : env) (x : CST.args) : argument list =
       let v1 = map_document env v1 in
       let v2 =
         v2
-        |> Common.map (fun (v1, v2) ->
-               let _v1 = (* "," *) token env v1 in
-               let v2 = map_document env v2 in
-               Arg v2)
+        |> List.map (fun (v1, v2) ->
+            let _v1 = (* "," *) token env v1 in
+            let v2 = map_document env v2 in
+            Arg v2)
       in
       let v3 =
         v3
-        |> Common.map (fun (v1, v2) ->
-               let _v1 = (* "," *) token env v1 in
-               let v2 = map_named_argument env v2 in
-               v2)
+        |> List.map (fun (v1, v2) ->
+            let _v1 = (* "," *) token env v1 in
+            let v2 = map_named_argument env v2 in
+            v2)
       in
       let _v4 = trailing_comma env v4 in
       Arg v1 :: (v2 @ v3)
@@ -156,10 +162,10 @@ let rec map_args (env : env) (x : CST.args) : argument list =
       let v1 = map_named_argument env v1 in
       let v2 =
         v2
-        |> Common.map (fun (v1, v2) ->
-               let _v1 = (* "," *) token env v1 in
-               let v2 = map_named_argument env v2 in
-               v2)
+        |> List.map (fun (v1, v2) ->
+            let _v1 = (* "," *) token env v1 in
+            let v2 = map_named_argument env v2 in
+            v2)
       in
       let _v3 = trailing_comma env v3 in
       v1 :: v2
@@ -183,7 +189,7 @@ and map_bind (env : env) (x : CST.bind) : bind =
       let id, teq, e = map_named_argument_bis env x in
       B (id, teq, e)
   | `Id_LPAR_opt_params_RPAR_EQ_expr (v1, v2, v3, v4, v5, v6) ->
-      let id = (* pattern [_a-zA-Z][_a-zA-Z0-9]* *) str env v1 in
+      let id = map_id env v1 in
       let lpar = (* "(" *) token env v2 in
       let ps =
         match v3 with
@@ -197,7 +203,7 @@ and map_bind (env : env) (x : CST.bind) : bind =
       B (id, teq, Lambda def)
 
 and map_compspec (env : env) (xs : CST.compspec) : for_or_if_comp list =
-  Common.map
+  List.map
     (fun x ->
       match x with
       | `Fors x ->
@@ -216,6 +222,16 @@ and map_expr_opt env v =
   | None -> None
 
 and map_expr (env : env) (x : CST.expr) : expr =
+  match x with
+  | `Semg_ellips v1 -> Ellipsis (token env v1)
+  | `Deep_ellips (v1, v2, v3) ->
+      let l = token env v1 in
+      let e = map_expr env v2 in
+      let r = token env v3 in
+      DeepEllipsis (l, e, r)
+  | `Choice_null x -> map_expr_origin env x
+
+and map_expr_origin (env : env) x : expr =
   match x with
   | `Null tok -> L (Null ((* "null" *) token env tok))
   | `True tok ->
@@ -252,7 +268,7 @@ and map_expr (env : env) (x : CST.expr) : expr =
         | Some (v1, v2, v3) ->
             let v1 = map_document env v1 in
             let v2 =
-              Common.map
+              List.map
                 (fun (v1, v2) ->
                   let _v1 = (* "," *) token env v1 in
                   let v2 = map_document env v2 in
@@ -280,7 +296,7 @@ and map_expr (env : env) (x : CST.expr) : expr =
   | `Expr_DOT_id (v1, v2, v3) ->
       let e = map_document env v1 in
       let tdot = (* "." *) token env v2 in
-      let fld = (* pattern [_a-zA-Z][_a-zA-Z0-9]* *) str env v3 in
+      let fld = map_id env v3 in
       DotAccess (e, tdot, fld)
   | `Expr_LBRACK_opt_expr_opt_COLON_opt_expr_opt_COLON_opt_expr_RBRACK
       (v1, v2, v3, v4, v5) -> (
@@ -312,7 +328,7 @@ and map_expr (env : env) (x : CST.expr) : expr =
   | `Super_DOT_id (v1, v2, v3) ->
       let tsuper = (* "super" *) token env v1 in
       let tdot = (* "." *) token env v2 in
-      let fld = (* pattern [_a-zA-Z][_a-zA-Z0-9]* *) str env v3 in
+      let fld = map_id env v3 in
       DotAccess (IdSpecial (Super, tsuper), tdot, fld)
   | `Super_LBRACK_expr_RBRACK (v1, v2, v3, v4) ->
       let tsuper = (* "super" *) token env v1 in
@@ -332,13 +348,13 @@ and map_expr (env : env) (x : CST.expr) : expr =
       let _tailstrictTODO = Option.map (token env) v5 in
       Call (e, (lp, args, rp))
   | `Id tok ->
-      let id = (* pattern [_a-zA-Z][_a-zA-Z0-9]* *) str env tok in
+      let id = map_id env tok in
       Id id
   | `Local_bind (v1, v2, v3, v4, v5) ->
       let tlocal = (* "local" *) token env v1 in
       let bind = map_bind env v2 in
       let binds =
-        Common.map
+        List.map
           (fun (v1, v2) ->
             let _v1 = (* "," *) token env v1 in
             let v2 = map_bind env v2 in
@@ -493,41 +509,53 @@ and map_binary_expr (env : env) (x : CST.binary_expr) : expr =
       let v3 = map_document env v3 in
       BinaryOp (v1, v2, v3)
 
-and map_field (env : env) (x : CST.field) : field =
+and map_field (env : env) (x : CST.field) : obj_member =
   match x with
-  | `Fiel_opt_PLUS_choice_COLON_expr (v1, v2, v3, v4) ->
-      let fld = map_fieldname env v1 in
-      let plusopt =
-        match v2 with
-        | Some tok -> Some (PlusField ((* "+" *) token env tok))
-        | None -> None
-      in
-      let h = map_h env v3 in
-      let e = map_document env v4 in
-      { fld_name = fld; fld_attr = plusopt; fld_hidden = h; fld_value = e }
-  | `Fiel_LPAR_opt_params_RPAR_choice_COLON_expr (v1, v2, v3, v4, v5, v6) ->
-      let fld = map_fieldname env v1 in
-      let lp = (* "(" *) token env v2 in
-      let params =
-        match v3 with
-        | Some x -> map_params env x
-        | None -> []
-      in
-      let rp = (* ")" *) token env v4 in
-      let h = map_h env v5 in
-      let e = map_document env v6 in
-      let fdef = { f_tok = lp; f_params = (lp, params, rp); f_body = e } in
-      {
-        fld_name = fld;
-        fld_attr = None;
-        fld_hidden = h;
-        fld_value = Lambda fdef;
-      }
+  | `Semg_ellips v1 ->
+      let tdots = token env v1 in
+      OEllipsis tdots
+  | `Choice_fiel_opt_PLUS_choice_COLON_expr y -> (
+      match y with
+      | `Fiel_opt_PLUS_choice_COLON_expr (v1, v2, v3, v4) ->
+          let fld = map_fieldname env v1 in
+          let plusopt =
+            match v2 with
+            | Some tok -> Some (PlusField ((* "+" *) token env tok))
+            | None -> None
+          in
+          let h = map_h env v3 in
+          let e = map_document env v4 in
+          OField
+            {
+              fld_name = fld;
+              fld_attr = plusopt;
+              fld_hidden = h;
+              fld_value = e;
+            }
+      | `Fiel_LPAR_opt_params_RPAR_choice_COLON_expr (v1, v2, v3, v4, v5, v6) ->
+          let fld = map_fieldname env v1 in
+          let lp = (* "(" *) token env v2 in
+          let params =
+            match v3 with
+            | Some x -> map_params env x
+            | None -> []
+          in
+          let rp = (* ")" *) token env v4 in
+          let h = map_h env v5 in
+          let e = map_document env v6 in
+          let fdef = { f_tok = lp; f_params = (lp, params, rp); f_body = e } in
+          OField
+            {
+              fld_name = fld;
+              fld_attr = None;
+              fld_hidden = h;
+              fld_value = Lambda fdef;
+            })
 
 and map_fieldname (env : env) (x : CST.fieldname) : field_name =
   match x with
   | `Id tok ->
-      let id = (* pattern [_a-zA-Z][_a-zA-Z0-9]* *) str env tok in
+      let id = map_id env tok in
       FId id
   | `Str x ->
       let s = map_string_ env x in
@@ -540,7 +568,7 @@ and map_fieldname (env : env) (x : CST.fieldname) : field_name =
 
 and map_forspec (env : env) ((v1, v2, v3, v4) : CST.forspec) : for_comp =
   let tfor = (* "for" *) token env v1 in
-  let id = (* pattern [_a-zA-Z][_a-zA-Z0-9]* *) str env v2 in
+  let id = map_id env v2 in
   let tin = (* "in" *) token env v3 in
   let e = map_document env v4 in
   (tfor, id, tin, e)
@@ -560,7 +588,7 @@ and map_member (env : env) (x : CST.member) : obj_member =
       OAssert x
   | `Field x ->
       let x = map_field env x in
-      OField x
+      x
 
 and map_named_argument (env : env) ((v1, v2, v3) : CST.named_argument) :
     argument =
@@ -568,7 +596,7 @@ and map_named_argument (env : env) ((v1, v2, v3) : CST.named_argument) :
   NamedArg (a, b, c)
 
 and map_named_argument_bis (env : env) ((v1, v2, v3) : CST.named_argument) =
-  let v1 = (* pattern [_a-zA-Z][_a-zA-Z0-9]* *) str env v1 in
+  let v1 = map_id env v1 in
   let v2 = (* "=" *) token env v2 in
   let v3 = map_document env v3 in
   (v1, v2, v3)
@@ -578,7 +606,7 @@ and map_objinside (env : env) (x : CST.objinside) : obj_inside =
   | `Member_rep_COMMA_member_opt_COMMA (v1, v2, v3) ->
       let v1 = map_member env v1 in
       let v2 =
-        Common.map
+        List.map
           (fun (v1, v2) ->
             let _v1 = (* "," *) token env v1 in
             let v2 = map_member env v2 in
@@ -590,7 +618,7 @@ and map_objinside (env : env) (x : CST.objinside) : obj_inside =
   | `Rep_objl_COMMA_LBRACK_expr_RBRACK_COLON_expr_rep_COMMA_objl_opt_COMMA_fors_opt_comp
       (v1, v2, v3, v4, v5, v6, v7, v8, v9, v10) ->
       let oc_locals1 =
-        Common.map
+        List.map
           (fun (v1, v2) ->
             let v1 = map_objlocal env v1 in
             let _v2 = (* "," *) token env v2 in
@@ -603,7 +631,7 @@ and map_objinside (env : env) (x : CST.objinside) : obj_inside =
       let tcolon = (* ":" *) token env v5 in
       let fldval = map_document env v6 in
       let oc_locals2 =
-        Common.map
+        List.map
           (fun (v1, v2) ->
             let _v1 = (* "," *) token env v1 in
             let v2 = map_objlocal env v2 in
@@ -629,22 +657,25 @@ and map_objlocal (env : env) ((v1, v2) : CST.objlocal) =
   let bind = map_bind env v2 in
   (tlocal, bind)
 
-and map_param (env : env) ((v1, v2) : CST.param) : parameter =
-  let id = (* pattern [_a-zA-Z][_a-zA-Z0-9]* *) str env v1 in
-  let default_opt =
-    match v2 with
-    | Some (v1, v2) ->
-        let v1 = (* "=" *) token env v1 in
-        let v2 = map_document env v2 in
-        Some (v1, v2)
-    | None -> None
-  in
-  P (id, default_opt)
+and map_param (env : env) (x : CST.param) : parameter =
+  match x with
+  | `Semg_ellips v1 -> ParamEllipsis (token env v1)
+  | `Id_opt_EQ_expr (v1, v2) ->
+      let id = map_id env v1 in
+      let default_opt =
+        match v2 with
+        | Some (v1, v2) ->
+            let v1 = (* "=" *) token env v1 in
+            let v2 = map_document env v2 in
+            Some (v1, v2)
+        | None -> None
+      in
+      P (id, default_opt)
 
 and map_params (env : env) ((v1, v2, v3) : CST.params) : parameter list =
   let v1 = map_param env v1 in
   let v2 =
-    Common.map
+    List.map
       (fun (v1, v2) ->
         let _v1 = (* "," *) token env v1 in
         let v2 = map_param env v2 in
@@ -660,8 +691,8 @@ and map_params (env : env) ((v1, v2, v3) : CST.params) : parameter list =
 
 let parse file =
   H.wrap_parser
-    (fun () -> Tree_sitter_jsonnet.Parse.file file)
-    (fun cst ->
+    (fun () -> Tree_sitter_jsonnet.Parse.file !!file)
+    (fun cst _extras ->
       let env = { H.file; conv = H.line_col_to_pos file; extra = () } in
       let e = map_document env cst in
       e)
@@ -669,8 +700,9 @@ let parse file =
 let parse_pattern str =
   H.wrap_parser
     (fun () -> Tree_sitter_jsonnet.Parse.string str)
-    (fun cst ->
-      let file = "<pattern>" in
-      let env = { H.file; conv = Hashtbl.create 0; extra = () } in
+    (fun cst _extras ->
+      (* TODO: use Origin!! *)
+      let file = Fpath.v "<pattern>" in
+      let env = { H.file; conv = H.line_col_to_pos_pattern str; extra = () } in
       let e = map_document env cst in
       E e)

@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2021-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import logging
 from typing import Any
 from typing import cast
@@ -17,6 +29,10 @@ class VerboseLogging(logging.Logger):
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+
+    def is_verbose(self) -> bool:
+        """Return whether verbose logging is enabled"""
+        return self.isEnabledFor(self.VERBOSE_LOG_LEVEL)
 
     def verbose(self, msg: str, *args: Any, **kwargs: Any) -> None:
         if self.isEnabledFor(self.VERBOSE_LOG_LEVEL):

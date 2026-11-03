@@ -1,8 +1,20 @@
 (*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    Regexp AST
 *)
 
-type loc = Parse_info.t * Parse_info.t
+type loc = Tok_range.t
 
 (*
    Matching options set with (?X) or (?-X), where X is a letter that specify
@@ -136,10 +148,3 @@ val location : t -> loc
 val location2 : t -> t -> loc
 val range : loc -> loc -> loc
 val dummy_loc : loc
-
-(***************************************************************************)
-(* AST dump *)
-(***************************************************************************)
-
-(* Show the general structure of the AST. *)
-val print : t -> unit

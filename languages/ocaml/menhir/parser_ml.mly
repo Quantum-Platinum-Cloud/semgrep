@@ -10,9 +10,8 @@
 (*  under the terms of the Q Public License version 1.0.               *)
 (*                                                                     *)
 (***********************************************************************)
-open Common
-open Ast_ml
-module PI = Parse_info
+open AST_ocaml
+open Either_
 
 (*************************************************************************)
 (* Prelude *)
@@ -44,7 +43,7 @@ module PI = Parse_info
 (*************************************************************************)
 (* Helpers *)
 (*************************************************************************)
-let (qufix: name -> tok -> ident -> name) =
+let (qufix: name -> Tok.t -> ident -> name) =
  fun longname _dottok ident ->
   match longname with
   | xs, ident2 -> xs @ [ident2], ident
@@ -56,7 +55,7 @@ let optlist_to_list = function
 
 let seq1 = function
   | [x] -> x
-  | xs -> Sequence (Parse_info.unsafe_fake_bracket xs)
+  | xs -> Sequence (Tok.unsafe_fake_bracket xs)
 
 let topseqexpr v1 = mki (TopExpr (seq1 v1))
 
@@ -66,30 +65,30 @@ let topseqexpr v1 = mki (TopExpr (seq1 v1))
 (*************************************************************************)
 
 (* unrecognized token, will generate parse error *)
-%token <Parse_info.t> TUnknown
-%token <Parse_info.t> EOF
+%token <Tok.t> TUnknown
+%token <Tok.t> EOF
 
 (*-----------------------------------------*)
 (* The space/comment tokens *)
 (*-----------------------------------------*)
 
 (* coupling: Token_helpers.is_real_comment *)
-%token <Parse_info.t> TCommentSpace TCommentNewline   TComment
-%token <Parse_info.t> TCommentMisc
+%token <Tok.t> TCommentSpace TCommentNewline   TComment
+%token <Tok.t> TCommentMisc
 
 (*-----------------------------------------*)
 (* The normal tokens *)
 (*-----------------------------------------*)
 
 (* tokens with "values" *)
-%token <int option * Parse_info.t> TInt
-%token <float option * Parse_info.t> TFloat
-%token <string * Parse_info.t> TChar TString
-%token <string * Parse_info.t> TLowerIdent TUpperIdent
-%token <string * Parse_info.t> TLabelUse TLabelDecl TOptLabelUse TOptLabelDecl
+%token <Parsed_int.t> TInt
+%token <float option * Tok.t> TFloat
+%token <string * Tok.t> TChar TString
+%token <string * Tok.t> TLowerIdent TUpperIdent
+%token <string * Tok.t> TLabelUse TLabelDecl TOptLabelUse TOptLabelDecl
 
 (* keywords tokens *)
-%token <Parse_info.t>
+%token <Tok.t>
  Tfun Tfunction Trec Ttype Tof Tif Tthen Telse
  Tmatch Twith Twhen
  Tlet Tin Tas
@@ -105,7 +104,7 @@ let topseqexpr v1 = mki (TopExpr (seq1 v1))
  Tor Tmod Tlor Tlsl Tlsr Tlxor Tasr Tland
 
 (* syntax *)
-%token <Parse_info.t>
+%token <Tok.t>
  TOParen "(" TCParen ")" TOBrace "{" TCBrace "}" TOBracket "[" TCBracket "]"
  TOBracketPipe "[|" TPipeCBracket "|]"  TOBracketLess "[<" TGreaterCBracket ">]"
  TOBraceLess "{<" TGreaterCBrace ">}"
@@ -122,21 +121,21 @@ let topseqexpr v1 = mki (TopExpr (seq1 v1))
  TMinusDot TPlusDot
 
 (* operators *)
-%token <Parse_info.t> TPlus "+" TMinus "-" TLess "<" TGreater ">"
-%token <string * Parse_info.t> TPrefixOperator TInfixOperator
-%token <string * Parse_info.t> LETOP ANDOP (* monadic let, since 4.08 *)
+%token <Tok.t> TPlus "+" TMinus "-" TLess "<" TGreater ">"
+%token <string * Tok.t> TPrefixOperator TInfixOperator
+%token <string * Tok.t> LETOP ANDOP (* monadic let, since 4.08 *)
 
 (* attributes *)
-%token <Parse_info.t> TBracketAt "[@" TBracketAtAt "[@@" TBracketAtAtAt "[@@@"
-%token <Parse_info.t> TBracketPercent "[%" TBracketPercentPercent "[%%"
+%token <Tok.t> TBracketAt "[@" TBracketAtAt "[@@" TBracketAtAtAt "[@@@"
+%token <Tok.t> TBracketPercent "[%" TBracketPercentPercent "[%%"
 
 (*-----------------------------------------*)
 (* extra tokens: *)
 (*-----------------------------------------*)
-%token <Parse_info.t> TSharpDirective
+%token <Tok.t> TSharpDirective
 
 (* sgrep-ext: *)
-%token <Parse_info.t> TDots "..." LDots "<..." RDots "...>"
+%token <Tok.t> TDots "..." LDots "<..." RDots "...>"
 
 (*************************************************************************)
 (* Priorities *)
@@ -206,10 +205,10 @@ let topseqexpr v1 = mki (TopExpr (seq1 v1))
 (*************************************************************************)
 (* Rules type declaration *)
 (*************************************************************************)
-%start <Ast_ml.item list> interface
-%start <Ast_ml.item list> implementation
-%start <Ast_ml.any> semgrep_pattern
-%start <Ast_ml.type_> type_for_lsp
+%start <AST_ocaml.item list> interface
+%start <AST_ocaml.item list> implementation
+%start <AST_ocaml.any> semgrep_pattern
+%start <AST_ocaml.type_> type_for_lsp
 
 %%
 (*************************************************************************)
@@ -287,19 +286,19 @@ semgrep_pattern:
      { I { i = $1; iattrs = $2 } }
  | just_in_structure post_item_attribute*  EOF
      { I { i = $1; iattrs = $2 } }
- | ":" core_type                       EOF { T $2 }
+ | ":" core_type_no_attr               EOF { T $2 }
  | "|" pattern                         EOF { P $2 }
  | "|" pattern match_action            EOF { MC ($2, $3) }
  (* partial *)
  | partial EOF { Partial $1 }
 
 (* this is used by semgrep -lsp to parse the types returned by ocamllsp *)
-type_for_lsp: core_type EOF { $1 }
+type_for_lsp: core_type_no_attr EOF { $1 }
 
 signature_or_structure_common:
  | Ttype list_and(type_declaration)
      { Type ($1, $2) }
- | Texternal val_ident ":" core_type "=" primitive_declaration
+ | Texternal val_ident ":" core_type_no_attr "=" primitive_declaration
      { External ($1, $2, $4, $6) }
  | Texception TUpperIdent generalized_constructor_arguments
      { Exception ($1, $2, $3) }
@@ -344,7 +343,7 @@ signature_item_noattr:
  | just_in_signature { $1 }
 
 just_in_signature:
- | Tval val_ident ":" core_type                { Val ($1, $2, $4) }
+ | Tval val_ident ":" core_type_no_attr                { Val ($1, $2, $4) }
  (* modules *)
  | Tmodule TUpperIdent module_declaration
     { ItemTodo (("ModuleDecl", $1), [$3]) }
@@ -621,7 +620,7 @@ simple_expr:
  | "(" seq_expr ")"
      { match $2 with
      | [] -> Sequence ($1, [], $3)
-     (* Ml_to_generic will do the right thing if x is a tuple or
+     (* Ocaml_to_generic will do the right thing if x is a tuple or
       * if this expression is part of a Constructor call.
       *)
      | [x] -> ParenExpr ($1, x, $3)
@@ -759,7 +758,7 @@ pattern:
        | Right _lit -> failwith "Impossible, literal with pattern argument"
      }
  (* the fake will be replace by real parens in simple_pattern last case *)
- | pattern_comma_list       %prec below_COMMA     { PatTuple (PI.unsafe_fake_bracket $1) }
+ | pattern_comma_list       %prec below_COMMA     { PatTuple (Tok.unsafe_fake_bracket $1) }
  | pattern "::" pattern                           { PatConsInfix ($1, $2, $3) }
 
  | pattern Tas val_ident                          { PatAs ($1, $3) }
@@ -779,8 +778,8 @@ simple_pattern:
  | val_ident %prec below_EQUAL      { PatVar ($1) }
  | constr_longident
      { match $1 with
-       | Left x -> PatConstructor (x, None)
-       | Right lit -> PatLiteral lit
+       | Either.Left x -> PatConstructor (x, None)
+       | Either.Right lit -> PatLiteral lit
      }
 
  | "_"                              { PatUnderscore $1 }
@@ -792,7 +791,7 @@ simple_pattern:
     { PatTodo (("ArrayLiteral",$1), optlist_to_list $2) }
 
  (* note that let (x:...) a =  will trigger this rule *)
- | "(" pattern ":" core_type ")"               { PatTyped ($2, $3, $4)}
+ | "(" pattern ":" core_type_no_attr ")"               { PatTyped ($2, $3, $4)}
 
  (* extensions *)
  (* name tag extension *)
@@ -847,21 +846,20 @@ signed_constant:
 (*************************************************************************)
 
 type_constraint:
- | ":" poly_type     { $1, $2 }
+ | ":" poly_type_no_attr     { $1, $2 }
  (* object cast extension *)
- | ":>" core_type    { $1, $2 }
+ | ":>" core_type_no_attr    { $1, $2 }
 
 (*----------------------------*)
 (* Types definitions *)
 (*----------------------------*)
 
 type_declaration: type_parameters TLowerIdent type_kind (*TODOAST constraints*)
-   { let tparams = $1 |> List.map (fun id -> TyParam id) in
-     match $3 with
+   { match $3 with
      | None ->
-         TyDecl { tname = $2; tparams; tbody = AbstractType }
+         TyDecl { tname = $2; tparams = $1; tbody = AbstractType }
      | Some (_tok_eq, type_kind) ->
-         TyDecl { tname = $2; tparams; tbody = type_kind }
+         TyDecl { tname = $2; tparams = $1; tbody = type_kind }
    }
 
 
@@ -888,11 +886,11 @@ constructor_arguments:
  | "{" label_declarations "}" { [ TyTodo(("InlineRecord", $1), []) ] }
 
 type_parameters:
- |  (*empty*)                          { []  }
- | type_parameter                      { [$1] }
- | "(" list_sep(type_parameter, ",") ")" { $2 }
+ |  (*empty*)                          { None  }
+ | type_parameter                      { Some (Tok.unsafe_fake_bracket [$1]) }
+ | "(" list_sep(type_parameter, ",") ")" { Some ($1, $2, $3) }
 
-type_parameter: ioption(type_variance) "'" ident   { $3 }
+type_parameter: ioption(type_variance) "'" ident   { TyParam $3 }
 
 (* old: list_sep_term(label_declaration, ";") but accept attr after ; *)
 label_declarations:
@@ -900,7 +898,7 @@ label_declarations:
  | label_declaration ";" attribute* { [$1] }
  | label_declaration ";" attribute* label_declarations { $1 :: $4 }
 
-label_declaration: Tmutable? label ":" poly_type attribute*
+label_declaration: Tmutable? label ":" poly_type_no_attr attribute*
    { $2, $4, $1 }
 
 (*----------------------------*)
@@ -919,19 +917,21 @@ label_declaration: Tmutable? label ":" poly_type attribute*
  *)
 atomic_type: simple_core_type_or_tuple { $1 }
 
-core_type:
+core_type: core_type_no_attr attribute* { $1 }
+
+core_type_no_attr:
  | simple_core_type_or_tuple
      { $1 }
- | core_type "->" core_type
+ | core_type_no_attr "->" core_type_no_attr
      { TyFunction ($1, $3) }
 
  (* ext: olabl *)
- | TLowerIdent     ":" core_type "->" core_type
+ | TLowerIdent     ":" core_type_no_attr "->" core_type_no_attr
      { TyFunction ($3, $5) (* TODOAST $1 $2 *)  }
- | "?" TLowerIdent ":" core_type "->" core_type
+ | "?" TLowerIdent ":" core_type_no_attr "->" core_type_no_attr
      { TyFunction ($4, $6) (* TODOAST $1 $2 *)  }
  (* pad: only because of lexer hack around labels *)
- | TOptLabelDecl    core_type "->" core_type
+ | TOptLabelDecl    core_type_no_attr "->" core_type_no_attr
      { TyFunction ($2, $4) (* TODOAST $1 $2 *)  }
 
 
@@ -944,14 +944,14 @@ simple_core_type_or_tuple:
 simple_core_type:
  | simple_core_type2   { $1 }
  (* weird diff between 'Foo of a * b' and 'Foo of (a * b)' *)
- | "(" list_sep(core_type, ",") ")" { TyTuple ($2) }
+ | "(" list_sep(core_type_no_attr, ",") ")" { TyTuple ($2) }
 
 simple_core_type2:
  | type_variable                                 { $1 }
  | type_longident                                { TyName ($1) }
- | simple_core_type2 type_longident              { TyApp ([$1], $2) }
- | "(" list_sep(core_type, ",") ")" type_longident
-      { TyApp (($2), $4) }
+ | simple_core_type2 type_longident              { TyApp (Tok.unsafe_fake_bracket [$1], $2) }
+ | "(" list_sep(core_type_no_attr, ",") ")" type_longident
+      { TyApp (($1, $2, $3), $4) }
 
  (* name tag extension *)
  | polymorphic_variant_type                       { $1 }
@@ -984,10 +984,13 @@ polymorphic_variant_type:
 (* Advanced types *)
 (*----------------------------*)
 
-poly_type:
- | type_parameter+ "." core_type { TyTodo(("Poly",$2), [$3]) }
- | abstract_type "." core_type   { TyTodo(("Poly", $2), [$3]) }
- | core_type { $1 }
+(* TODO: same as poly_type_no_attr but use core_type in body *)
+poly_type: poly_type_no_attr { $1 }
+
+poly_type_no_attr:
+ | type_parameter+ "." core_type_no_attr { TyTodo(("Poly",$2), [$3]) }
+ | abstract_type "." core_type_no_attr   { TyTodo(("Poly", $2), [$3]) }
+ | core_type_no_attr { $1 }
 
 (* TODOAST *)
 abstract_type: Ttype TLowerIdent+ { }
@@ -997,7 +1000,7 @@ row_field:
  | simple_core_type2                           { $1 }
 
 tag_field:
- | name_tag Tof TAnd? list_and(core_type)   { TyTodo (("Tag",fst $1),$4)}
+ | name_tag Tof TAnd? list_and(core_type_no_attr)   { TyTodo (("Tag",fst $1),$4)}
  | name_tag                                  { TyTodo (("Tag",fst $1),[]) }
 
 meth_list:
@@ -1005,7 +1008,7 @@ meth_list:
   | field ";"?                              { [$1] }
   | ".."                                    { [TyTodo(("..",$1), [])] }
 
-field: label ":" poly_type attribute*       { TyTodo(("Field",$2), [$3]) }
+field: label ":" poly_type_no_attr attribute*       { TyTodo(("Field",$2), [$3]) }
 
 type_variance:
   | "+" { }
@@ -1018,7 +1021,7 @@ type_variance:
 let_binding:
  | val_ident fun_binding
       { let (lparams, (lrettype, _teq, body)) = $2 in
-        LetClassic { lname = $1; lparams; lrettype; lbody = seq1 body; } }
+        LetClassic { lname = $1; lparams; lrettype; lbody = seq1 body; lattrs = [] } }
  | pattern "=" seq_expr
       { LetPattern ($1, seq1 $3) }
 
@@ -1066,7 +1069,7 @@ label_pattern:
 
 label_let_pattern:
  | label_var                { }
- | label_var ":" core_type  { }
+ | label_var ":" core_type_no_attr  { }
 
 (*************************************************************************)
 (* Classes *)
@@ -1094,7 +1097,7 @@ class_sig_body: class_self_type class_sig_fields { }
 
 class_self_type:
   | (*empty*) {  }
-  | "(" core_type ")"  { }
+  | "(" core_type_no_attr ")"  { }
 
 class_sig_fields: class_sig_field* { }
 
@@ -1111,9 +1114,9 @@ virtual_method_type:
   | Tmethod Tvirtual Tprivate? label ":" poly_type   {  }
 
 value_type:
-  | Tvirtual Tmutable? label ":" core_type     { }
-  | Tmutable Tvirtual? label ":" core_type  {  }
-  | label ":" core_type     {  }
+  | Tvirtual Tmutable? label ":" core_type_no_attr     { }
+  | Tmutable Tvirtual? label ":" core_type_no_attr  {  }
+  | label ":" core_type_no_attr     {  }
 
 (*----------------------------*)
 (* Class expressions *)
@@ -1147,7 +1150,7 @@ class_expr:
 
 %inline
 actual_class_parameters:
- | "[" list_sep(core_type, ",") "]"  { }
+ | "[" list_sep(core_type_no_attr, ",") "]"  { }
  | (* empty *) { }
 
 class_simple_expr:
@@ -1167,7 +1170,7 @@ class_structure: class_self_pattern class_fields { }
 
 class_self_pattern:
   | "(" pattern ")"                { }
-  | "(" pattern ":" core_type ")"  { }
+  | "(" pattern ":" core_type_no_attr ")"  { }
   | (*empty*)                      { }
 
 
@@ -1186,8 +1189,8 @@ parent_binder:
   | (* empty *) { }
 
 virtual_value:
-  | "!"? Tmutable Tvirtual label ":" core_type  { }
-  |      Tvirtual Tmutable label ":" core_type                { }
+  | "!"? Tmutable Tvirtual label ":" core_type_no_attr  { }
+  |      Tvirtual Tmutable label ":" core_type_no_attr                { }
 
 value:
   | "!"? ioption(Tmutable) label "=" seq_expr      { }
@@ -1238,7 +1241,7 @@ module_type_noattr:
 
 
 with_constraint:
- | Ttype type_parameters label_longident with_type_binder core_type
+ | Ttype type_parameters label_longident with_type_binder core_type_no_attr
     (*constraints*)
    { }
 
@@ -1260,8 +1263,8 @@ module_expr:
   | Tfunctor "(" TUpperIdent ":" module_type ")" "->" module_expr
      { ModuleTodo (("Functor", $1), [$8]) }
   (* module/functor application *)
-  | module_expr "(" module_expr ")"
-    { ModuleTodo (("FunctorApply", $2), [$1; $3]) }
+  | module_expr "(" module_expr? ")"
+    { ModuleTodo (("FunctorApply", $2), $1::(Option.to_list $3)) }
 
 (*************************************************************************)
 (* Attributes *)

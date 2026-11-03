@@ -16,14 +16,11 @@
  * license.txt for more details.
  *
  *)
-
 open Parser_cpp
 open Ast_cpp (* to factorise tokens with OpAssign, ... *)
 
-module Flag = Flag_parsing
 module Flag_cpp = Flag_parsing_cpp
 module Ast = Ast_cpp
-module PI = Parse_info
 
 (*****************************************************************************)
 (* Prelude *)
@@ -55,16 +52,16 @@ module PI = Parse_info
 
 (* shortcuts *)
 let tok = Lexing.lexeme
-let tokinfo = Parse_info.tokinfo
-let error = Parse_info.lexical_error
-let tok_add_s = Parse_info.tok_add_s
+let tokinfo = Tok.tok_of_lexbuf
+let error = Parsing_error.lexical_error
+let tok_add_s = Tok.tok_add_s
 
 (* ---------------------------------------------------------------------- *)
 (* Keywords *)
 (* ---------------------------------------------------------------------- *)
 
 (* opti: less convenient, but using a hash is faster than using a match *)
-let keyword_table = Common.hash_of_list [
+let keyword_table = Hashtbl_.Base.hash_of_list [
 
   "void",   (fun ii -> Tvoid ii);
   "char",   (fun ii -> Tchar ii);
@@ -106,6 +103,10 @@ let keyword_table = Common.hash_of_list [
   "explicit", (fun ii -> Texplicit ii);
   "mutable", (fun ii -> Tmutable ii);
   "virtual", (fun ii -> Tvirtual ii);
+
+  (* virtual specifier *)
+  "final", (fun ii -> Tfinal ii);
+  "override", (fun ii -> Toverride ii);
 
   (* c++0x:  *)
   "constexpr", (fun ii -> Tconstexpr ii);
@@ -470,8 +471,8 @@ rule token = parse
   | letter (letter | digit) *
       { let info = tokinfo lexbuf in
         let s = tok lexbuf in
-        Profiling.profile_code "C parsing.lex_ident" (fun () ->
-          match Common2.optionise (fun () -> Hashtbl.find keyword_table s) with
+        Profiling.measure "C parsing.lex_ident" (fun () ->
+          match Base.Hashtbl.find keyword_table s with
           | Some f -> f info
 
            (* typedef_hack. note: now this is no more useful, cos
@@ -496,13 +497,13 @@ rule token = parse
   | (letter | '$') (letter | digit | '$')*
       {
         let s = tok lexbuf in
-        if not !Flag_parsing.sgrep_mode
+        if not (Hook.get Flag_parsing.sgrep_mode)
         then error ("identifier with dollar: "  ^ s) lexbuf;
         TIdent (s, tokinfo lexbuf)
       }
   (* sgrep-ext: *)
   | '$' "..." ['A'-'Z''_']['A'-'Z''_''0'-'9']*
-     { Flag.sgrep_guard (TIdent (tok lexbuf, tokinfo lexbuf)) }
+     { Flag_parsing.sgrep_guard (TIdent (tok lexbuf, tokinfo lexbuf)) }
 
 
   (* ----------------------------------------------------------------------- *)
@@ -542,7 +543,7 @@ rule token = parse
   (* this is also part of the case below, but we specialize it here to use the
    * right int_of_string *)
   | "0" (oct+ as n)
-     { TInt (int_of_string_opt( "0o" ^ n), tokinfo lexbuf) }
+     { TInt (Parsed_int.parse ( "0o" ^ n, tokinfo lexbuf)) }
 
   | (( decimal | hexa | octal)
         ( ['u' 'U']
@@ -552,7 +553,7 @@ rule token = parse
         | (['u' 'U'] ['l' 'L'] ['l' 'L'])
         | (['l' 'L'] ['l' 'L'])
         )?
-    ) as x { TInt (int_of_string_opt x, tokinfo lexbuf) }
+    ) as x { TInt (Parsed_int.parse (x, tokinfo lexbuf)) }
 
   | (real ['f' 'F']) as x { TFloat ((float_of_string_opt x, tokinfo lexbuf)) }
   | (real ['l' 'L']) as x { TFloat ((float_of_string_opt x, tokinfo lexbuf)) }
@@ -579,7 +580,7 @@ rule token = parse
  | ['0'-'1']+'b' { TInt (((tok lexbuf)<!!>(0,-2)) |> int_of_stringbits) }
 *)
   (*------------------------------------------------------------------------ *)
-  | eof { EOF (tokinfo lexbuf |> PI.rewrap_str "") }
+  | eof { EOF (tokinfo lexbuf |> Tok.rewrap_str "") }
 
   | _ {
       error("unrecognised symbol, in token rule:" ^ tok lexbuf) lexbuf;

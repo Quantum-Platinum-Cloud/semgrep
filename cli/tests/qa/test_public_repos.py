@@ -1,4 +1,16 @@
 #
+# Copyright (c) 2020-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
+#
 # TODO: explain what these tests are for if you happen to know.
 #
 import contextlib
@@ -8,12 +20,16 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import appdirs
+import appdirs  # type: ignore
 import pytest
+from tests.conftest import TESTS_PATH
+from tests.semgrep_runner import SEMGREP_BASE_SCAN_COMMAND
 
-from ..conftest import TESTS_PATH
-from ..semgrep_runner import SEMGREP_BASE_COMMAND
 from .public_repos import REPOS
+
+# TODO: we shouldn't ignore the types of the appdirs module.
+# They're supposed to be provided by the types-appdirs package
+# but I can't make it work -- Martin
 
 # Some improbable string that was implanted in test targets [how?] [why?].
 #
@@ -53,8 +69,9 @@ def chdir(dirname=None):
 
 
 def assert_sentinel_results(repo_path, sentinel_path, language):
-    cmd = SEMGREP_BASE_COMMAND + [
+    cmd = SEMGREP_BASE_SCAN_COMMAND + [
         "--disable-version-check",
+        "--timeout=0",
         "--pattern",
         SENTINEL_PATTERN,
         "--lang",
@@ -62,9 +79,16 @@ def assert_sentinel_results(repo_path, sentinel_path, language):
         "--json",
         repo_path,
         "--metrics=off",
+        # Multicore w/ a parallel runner can cause thrashing and timeouts.
+        "-j1",
         # Turn off optimizations since it skips parsing when it can and this test is testing parsing
         "--optimizations=none",
     ]
+
+    # This is useful for debugging. I don't see a downside to printing
+    # such important debugging info when running tests so I'm leaving it
+    # -- Martin
+    print(f"semgrep command: {cmd}")
 
     # nosemgrep: python.lang.security.audit.dangerous-subprocess-use.dangerous-subprocess-use
     semgrep_run = subprocess.run(cmd, capture_output=True, encoding="utf-8")
@@ -157,15 +181,17 @@ def test_semgrep_on_repo(monkeypatch, tmp_path, repo):
         sentinel_path = repo_path / sentinel_info["filename"]
         with sentinel_path.open("w") as sentinel_file:
             sentinel_file.write(sentinel_info["file_contents"])
-
         assert_sentinel_results(repo_path, sentinel_path, language)
 
-    cmd = SEMGREP_BASE_COMMAND + [
+    cmd = SEMGREP_BASE_SCAN_COMMAND + [
         "--disable-version-check",
         "--config=rules/regex-sentinel.yaml",
+        "--timeout=0",
         "--strict",
         "--json",
         "--metrics=off",
+        # Multicore w/ a parallel runner can cause thrashing and timeouts.
+        "-j1",
         # Turn off optimizations since it skips parsing when it can and this test is testing parsing
         "--optimizations=none",
         repo_path,

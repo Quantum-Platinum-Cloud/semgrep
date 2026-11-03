@@ -1,6 +1,6 @@
 (* Nat Mote
  *
- * Copyright (C) 2019-2022 r2c
+ * Copyright (C) 2019-2022 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -20,9 +20,11 @@ module B = Immutable_buffer
 let b = B.of_string
 let combine = B.combine
 
-(******************************************************************************)
-(* UglyPrinter prints syntactically-correct code without attempting to format it
- * nicely (as opposed to a pretty printer such as those based on Wadler's "A
+(*****************************************************************************)
+(* Prelude *)
+(*****************************************************************************)
+(* UglyPrinter prints syntactically-correct code without attempting to format
+ * it nicely (as opposed to a pretty printer such as those based on Wadler's "A
  * prettier printer" [1]). It would be difficult, if not impossible, to print
  * code that conforms to everyone's style guides, linters, and formatters, so
  * the prettifying of code is left to other tools.
@@ -55,70 +57,72 @@ let combine = B.combine
  * address that as we migrate it here.
  *
  * [1] https://homepages.inf.ed.ac.uk/wadler/papers/prettier/prettier.pdf *)
-(******************************************************************************)
 
-class type printer_t =
-  object
-    method print_any : G.any -> (Immutable_buffer.t, string) result
+(*****************************************************************************)
+(* Types *)
+(*****************************************************************************)
 
-    (* Prints an expression, inserting parentheses around it if needed. *)
-    method print_expr : G.expr -> (Immutable_buffer.t, string) result
-    method print_expr_kind : G.expr_kind -> (Immutable_buffer.t, string) result
-    method print_argument : G.argument -> (Immutable_buffer.t, string) result
-    method print_arguments : G.arguments -> (Immutable_buffer.t, string) result
+class type printer_t = object
+  method print_any : G.any -> (Immutable_buffer.t, string) result
 
-    method print_unbracketed_arguments :
-      G.argument list -> (Immutable_buffer.t, string) result
+  (* Prints an expression, inserting parentheses around it if needed. *)
+  method print_expr : G.expr -> (Immutable_buffer.t, string) result
+  method print_expr_kind : G.expr_kind -> (Immutable_buffer.t, string) result
+  method print_argument : G.argument -> (Immutable_buffer.t, string) result
+  method print_arguments : G.arguments -> (Immutable_buffer.t, string) result
 
-    method print_dot_access :
-      G.expr -> G.tok -> G.field_name -> (Immutable_buffer.t, string) result
+  method print_unbracketed_arguments :
+    G.argument list -> (Immutable_buffer.t, string) result
 
-    method print_field_name :
-      G.field_name -> (Immutable_buffer.t, string) result
+  method print_dot_access :
+    G.expr -> G.tok -> G.field_name -> (Immutable_buffer.t, string) result
 
-    method print_name : G.name -> (Immutable_buffer.t, string) result
-    method print_ident : G.ident -> (Immutable_buffer.t, string) result
+  method print_field_name : G.field_name -> (Immutable_buffer.t, string) result
+  method print_name : G.name -> (Immutable_buffer.t, string) result
+  method print_ident : G.ident -> (Immutable_buffer.t, string) result
 
-    method print_call :
-      G.expr -> G.arguments -> (Immutable_buffer.t, string) result
+  method print_call :
+    G.expr -> G.arguments -> (Immutable_buffer.t, string) result
 
-    (* Takes `expr` rather than `operator` to facilitate hybrid_print. The
-     * hybrid_print primary printer takes an `AST_generic.any`, and there is no
-     * `any` variant for `operator`.
-     *
-     * We could refactor to support this but unless we run into other similar
-     * issues, it doesn't seem worth the additional boilerplate. This doesn't
-     * make implementing a printer any more difficult, since `print_expr` should
-     * handle `IdSpecial (Op ...)` anyway. *)
-    method print_opcall :
-      G.expr -> G.arguments -> (Immutable_buffer.t, string) result
+  (* Takes `expr` rather than `operator` to facilitate hybrid_print. The
+   * hybrid_print primary printer takes an `AST_generic.any`, and there is no
+   * `any` variant for `operator`.
+   *
+   * We could refactor to support this but unless we run into other similar
+   * issues, it doesn't seem worth the additional boilerplate. This doesn't
+   * make implementing a printer any more difficult, since `print_expr` should
+   * handle `IdSpecial (Op ...)` anyway. *)
+  method print_opcall :
+    G.expr -> G.arguments -> (Immutable_buffer.t, string) result
 
-    method print_ordinary_call :
-      G.expr -> G.arguments -> (Immutable_buffer.t, string) result
+  method print_ordinary_call :
+    G.expr -> G.arguments -> (Immutable_buffer.t, string) result
 
-    (* TODO Add more nodes as needed. *)
+  (* TODO Add more nodes as needed. *)
 
-    (* Clients should not (and cannot) call the methods below, but subclasses of
-     * base_printer should consider overriding them to control printing
-     * behavior. *)
+  (* Clients should not (and cannot) call the methods below, but subclasses of
+   * base_printer should consider overriding them to control printing
+   * behavior. *)
 
-    (* Determines whether the node in question needs to be surrounded by
-     * parentheses. For example, `2 + 3 * 5` has a different meaning than
-     * `(2 + 3) * 5`.
-     *
-     * TODO Include some context as a paremeter, which will be needed when we
-     * want to insert parentheses only where absolutely necessary. *)
-    method private needs_parens : G.any -> bool
+  (* Determines whether the node in question needs to be surrounded by
+   * parentheses. For example, `2 + 3 * 5` has a different meaning than
+   * `(2 + 3) * 5`.
+   *
+   * TODO Include some context as a paremeter, which will be needed when we
+   * want to insert parentheses only where absolutely necessary. *)
+  method private needs_parens : G.any -> bool
 
-    (* Subclasses should normally override print_expr_without_parens rather than
-     * print_expr, unless they want to modify the parentheses-insertion behavior in
-     * a way that is not possible by overriding needs_parens. Clients should not
-     * call this directly. *)
-    method private print_expr_without_parens :
-      G.expr -> (Immutable_buffer.t, string) result
-  end
+  (* Subclasses should normally override print_expr_without_parens rather than
+   * print_expr, unless they want to modify the parentheses-insertion behavior in
+   * a way that is not possible by overriding needs_parens. Clients should not
+   * call this directly. *)
+  method private print_expr_without_parens :
+    G.expr -> (Immutable_buffer.t, string) result
+end
 
-let ( let/ ) = Result.bind
+(*****************************************************************************)
+(* Helpers *)
+(*****************************************************************************)
 
 (* Ok if and only if `f` returns `Ok for all elements. Short circuits when
  * the first `Error is encountered.
@@ -142,6 +146,10 @@ let print_fail () =
   let callstack = Printexc.(get_callstack 10 |> raw_backtrace_to_string) in
   let msg = spf "Could not print AST:\n%s" callstack in
   Error msg
+
+(*****************************************************************************)
+(* Helper classes to inherit from *)
+(*****************************************************************************)
 
 (* We could consider partially replacing this with an autogenerated reduce
  * visitor, where `plus` simply returns `Error`. That could cut down on the
@@ -192,7 +200,7 @@ class base_printer : printer_t =
       match e.G.e with
       (* Binary operator expressions are desugared to calls, but are different
        * enough that they merit a separate method here. *)
-      | G.IdSpecial (G.Op _, _) -> self#print_opcall e args
+      | G.Special (G.Op _, _) -> self#print_opcall e args
       (* TODO also handle other kinds of IdSpecial *)
       | _ -> self#print_ordinary_call e args
 
@@ -206,7 +214,7 @@ class base_printer : printer_t =
      * actually needed. *)
     method private needs_parens =
       function
-      | G.E { e = G.Call ({ e = G.IdSpecial (G.Op _, _); _ }, _); _ } -> true
+      | G.E { e = G.Call ({ e = G.Special (G.Op _, _); _ }, _); _ } -> true
       | _ -> false
 
     method private add_parens_if_needed any res =
@@ -251,6 +259,7 @@ class virtual common_printer =
       function
       | G.Id (ident, _) -> self#print_ident ident
       | G.IdQualified _ -> print_fail ()
+      | G.IdSpecial _ -> print_fail ()
 
     method print_ident (str, _) = Ok (b str)
 
@@ -277,6 +286,10 @@ class virtual common_printer =
         : G.expr -> G.tok -> G.field_name -> (Immutable_buffer.t, string) result
   end
 
+(*****************************************************************************)
+(* Languages ugly printers *)
+(*****************************************************************************)
+
 class python_printer : printer_t =
   object (self)
     inherit base_printer
@@ -292,4 +305,9 @@ class jsts_printer : printer_t =
   object (_self)
     inherit base_printer
     inherit! common_printer
+  end
+
+class ocaml_printer : printer_t =
+  object (_self)
+    inherit base_printer
   end

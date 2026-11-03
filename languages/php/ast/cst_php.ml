@@ -1,7 +1,7 @@
 (* Yoann Padioleau
  *
  * Copyright (C) 2009-2013 Facebook
- * Copyright (C) 2020 R2C
+ * Copyright (C) 2020 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -70,11 +70,7 @@ open Common
 (* ------------------------------------------------------------------------- *)
 (* Token/info *)
 (* ------------------------------------------------------------------------- *)
-(* Contains among other things the position of the token through
- * the Parse_info.parse_info embedded inside it, as well as the
- * transformation field that makes possible spatch.
- *)
-type tok = Parse_info.t
+type tok = Tok.t
 
 (* shortcuts to annotate some information with token/position information *)
 and 'a wrap = 'a * tok
@@ -83,12 +79,11 @@ and 'a brace = tok * 'a * tok
 and 'a bracket = tok * 'a * tok
 and 'a angle = tok * 'a * tok
 and 'a single_angle = tok * 'a * tok
-and 'a comma_list = ('a, tok (* the comma *)) Common.either list
+and 'a comma_list = ('a, tok (* the comma *)) Either_.t list
 
 and 'a comma_list_dots =
-  ('a, tok (* ... in parameters *), tok (* the comma *)) Common.either3 list
+  ('a, tok (* ... in parameters *), tok (* the comma *)) Either_.either3 list
 [@@deriving show]
-(* with tarzan *)
 
 (* ------------------------------------------------------------------------- *)
 (* Ident/Name/LongName   *)
@@ -125,7 +120,6 @@ and qualified_ident_element =
   | QI of ident (* the ident can be 'namespace' *)
   | QITok of tok (* '\' *)
 [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 type name =
   | XName of qualified_ident
@@ -138,7 +132,6 @@ type name =
   (* php 5.3 late static binding (no idea why it's useful ...) *)
   | LateStatic of tok
 [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 (*****************************************************************************)
 (* Types *)
@@ -304,7 +297,7 @@ and scalar =
 
 and constant =
   | Bool of bool wrap
-  | Int of int option wrap (* decimal, hex, or binary int format *)
+  | Int of Parsed_int.t (* decimal, hex, or binary int format *)
   | Double of float option wrap
   (* see also Guil for interpolated strings
    * The string does not contain the enclosing '"' or "'".
@@ -333,7 +326,7 @@ and encaps =
   | EncapsDollarCurly of tok (* '${' *) * lvalue * tok
   | EncapsExpr of tok * expr * tok
 
-and fixOp = AST_generic_.incr_decr
+and fixOp = AST_generic.incr_decr
 
 and binaryOp =
   | Arith of arithOp
@@ -694,7 +687,7 @@ and class_stmt =
   | UseTrait of
       tok (*use*)
       * class_name comma_list
-      * (tok (* ; *), trait_rule list brace) Common.either
+      * (tok (* ; *), trait_rule list brace) Either_.t
   (* ?? *)
   | ClassType of type_def
   (* semgrep-ext:  *)
@@ -736,7 +729,7 @@ and trait_rule =
       * class_name comma_list
       * tok (* ; *)
   | As of
-      (ident, name * tok * ident) Common.either
+      (ident, name * tok * ident) Either_.t
       * tok (* as *)
       * modifier wrap list
       * ident option
@@ -823,14 +816,12 @@ and toplevel =
 and namespace_use_rule = qualified_ident * alias option
 and alias = tok (* as *) * ident
 and program = toplevel list [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 (*****************************************************************************)
 (* Any *)
 (*****************************************************************************)
 
 type partial = PartialIf of tok * expr [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 type any =
   | Expr of expr
@@ -856,38 +847,32 @@ type any =
   | Ident2 of ident
   | Hint2 of hint_type
 [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 (*****************************************************************************)
 (* Some constructors *)
 (*****************************************************************************)
-let fakeInfo ?(next_to = None) str =
-  {
-    Parse_info.token = Parse_info.FakeTokStr (str, next_to);
-    transfo = Parse_info.NoTransfo;
-  }
+(* TODO: reuse Tok.fake_tok ? *)
+let fakeInfo ?next_to str = Tok.FakeTok (str, next_to)
+
 (*****************************************************************************)
 (* Wrappers *)
 (*****************************************************************************)
 
 let unwrap = fst
-let unparen (_a, b, _c) = b
-let unbrace = unparen
-let unbracket = unparen
 
 let uncomma xs =
-  Common.map_filter
+  List.filter_map
     (function
-      | Left e -> Some e
-      | Right _info -> None)
+      | Either.Left e -> Some e
+      | Either.Right _info -> None)
     xs
 
 let uncomma_dots xs =
-  Common.map_filter
+  List.filter_map
     (function
-      | Left3 e -> Some e
-      | Right3 _info
-      | Middle3 _info ->
+      | Either_.Left3 e -> Some e
+      | Either_.Right3 _info
+      | Either_.Middle3 _info ->
           None)
     xs
 
@@ -900,12 +885,12 @@ let unarg arg =
 
 let unargs xs =
   uncomma xs
-  |> Common.partition_either (function
-       | Arg e -> Left e
-       | ArgRef (_, e)
-       | ArgUnpack (_, e)
-       | ArgLabel (_, _, e) ->
-           Right e)
+  |> Either_.partition (function
+    | Arg e -> Left e
+    | ArgRef (_, e)
+    | ArgUnpack (_, e)
+    | ArgLabel (_, _, e) ->
+        Right e)
 
 let unmodifiers class_vars =
   match class_vars with
@@ -918,8 +903,8 @@ let map_comma_list f xs =
   List.map
     (fun x ->
       match x with
-      | Left e -> Left (f e)
-      | Right tok -> Right tok)
+      | Either.Left e -> Either.Left (f e)
+      | Either.Right tok -> Either.Right tok)
     xs
 
 (*****************************************************************************)
@@ -933,7 +918,7 @@ let map_comma_list f xs =
  * information, to "abstract those line" (al) information.
  *)
 
-let al_info x = { x with Parse_info.token = Parse_info.Ab }
+let al_info _x = Tok.Ab
 
 (*****************************************************************************)
 (* Views *)
@@ -984,7 +969,7 @@ let str_of_name x =
   | Self tok
   | Parent tok
   | LateStatic tok ->
-      Parse_info.str_of_info tok
+      Tok.content_of_tok tok
   | XName qu -> raise (TodoNamespace (info_of_qualified_ident qu))
 
 let str_of_name_namespace x =
@@ -992,13 +977,13 @@ let str_of_name_namespace x =
   | Self tok
   | Parent tok
   | LateStatic tok ->
-      Parse_info.str_of_info tok
+      Tok.content_of_tok tok
   | XName xs ->
       xs
       |> List.map (function
-           | QITok _ -> "\\"
-           | QI id -> str_of_ident id)
-      |> Common.join ""
+        | QITok _ -> "\\"
+        | QI id -> str_of_ident id)
+      |> String.concat ""
 
 let name_of_class_name x =
   match x with

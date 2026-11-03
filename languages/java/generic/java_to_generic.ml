@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2019 r2c
+ * Copyright (C) 2019 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -30,16 +30,16 @@ module H = AST_generic_helpers
 (*****************************************************************************)
 let id x = x
 let option = Option.map
-let list = Common.map
+let list = List.map
 let (string : string -> string) = id
 let (bool : bool -> bool) = id
 let (int : int -> int) = id
 let error = AST_generic.error
-let fake tok s = Parse_info.fake_info tok s
-let unsafe_fake s = Parse_info.unsafe_fake_info s
+let fake tok s = Tok.fake_tok tok s
+let unsafe_fake s = Tok.unsafe_fake_tok s
 
 (* todo: to remove at some point when Ast_java includes them directly *)
-let fb = G.fake_bracket
+let fb = Tok.unsafe_fake_bracket
 
 let id_of_entname = function
   | G.EN (Id (id, idinfo)) -> (id, idinfo)
@@ -119,7 +119,7 @@ and class_type v =
       |> G.t
   | (id, Some ts) :: xs ->
       G.TyApply
-        (G.TyN (H.name_of_ids (List.rev (id :: Common.map fst xs))) |> G.t, ts)
+        (G.TyN (H.name_of_ids (List.rev (id :: List.map fst xs))) |> G.t, ts)
       |> G.t
 
 and type_argument = function
@@ -145,7 +145,7 @@ let type_parameter = function
       G.tparam_of_id v1 ~tp_bounds:v2
 
 let rec modifier (x, tok) =
-  let s = Parse_info.str_of_info tok in
+  let s = Tok.content_of_tok tok in
   match x with
   | Public -> G.attr G.Public tok
   | Protected -> G.attr G.Protected tok
@@ -158,7 +158,7 @@ let rec modifier (x, tok) =
   | Volatile -> G.attr G.Volatile tok
   | Synchronized -> G.unhandled_keywordattr (s, tok)
   | Native -> G.unhandled_keywordattr (s, tok)
-  | DefaultModifier -> G.unhandled_keywordattr (s, tok)
+  | DefaultModifier -> G.attr G.DefaultImpl tok
   | Sealed -> G.attr G.SealedClass tok
   | NonSealed -> G.unhandled_keywordattr (s, tok)
   | Annotation v1 -> annotation v1
@@ -223,180 +223,209 @@ and name v =
   )
 *)
 and literal = function
-  | Int v1 ->
-      let v1 = wrap id v1 in
-      G.Int v1
+  | Int v1 -> G.L (G.Int v1)
   | Float v1 ->
       let v1 = wrap id v1 in
-      G.Float v1
-  | String v1 ->
-      let v1 = wrap string v1 in
-      G.String v1
+      G.L (G.Float v1)
+  | String (l, x, r) ->
+      let e = (l, List.map string_component x, r) |> G.interpolated in
+      e.G.e
   | TextBlock v1 ->
       (* TODO: remove enclosing triple quotes? or do that in ast_java.ml? *)
       let v1 = wrap string v1 in
-      G.String v1
+      G.L (G.String (fb v1))
   | Char v1 ->
       let v1 = wrap string v1 in
-      G.Char v1
+      G.L (G.Char v1)
   | Null v1 ->
       let v1 = tok v1 in
-      G.Null v1
+      G.L (G.Null v1)
   | Bool v1 ->
       let v1 = wrap bool v1 in
-      G.Bool v1
+      G.L (G.Bool v1)
+
+and string_component = function
+  | StrLit id -> Either_.Left3 id
+  | StrInterp (l, x, r) -> Either_.Right3 (l, Some (expr x), r)
 
 and expr e =
   (match e with
-  | This t -> G.IdSpecial (G.This, t)
-  | ObjAccessEllipsis (v1, v2) ->
-      let v1 = expr v1 in
-      G.DotAccessEllipsis (v1, v2)
-  | Ellipsis v1 ->
-      let v1 = tok v1 in
-      G.Ellipsis v1
-  | DeepEllipsis v1 ->
-      let v1 = bracket expr v1 in
-      G.DeepEllipsis v1
-  | NameId v1 -> G.N (name v1)
-  | NameOrClassType _v1 ->
-      let ii = Lib_parsing_java.ii_of_any (AExpr e) in
-      error (List.hd ii)
-        "NameOrClassType should only appear in (ignored) annotations"
-  | Literal v1 ->
-      let v1 = literal v1 in
-      G.L v1
-  | ClassLiteral (v1, v2) ->
-      let v1 = typ v1 in
-      G.OtherExpr (("ClassLiteral", v2), [ G.T v1 ])
-  | NewClass (v0, v1, (lp, v2, rp), v3) -> (
-      let v1 = typ v1
-      and v2 = list argument v2
-      and v3 = option (bracket decls) v3 in
-      match v3 with
-      | None -> G.New (v0, v1, (lp, v2, rp))
-      | Some decls ->
-          let anonclass =
-            G.AnonClass
-              {
-                G.ckind = (G.Class, v0);
-                cextends = [ (v1, None) ];
-                cimplements = [];
-                cmixins = [];
-                cparams = [];
-                cbody = decls |> bracket (Common.map (fun x -> G.F x));
-              }
-            |> G.e
-          in
-          G.Call (anonclass, (lp, v2, rp)))
-  | NewArray (v0, v1, v2, v3, v4) -> (
-      let v1 = typ v1
-      and v2 = list argument v2
-      and v3 = int v3
-      and v4 = option init v4 in
-      let rec mk_array n =
-        if n < 1 then raise Impossible;
-        (* see parser_java.mly dims | dim_exprs rules *)
-        if n =|= 1 then G.TyArray (fb None, v1) |> G.t
-        else G.TyArray (fb None, mk_array (n - 1)) |> G.t
-      in
-      let t = mk_array (v3 + List.length v2) in
-      match v4 with
-      | None -> G.New (v0, t, fb v2)
-      | Some e -> G.New (v0, t, fb (G.Arg e :: v2)))
-  (* x.new Y(...) {...} *)
-  | NewQualifiedClass (v0, _tok1, tok2, v2, v3, v4) ->
-      let v0 = expr v0
-      and v2 = typ v2
-      and v3 = arguments v3
-      and v4 = option (bracket decls) v4 in
-      let anys =
-        [ G.E v0; G.T v2 ]
-        @ (v3 |> G.unbracket |> Common.map (fun arg -> G.Ar arg))
-        @ (Option.to_list v4 |> Common.map G.unbracket |> List.flatten
-          |> Common.map (fun st -> G.S st))
-      in
-      G.OtherExpr (("NewQualifiedClass", tok2), anys)
-  | MethodRef (v1, v2, v3, v4) ->
-      let v1 = expr_or_type v1 in
-      let v2 = tok v2 in
-      let _v3TODO = option type_arguments v3 in
-      let v4 = ident v4 in
-      (* TODO? use G.GetRef? *)
-      G.OtherExpr (("MethodRef", v2), [ v1; G.I v4 ])
-  | Call (v1, v2) ->
-      let v1 = expr v1 and v2 = arguments v2 in
-      G.Call (v1, v2)
-  | Dot (v1, t, v2) ->
-      let v1 = expr v1 and t = info t and v2 = ident v2 in
-      G.DotAccess (v1, t, G.FN (G.Id (v2, G.empty_id_info ())))
-  | ArrayAccess (v1, v2) ->
-      let v1 = expr v1 and v2 = bracket expr v2 in
-      G.ArrayAccess (v1, v2)
-  | Postfix (v1, (v2, tok)) ->
-      let v1 = expr v1 and v2 = fix_op v2 in
-      G.Call
-        (G.IdSpecial (G.IncrDecr (v2, G.Postfix), tok) |> G.e, fb [ G.Arg v1 ])
-  | Prefix ((v1, tok), v2) ->
-      let v1 = fix_op v1 and v2 = expr v2 in
-      G.Call
-        (G.IdSpecial (G.IncrDecr (v1, G.Prefix), tok) |> G.e, fb [ G.Arg v2 ])
-  | Unary (v1, v2) ->
-      let v1, tok = v1 and v2 = expr v2 in
-      G.Call (G.IdSpecial (G.Op (H.conv_op v1), tok) |> G.e, fb [ G.Arg v2 ])
-  | Infix (v1, (v2, tok), v3) ->
-      let v1 = expr v1 and v2 = v2 and v3 = expr v3 in
-      G.Call
-        ( G.IdSpecial (G.Op (H.conv_op v2), tok) |> G.e,
-          fb [ G.Arg v1; G.Arg v3 ] )
-  | Cast ((l, v1, _), v2) ->
-      let v1 = list typ v1 and v2 = expr v2 in
-      let t =
-        Common2.foldl1 (fun acc e -> G.TyAnd (acc, fake l "&", e) |> G.t) v1
-      in
-      G.Cast (t, l, v2)
-  | InstanceOf (v1, v2) ->
-      let v1 = expr v1 and v2 = ref_type v2 in
-      G.Call
-        ( G.IdSpecial (G.Instanceof, unsafe_fake "instanceof") |> G.e,
-          fb [ G.Arg v1; G.ArgType v2 ] )
-  | Conditional (v1, v2, v3) ->
-      let v1 = expr v1 and v2 = expr v2 and v3 = expr v3 in
-      G.Conditional (v1, v2, v3)
-  | Assign (v1, v2, v3) ->
-      let v1 = expr v1 and v2 = info v2 and v3 = expr v3 in
-      G.Assign (v1, v2, v3)
-  | AssignOp (v1, (v2, tok), v3) ->
-      let v1 = expr v1 and v3 = expr v3 in
-      G.AssignOp (v1, (H.conv_op v2, tok), v3)
-  | TypedMetavar (v1, v2) ->
-      let v1 = ident v1 in
-      let v2 = typ v2 in
-      G.TypedMetavar (v1, Parse_info.fake_info (snd v1) " ", v2)
-  | Lambda (v1, t, v2) ->
-      let v1 = parameters v1 in
-      let v2 = stmt v2 in
-      G.Lambda
-        {
-          G.fparams = v1;
-          frettype = None;
-          fbody = G.FBStmt v2;
-          fkind = (G.Arrow, t);
-        }
-  | SwitchE (v0, v1, v2) ->
-      let v0 = info v0 in
-      let v1 = expr v1
-      and v2 =
-        list
-          (fun (v1, v2) ->
-            let v1 = cases v1 and v2 = stmts v2 in
-            (v1, G.stmt1 v2))
-          v2
-        |> Common.map (fun x -> G.CasesAndBody x)
-      in
-      let x = G.stmt_to_expr (G.Switch (v0, Some (Cond v1), v2) |> G.s) in
-      x.G.e)
+    | This t -> G.N (G.IdSpecial ((G.This, t), G.empty_id_info ()))
+    | Super t -> G.N (G.IdSpecial ((G.Super, t), G.empty_id_info ()))
+    | ObjAccessEllipsis (v1, v2) ->
+        let v1 = expr v1 in
+        G.DotAccessEllipsis (v1, v2)
+    | Ellipsis v1 ->
+        let v1 = tok v1 in
+        G.Ellipsis v1
+    | DeepEllipsis v1 ->
+        let v1 = bracket expr v1 in
+        G.DeepEllipsis v1
+    | NameId v1 -> G.N (name v1)
+    | NameOrClassType v1 ->
+        let ii = Ast_java.tok_of_name_or_class_type v1 in
+        error ii "NameOrClassType should only appear in (ignored) annotations"
+    | Literal v1 ->
+        let v1 = literal v1 in
+        v1
+    | ClassLiteral (v1, v2) ->
+        let v1 = typ v1 in
+        G.OtherExpr (("ClassLiteral", v2), [ G.T v1 ])
+    | NewClass (v0, v1, (lp, v2, rp), v3) -> (
+        let v1 = typ v1
+        and v2 = list argument v2
+        and v3 = option (bracket decls) v3 in
+        match v3 with
+        | None -> G.New (v0, v1, G.empty_id_info (), (lp, v2, rp))
+        | Some decls ->
+            let anonclass =
+              G.AnonClass
+                {
+                  G.ckind = (G.Class, v0);
+                  cextends = [ (v1, None) ];
+                  cimplements = [];
+                  cmixins = [];
+                  cparams = fb [];
+                  cbody = decls |> bracket (List.map (fun x -> G.F x));
+                }
+              |> G.e
+            in
+            G.Call (anonclass, (lp, v2, rp)))
+    | NewArray (v0, v1, v2, v3, v4) -> (
+        let v1 = typ v1
+        and v2 = list argument v2
+        and v3 = int v3
+        and v4 = option init v4 in
+        let rec mk_array n =
+          if n < 1 then raise Impossible;
+          (* see parser_java.mly dims | dim_exprs rules *)
+          if n =|= 1 then G.TyArray (fb None, v1) |> G.t
+          else G.TyArray (fb None, mk_array (n - 1)) |> G.t
+        in
+        let t = mk_array (v3 + List.length v2) in
+        match v4 with
+        | None -> G.New (v0, t, G.empty_id_info (), fb v2)
+        | Some e -> G.New (v0, t, G.empty_id_info (), fb (G.Arg e :: v2)))
+    (* x.new Y(...) {...} *)
+    | NewQualifiedClass (v0, _tok1, tok2, v2, v3, v4) ->
+        let v0 = expr v0
+        and v2 = typ v2
+        and v3 = arguments v3
+        and v4 = option (bracket decls) v4 in
+        let anys =
+          [ G.E v0; G.T v2 ]
+          @ (v3 |> Tok.unbracket |> List.map (fun arg -> G.Ar arg))
+          @ (Option.to_list v4 |> List.map Tok.unbracket |> List_.flatten
+            |> List.map (fun st -> G.S st))
+        in
+        G.OtherExpr (("NewQualifiedClass", tok2), anys)
+    | MethodRef (v1, v2, v3, v4) ->
+        let v1 = expr_or_type v1 in
+        let v2 = tok v2 in
+        let _v3TODO = option type_arguments v3 in
+        let v4 = ident v4 in
+        (* TODO? use G.GetRef? *)
+        G.OtherExpr (("MethodRef", v2), [ v1; G.I v4 ])
+    | Call (v1, v2) ->
+        let v1 = expr v1 and v2 = arguments v2 in
+        G.Call (v1, v2)
+    | Dot (v1, t, v2) ->
+        let v1 = expr v1 and t = info t and v2 = ident v2 in
+        G.DotAccess (v1, t, G.FN (G.Id (v2, G.empty_id_info ())))
+    | DotSuper (v1, t, t_super) ->
+        (* Qualified super syntax: Type.super *)
+        let v1 = expr v1 and t = info t and t_super = info t_super in
+        let super =
+          G.FN (G.IdSpecial ((G.Super, t_super), G.empty_id_info ()))
+        in
+        G.DotAccess (v1, t, super)
+    | DotEllipsis (v1, t) ->
+        let v1 = expr v1 and t = info t in
+        G.DotAccessEllipsis (v1, t)
+    | ArrayAccess (v1, v2) ->
+        let v1 = expr v1 and v2 = bracket expr v2 in
+        G.ArrayAccess (v1, v2)
+    | Postfix (v1, (v2, tok)) ->
+        let v1 = expr v1 and v2 = fix_op v2 in
+        G.Call
+          (G.Special (G.IncrDecr (v2, G.Postfix), tok) |> G.e, fb [ G.Arg v1 ])
+    | Prefix ((v1, tok), v2) ->
+        let v1 = fix_op v1 and v2 = expr v2 in
+        G.Call
+          (G.Special (G.IncrDecr (v1, G.Prefix), tok) |> G.e, fb [ G.Arg v2 ])
+    | Unary (v1, v2) ->
+        let v1, tok = v1 and v2 = expr v2 in
+        G.Call (G.Special (G.Op v1, tok) |> G.e, fb [ G.Arg v2 ])
+    | Infix (v1, (v2, tok), v3) ->
+        let v1 = expr v1 and v2 = v2 and v3 = expr v3 in
+        G.Call (G.Special (G.Op v2, tok) |> G.e, fb [ G.Arg v1; G.Arg v3 ])
+    | Cast ((l, v1, _), v2) ->
+        let v1 = list typ v1 and v2 = expr v2 in
+        let t =
+          Common2.foldl1 (fun acc e -> G.TyAnd (acc, fake l "&", e) |> G.t) v1
+        in
+        G.Cast (t, l, v2)
+    | InstanceOf (v1, v2) ->
+        let v1 = expr v1
+        and v2 =
+          match v2 with
+          | Left e -> G.ArgType (ref_type e)
+          | Right p ->
+              G.OtherArg (("ArgPat", G.fake "ArgPat"), [ G.P (pattern p) ])
+        in
+        G.Call
+          ( G.Special (G.Instanceof, unsafe_fake "instanceof") |> G.e,
+            fb [ G.Arg v1; v2 ] )
+    | Conditional (v1, v2, v3) ->
+        let v1 = expr v1 and v2 = expr v2 and v3 = expr v3 in
+        G.Conditional (v1, v2, v3)
+    | Assign (v1, v2, v3) ->
+        let v1 = expr v1 and v2 = info v2 and v3 = expr v3 in
+        G.Assign (v1, v2, v3)
+    | AssignOp (v1, (v2, tok), v3) ->
+        let v1 = expr v1 and v3 = expr v3 in
+        G.AssignOp (v1, (v2, tok), v3)
+    | TypedMetavar (v1, v2) ->
+        let v1 = ident v1 in
+        let v2 = typ v2 in
+        G.TypedMetavar (v1, Tok.fake_tok (snd v1) " ", v2)
+    | Lambda (v1, t, v2) ->
+        let fparams = parameters v1 in
+        let v2 = stmt v2 in
+        G.Lambda
+          {
+            G.fparams = fb fparams;
+            frettype = None;
+            fbody = G.FBStmt v2;
+            fkind = (G.Arrow, t);
+          }
+    | SwitchE (v0, v1, v2) ->
+        let v0 = info v0 in
+        let v1 = expr v1
+        and v2 =
+          list
+            (fun (v1, v2) ->
+              let v1 = cases v1 and v2 = stmts v2 in
+              (v1, G.stmt1 v2))
+            v2
+          |> List.map (fun x -> G.CasesAndBody x)
+        in
+        let x = G.stmt_to_expr (G.Switch (v0, Some (Cond v1), v2) |> G.s) in
+        x.G.e
+    | Template (_v1, _v2, (l, v3, r)) ->
+        (* TODO: allow matching on the first expression *)
+        let parts = List.map string_component v3 in
+        let e = G.interpolated (l, parts, r) in
+        e.G.e)
   |> G.e
+
+and pattern = function
+  | PatUnderscore t -> G.PatWildcard t |> G.p
+  | PatId id -> G.PatId (ident id, G.empty_id_info ()) |> G.p
+  | PatTyped (pat, ty) -> G.PatTyped (pattern pat, typ ty) |> G.p
+  | PatConstructor (qual, pats) ->
+      let dotted = qualified_ident qual in
+      G.PatConstructor (H.name_of_ids dotted, List.map pattern pats) |> G.p
 
 and class_parent v : G.class_parent =
   let v = ref_type v in
@@ -411,7 +440,7 @@ and argument v =
   G.Arg v
 
 and arguments v : G.argument list G.bracket = bracket (list argument) v
-and fix_op v = H.conv_incr v
+and fix_op v = v
 
 and resource t (v : resource) : G.stmt =
   match v with
@@ -424,7 +453,7 @@ and resources (_t1, v, t2) = list (resource t2) v
 
 and stmt st =
   match stmt_aux st with
-  | [] -> G.s (Block (G.fake_bracket []))
+  | [] -> G.s (Block (Tok.unsafe_fake_bracket []))
   | [ st ] -> st
   | xs ->
       (* This should never happen in a context where we want
@@ -462,7 +491,7 @@ and stmt_aux st =
             let v1 = cases v1 and v2 = stmts v2 in
             (v1, G.stmt1 v2))
           v2
-        |> Common.map (fun x -> G.CasesAndBody x)
+        |> List.map (fun x -> G.CasesAndBody x)
       in
       [ G.Switch (v0, Some (G.Cond v1), v2) |> G.s ]
   | While (t, v1, v2) ->
@@ -491,37 +520,54 @@ and stmt_aux st =
       [ G.OtherStmtWithStmt (G.OSWS_Block ("Sync", v0), [ G.E v1 ], v2) |> G.s ]
   | Try (t, v0, v1, v2, v3) -> (
       let v1 = stmt v1 and v2 = catches v2 and v3 = option tok_and_stmt v3 in
-      let try_stmt = G.Try (t, v1, v2, v3) |> G.s in
+      let try_stmt = G.Try (t, v1, v2, None, v3) |> G.s in
       match v0 with
       | None -> [ try_stmt ]
       | Some r -> [ G.WithUsingResource (t, resources r, try_stmt) |> G.s ])
   | Throw (t, v1) ->
       let v1 = expr v1 in
       [ G.Throw (t, v1, G.sc) |> G.s ]
-  | LocalVarList vs ->
-      Common.map
-        (fun v1 ->
+  | LocalVarList (vs, sc) ->
+      vs
+      |> List.map (fun v1 ->
           let ent, v = var_with_init v1 in
-          G.DefStmt (ent, G.VarDef v) |> G.s)
-        vs
+          (ent, v))
+      |> H.add_semicolon_to_last_var_def_and_convert_to_stmts sc
   | DeclStmt v1 -> [ decl v1 ]
   | DirectiveStmt v1 -> [ directive v1 ]
   | Assert (t, v1, v2) ->
       let v1 = expr v1 and v2 = option expr v2 in
       let es = v1 :: Option.to_list v2 in
-      let args = es |> Common.map G.arg in
+      let args = es |> List.map G.arg in
       [ G.Assert (t, fb args, G.sc) |> G.s ]
 
 and tok_and_stmt (t, v) =
   let v = stmt v in
   (t, v)
 
-and stmts v = list stmt_aux v |> List.flatten
+and stmts v = list stmt_aux v |> List_.flatten
 
 and case = function
-  | Case (t, v1) ->
-      let v1 = expr v1 in
-      G.Case (t, H.expr_to_pattern v1)
+  | Case (t, base_pat, guardopt) ->
+      let pat =
+        match guardopt with
+        | None -> pattern base_pat
+        | Some e -> G.PatWhen (pattern base_pat, expr e) |> G.p
+      in
+      G.Case (t, pat)
+  | CaseExprs (t, es, guardopt) ->
+      let pat =
+        match es with
+        | [ x ] -> H.expr_to_pattern (expr x)
+        | _ ->
+            H.expr_to_pattern (G.Container (List, fb (List.map expr es)) |> G.e)
+      in
+      let pat =
+        match guardopt with
+        | None -> pat
+        | Some e -> G.PatWhen (pat, expr e) |> G.p
+      in
+      G.Case (t, pat)
   | Default t -> G.Default t
 
 and cases v = list case v
@@ -550,10 +596,10 @@ and for_control tok = function
 and for_init = function
   | ForInitVars v1 ->
       let v1 = list var_with_init v1 in
-      v1 |> Common.map (fun (ent, v) -> G.ForInitVar (ent, v))
+      v1 |> List.map (fun (ent, v) -> G.ForInitVar (ent, v))
   | ForInitExprs v1 ->
       let v1 = list expr v1 in
-      v1 |> Common.map (fun e -> G.ForInitExpr e)
+      v1 |> List.map (fun e -> G.ForInitExpr e)
 
 and var { name; mods; type_ = xtyp } =
   let v1 = ident name in
@@ -569,7 +615,7 @@ and catch (tok, catch_exn, v2) =
         let ent, typ = var v1 in
         let id, _idinfo = id_of_entname ent.G.name in
         match typ with
-        | Some t -> G.CatchParam (G.param_of_type t ~pname:(Some id))
+        | Some t -> G.CatchParam (G.param_of_type t ~pname:id)
         | None -> error tok "TODO: Catch without a type")
     | CatchEllipsis t -> G.CatchPattern (G.PatEllipsis t)
   in
@@ -580,7 +626,7 @@ and catches v = list catch v
 and var_with_init { f_var; f_init } =
   let ent, t = var f_var in
   let init = option init f_init in
-  (ent, { G.vinit = init; vtype = t })
+  (ent, { G.vinit = init; vtype = t; vtok = G.no_sc })
 
 and init = function
   | ExprInit v1 ->
@@ -590,7 +636,7 @@ and init = function
       let v1 = bracket (list init) v1 in
       G.Container (G.Array, v1) |> G.e
 
-and parameters v = Common.map parameter_binding v
+and parameters v : G.parameter list = List.map parameter_binding v
 
 and parameter_binding = function
   | ParamClassic v
@@ -603,15 +649,14 @@ and parameter_binding = function
       G.ParamRest (tk, p)
   | ParamEllipsis t -> G.ParamEllipsis t
 
-and method_decl ?(cl_kind = None) { m_var; m_formals; m_throws; m_body } =
+and method_decl ?cl_kind { m_var; m_formals; m_throws; m_body } =
   let ent, rett = var m_var in
-  let v2 = parameters m_formals in
+  let fparams = parameters m_formals in
   let v3 = list typ m_throws in
   let v4 = stmt m_body in
   (* TODO: use fthrow field instead *)
   let throws =
-    v3
-    |> Common.map (fun t -> G.OtherAttribute (("Throw", G.fake ""), [ G.T t ]))
+    v3 |> List.map (fun t -> G.OtherAttribute (("Throw", G.fake ""), [ G.T t ]))
   in
   let fbody =
     match (cl_kind, v4) with
@@ -619,7 +664,12 @@ and method_decl ?(cl_kind = None) { m_var; m_formals; m_throws; m_body } =
     | _ -> FBStmt v4
   in
   ( { ent with G.attrs = ent.G.attrs @ throws },
-    { G.fparams = v2; frettype = rett; fbody; fkind = (G.Method, G.fake "") } )
+    {
+      G.fparams = fb fparams;
+      frettype = rett;
+      fbody;
+      fkind = (G.Method, G.fake "");
+    } )
 
 and field v = var_with_init v
 
@@ -628,8 +678,8 @@ and enum_decl { en_name; en_mods; en_impls; en_body } =
   let v2 = modifiers en_mods in
   let v3 = list class_parent en_impls in
   let v4, v5 = en_body in
-  let v4 = list enum_constant v4 |> Common.map G.fld in
-  let v5 = decls v5 |> Common.map (fun st -> G.F st) in
+  let v4 = list enum_constant v4 |> List.map G.fld in
+  let v5 = decls v5 |> List.map (fun st -> G.F st) in
   let ent = G.basic_entity v1 ~attrs:(G.attr EnumClass (snd v1) :: v2) in
   let cbody = fb (v4 @ v5) in
   let cdef =
@@ -638,7 +688,7 @@ and enum_decl { en_name; en_mods; en_impls; en_body } =
       cextends = v3;
       cmixins = [];
       cimplements = [];
-      cparams = [];
+      cparams = fb [];
       cbody;
     }
   in
@@ -652,8 +702,8 @@ and enum_constant (v1, v2, v3) =
   let def = { G.ee_args = v2; ee_body = v3 } in
   (ent, G.EnumEntryDef def)
 
-and class_body ?(cl_kind = None) (l, xs, r) : G.field list G.bracket =
-  let xs = decls ~cl_kind xs |> Common.map (fun x -> G.F x) in
+and class_body ?cl_kind (l, xs, r) : G.field list G.bracket =
+  let xs = decls ?cl_kind xs |> List.map (fun x -> G.F x) in
   (l, xs, r)
 
 and class_decl
@@ -669,20 +719,24 @@ and class_decl
     } =
   let v1 = ident cl_name in
   let v2, more_attrs = class_kind_and_more cl_kind in
-  let v3 = list type_parameter cl_tparams in
+  let v3 =
+    match cl_tparams with
+    | [] -> None
+    | xs -> Some (Tok.unsafe_fake_bracket (list type_parameter xs))
+  in
   let v4 = modifiers cl_mods in
   let v5 = option class_parent cl_extends in
   let v6 = list ref_type cl_impls in
   let cparams = parameters cl_formals in
-  let fields = class_body ~cl_kind:(Some cl_kind) cl_body in
-  let ent = G.basic_entity v1 ~attrs:(more_attrs @ v4) ~tparams:v3 in
+  let fields = class_body ~cl_kind cl_body in
+  let ent = G.basic_entity v1 ~attrs:(more_attrs @ v4) ?tparams:v3 in
   let cdef =
     {
       G.ckind = v2;
       cextends = Option.to_list v5;
       cimplements = v6;
       cmixins = [];
-      cparams;
+      cparams = fb cparams;
       cbody = fields;
     }
   in
@@ -695,13 +749,13 @@ and class_kind_and_more (x, t) =
   | AtInterface -> ((G.Interface, t), [ G.attr AnnotationClass t ])
   | Record -> ((G.Class, t), [ G.attr RecordClass t ])
 
-and decl ?(cl_kind = None) decl : G.stmt =
+and decl ?cl_kind decl : G.stmt =
   match decl with
   | Class v1 ->
       let ent, def = class_decl v1 in
       G.DefStmt (ent, G.ClassDef def) |> G.s
   | Method v1 ->
-      let ent, def = method_decl ~cl_kind v1 in
+      let ent, def = method_decl ?cl_kind v1 in
       G.DefStmt (ent, G.FuncDef def) |> G.s
   | Field v1 ->
       let ent, def = field v1 in
@@ -716,16 +770,18 @@ and decl ?(cl_kind = None) decl : G.stmt =
           G.OtherStmtWithStmt (G.OSWS_Block ("Static", tstatic), [], st) |> G.s
       | None -> st)
   | DeclEllipsis v1 -> G.ExprStmt (G.Ellipsis v1 |> G.e, G.sc) |> G.s
+  | DeclMetavarEllipsis v1 ->
+      G.ExprStmt (G.N (Id (v1, G.empty_id_info ())) |> G.e, G.sc) |> G.s
   | EmptyDecl t -> G.Block (t, [], t) |> G.s
   | AnnotationTypeElementTodo t -> G.OtherStmt (G.OS_Todo, [ G.Tk t ]) |> G.s
 
-and decls ?(cl_kind = None) v : G.stmt list = list (decl ~cl_kind) v
+and decls ?cl_kind v : G.stmt list = list (decl ?cl_kind) v
 
 and import = function
   | ImportAll (t, xs, tok) -> G.ImportAll (t, G.DottedName xs, tok)
   | ImportFrom (t, xs, id) ->
       let id = ident id in
-      G.ImportFrom (t, G.DottedName xs, [ (id, None) ])
+      G.ImportFrom (t, G.DottedName xs, [ H.mk_import_from_kind id None ])
 
 and directive = function
   | Import (static, v2) ->
@@ -778,14 +834,14 @@ let any = function
       let v1 = stmt v1 in
       G.S v1
   | AStmts v1 ->
-      let v1 = Common.map stmt v1 in
+      let v1 = List.map stmt v1 in
       G.Ss v1
   | ATyp v1 ->
       let v1 = typ v1 in
       G.T v1
   | AVar v1 ->
       let ent, t = var v1 in
-      G.Def (ent, G.VarDef { G.vtype = t; vinit = None })
+      G.Def (ent, G.VarDef { G.vtype = t; vinit = None; vtok = G.no_sc })
   | AInit v1 ->
       let v1 = init v1 in
       G.E v1

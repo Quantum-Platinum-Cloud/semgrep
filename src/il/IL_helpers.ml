@@ -13,15 +13,16 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * LICENSE for more details.
  *)
+open Common
 open IL
 
 (*****************************************************************************)
 (* Prelude *)
 (*****************************************************************************)
 
-let compare_name x y =
-  let ident_cmp = String.compare (fst x.ident) (fst y.ident) in
-  if ident_cmp <> 0 then ident_cmp else AST_generic.SId.compare x.sid y.sid
+(***********************************************)
+(* L-values *)
+(***********************************************)
 
 let exp_of_arg arg =
   match arg with
@@ -30,10 +31,12 @@ let exp_of_arg arg =
 
 let rexps_of_instr x =
   match x.i with
+  | Assign (({ base = Var _; rev_offset = _ :: _ } as lval), exp) ->
+      [ { e = Fetch { lval with rev_offset = [] }; eorig = NoOrig }; exp ]
   | Assign (_, exp) -> [ exp ]
-  | AssignAnon _ -> []
-  | Call (_, e1, args) -> e1 :: Common.map exp_of_arg args
-  | CallSpecial (_, _, args) -> Common.map exp_of_arg args
+  | AssignCall (_, { c = Call (e1, args); _ }) -> e1 :: List.map exp_of_arg args
+  | AssignCall (_, { c = CallSpecial (_, args); _ }) -> List.map exp_of_arg args
+  | New (_, _, _, args) -> List.map exp_of_arg args
   | FixmeInstr _ -> []
 
 (* opti: could use a set *)
@@ -43,14 +46,15 @@ let rec lvals_of_exp e =
   | Literal _ -> []
   | Cast (_, e) -> lvals_of_exp e
   | Composite (_, (_, xs, _)) -> lvals_of_exps xs
-  | Operator (_, xs) -> lvals_of_exps (Common.map exp_of_arg xs)
-  | Record ys ->
+  | Operator (_, xs) -> lvals_of_exps (List.map exp_of_arg xs)
+  | RecordOrDict ys ->
       lvals_of_exps
         (ys
-        |> Common.map @@ function
+        |> List.concat_map @@ function
            | Field (_, e)
            | Spread e ->
-               e)
+               [ e ]
+           | Entry (ke, ve) -> [ ke; ve ])
   | FixmeExp (_, _, Some e) -> lvals_of_exp e
   | FixmeExp (_, _, None) -> []
 
@@ -70,9 +74,9 @@ and lvals_in_lval lval =
   in
   base_lvals @ offset_lvals
 
-and lvals_of_exps xs = xs |> Common.map lvals_of_exp |> List.flatten
+and lvals_of_exps xs = xs |> List.concat_map lvals_of_exp
 
-(** The lvals in the RHS of the instruction. *)
+(** The lvals in the rvals of the instruction. *)
 let rlvals_of_instr x =
   let exps = rexps_of_instr x in
   lvals_of_exps exps
@@ -81,25 +85,52 @@ let rlvals_of_instr x =
 (* Public *)
 (*****************************************************************************)
 
+let loc_of_name fpath name =
+  let var_loc =
+    let* name = name in
+    Tok.loc_of_tok (snd name.ident) |> Result.to_option
+  in
+  var_loc ||| Loc.first_loc_of_file fpath
+
+let is_pro_resolved_global name =
+  match !(name.id_info.id_resolved) with
+  | Some (GlobalName _, _sid) -> true
+  | Some _
+  | None ->
+      false
+
+(* HACK: Because we don't have a "Class" type, classes have themselves as types. *)
+let is_class_name (name : name) =
+  match (!(name.id_info.id_resolved), !(name.id_info.id_type)) with
+  | Some resolved1, Some { t = TyN (Id (_, { id_resolved; _ })); _ } -> (
+      match !id_resolved with
+      | None -> false
+      | Some resolved2 ->
+          (* If 'name' has type 'name' then we assume it's a class. *)
+          AST_generic.equal_resolved_name resolved1 resolved2)
+  | _, None
+  | _, Some _ ->
+      false
+
+(***********************************************)
+(* L-values *)
+(***********************************************)
+
 let lval_of_var var = { IL.base = Var var; rev_offset = [] }
 
 let is_dots_offset offset =
   offset
   |> List.for_all (fun o ->
-         match o.o with
-         | Dot _ -> true
-         | Index _ -> false)
+      match o.o with
+      | Dot _ -> true
+      | Index _ -> false)
 
 let lval_of_instr_opt x =
   match x.i with
   | Assign (lval, _)
-  | AssignAnon (lval, _)
-  | Call (Some lval, _, _)
-  | CallSpecial (Some lval, _, _) ->
+  | New (lval, _, _, _) ->
       Some lval
-  | Call _
-  | CallSpecial _ ->
-      None
+  | AssignCall (lval_opt, _) -> lval_opt
   | FixmeInstr _ -> None
 
 let lvar_of_instr_opt x =
@@ -112,40 +143,48 @@ let lvar_of_instr_opt x =
 let rlvals_of_node = function
   | Enter
   | Exit
-  | TrueNode
-  | FalseNode
+  (* must ignore exp in True and False *)
+  | TrueNode _
+  | FalseNode _
   | NGoto _
   | Join ->
       []
+  | NCase (scrutinee, _pattern) -> [ lval_of_var scrutinee ]
   | NInstr x -> rlvals_of_instr x
   | NCond (_, e)
   | NReturn (_, e)
   | NThrow (_, e) ->
       lvals_of_exp e
-  | NLambda _
+  | NMatch _scrutinee -> []
+  | NNestedDef _
   | NOther _
   | NTodo _ ->
       []
 
-module LvalOrdered = struct
-  type t = lval
+let orig_of_tok tok =
+  if Tok.is_origintok tok then Some (Related (AST_generic.Tk tok)) else None
 
-  let compare lval1 lval2 =
-    (* Right now we only care about comparing lvals of the form `x.a_1. ... . a_n,
-       so it's OK if `Stdlib.compare` may not be the ideal comparison function for
-       the remaining cases. *)
-    match (lval1, lval2) with
-    | { base = Var x; rev_offset = ro1 }, { base = Var y; rev_offset = ro2 } ->
-        let name_cmp = compare_name x y in
-        if name_cmp <> 0 then name_cmp
-        else
-          List.compare
-            (fun offset1 offset2 ->
-              match (offset1.o, offset2.o) with
-              | Dot a, Dot b -> compare_name a b
-              | Index _, _
-              | _, Index _ ->
-                  Stdlib.compare offset1 offset2)
-            ro1 ro2
-    | _, _ -> Stdlib.compare lval1 lval2
-end
+let orig_of_node = function
+  | Enter
+  | Exit ->
+      None
+  | NCond (tok, e)
+  | NReturn (tok, e)
+  | NThrow (tok, e) -> (
+      match e.eorig with
+      | SameAs _
+      | Related _ ->
+          Some e.eorig
+      | NoOrig -> orig_of_tok tok)
+  | NMatch _ -> None
+  | NCase (scrutinee, _) -> orig_of_tok (snd scrutinee.ident)
+  | NInstr i -> Some i.iorig
+  | TrueNode e
+  | FalseNode e ->
+      Some e.eorig
+  | NGoto _
+  | Join
+  | NNestedDef _
+  | NOther _
+  | NTodo _ ->
+      None

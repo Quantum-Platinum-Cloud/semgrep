@@ -110,21 +110,21 @@
 (* Token (leaves) *)
 (*****************************************************************************)
 
-type tok = Parse_info.t [@@deriving show]
-type 'a wrap = 'a * tok [@@deriving show] (* with tarzan *)
+type tok = Tok.t [@@deriving show]
+type 'a wrap = 'a * tok [@@deriving show]
 
 (* round(), square[], curly{}, angle<> brackets *)
-type 'a bracket = tok * 'a * tok [@@deriving show] (* with tarzan *)
-type ident = string wrap [@@deriving show] (* with tarzan *)
+type 'a bracket = tok * 'a * tok [@@deriving show]
+type ident = string wrap [@@deriving show]
 
 (* the string contains the $ prefix *)
-type var = string wrap [@@deriving show] (* with tarzan *)
+type var = string wrap [@@deriving show]
 
 (* The keyword 'namespace' can be in a leading position. The special
  * ident 'ROOT' can also be leading.
  *)
-type qualified_ident = ident list [@@deriving show] (* with tarzan *)
-type name = qualified_ident [@@deriving show] (* with tarzan *)
+type qualified_ident = ident list [@@deriving show]
+type name = qualified_ident [@@deriving show]
 
 (*****************************************************************************)
 (* Expression *)
@@ -140,14 +140,14 @@ type expr =
      non-0 is cast to true *)
   (* https://www.php.net/manual/en/language.types.boolean.php *)
   | Bool of bool wrap
-  | Int of int option wrap
+  | Int of Parsed_int.t
   | Double of float option wrap
   (* PHP has no first-class functions so entities are sometimes passed
    * as strings so the string wrap below can actually correspond to a
    * 'Id name' sometimes. Some magic functions like param_post() also
    * introduce entities (variables) via strings.
    *)
-  | String of string wrap
+  | String of string wrap (* TODO: bracket *)
   (* Id is valid for "entities" (functions, classes, constants). Id is also
    * used for class methods/fields/constants. It can also contain
    * "self/parent" or "static", "class". It can be "true", "false", "null"
@@ -198,8 +198,8 @@ type expr =
   | Call of expr * argument list bracket
   | Throw of tok * expr
   (* todo? transform into Call (builtin ...) ? *)
-  | Infix of AST_generic_.incr_decr wrap * expr
-  | Postfix of AST_generic_.incr_decr wrap * expr
+  | Infix of AST_generic.incr_decr wrap * expr
+  | Postfix of AST_generic.incr_decr wrap * expr
   | Binop of expr * binaryOp wrap * expr
   | Unop of unaryOp wrap * expr
   | Guil of expr list bracket
@@ -239,9 +239,9 @@ and binaryOp =
   (* TODO: now available in AST_generic_ ? *)
   | BinaryConcat
   | CombinedComparison
-  | ArithOp of AST_generic_.operator
+  | ArithOp of AST_generic.operator
 
-and unaryOp = AST_generic_.operator
+and unaryOp = AST_generic.operator
 
 and argument =
   | Arg of expr
@@ -281,7 +281,8 @@ and class_name = hint_type
 and stmt =
   | Expr of expr * tok
   | Block of stmt list bracket
-  | If of tok * expr * stmt * stmt
+  (* option to distinguish an empty else branch from an undecl *)
+  | If of tok * expr * stmt * stmt option
   | Switch of tok * expr * case list
   | While of tok * expr * stmt
   | Do of tok * stmt * expr
@@ -336,7 +337,7 @@ and func_def = {
   (* TODO: "_lambda" when used for lambda, see also AnonLambda for f_kind below *)
   f_name : ident;
   f_kind : function_kind wrap;
-  f_params : parameter list;
+  f_params : parameter list; (* TODO bracket *)
   f_return_type : hint_type option;
   (* functions returning a ref are rare *)
   f_ref : bool;
@@ -423,20 +424,17 @@ and class_var = {
 and method_def = func_def
 and type_def = { t_name : ident; t_kind : type_def_kind }
 and type_def_kind = Alias of hint_type [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 (*****************************************************************************)
 (* Program *)
 (*****************************************************************************)
 
 type program = stmt list [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 (*****************************************************************************)
 (* Any *)
 (*****************************************************************************)
 type partial = PartialIf of tok * expr [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 type any =
   | Program of program
@@ -445,14 +443,13 @@ type any =
   | Param of parameter
   | Partial of partial
 [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 (*****************************************************************************)
 (* Helpers *)
 (*****************************************************************************)
 
 let unwrap x = fst x
-let wrap_fake s = (s, Parse_info.fake_info s)
+let wrap_fake s = (s, Tok.fake_tok s)
 
 (* TODO: replace builtin() by IdSpecial like I do in AST_generic.ml
  * builtin() is used for:
@@ -468,7 +465,7 @@ let wrap_fake s = (s, Parse_info.fake_info s)
  *  - 'include', 'require', 'include_once', 'require_once'.
  *  -  __LINE__/__FILE/__DIR/__CLASS/__TRAIT/__FUNCTION/__METHOD/
  *
- * See also pfff/data/php_stdlib/pfff.php which declares those builtins.
+ * See also data/php_stdlib/pfff.php which declares those builtins.
  * See also tests/php/semantic/ for example of uses of those builtins.
  *
  * coupling: if modify the string, git grep it because it's probably
@@ -486,7 +483,7 @@ let special x = "__special__" ^ x
 let has_modifier cv = List.length cv.cv_modifiers > 0
 let is_static modifiers = List.mem Static (List.map unwrap modifiers)
 let is_private modifiers = List.mem Private (List.map unwrap modifiers)
-let string_of_xhp_tag xs = ":" ^ Common.join ":" xs
+let string_of_xhp_tag xs = ":" ^ String.concat ":" xs
 let str_of_ident (s, _) = s
 let tok_of_ident (_, x) = x
 

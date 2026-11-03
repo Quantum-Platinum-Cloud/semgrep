@@ -1,16 +1,39 @@
+(*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 open Ast_fuzzy
 
-type 'tok hooks = {
-  kind : 'tok -> Parse_info.token_kind;
-  tokf : 'tok -> Parse_info.t;
-}
+type token_kind =
+  | LPar
+  | RPar
+  | LBrace
+  | RBrace
+  | LBracket
+  | RBracket
+  | LAngle
+  | RAngle
+  | Esthet of esthet
+  | Eof
+  | Other
 
-exception Unclosed of string (* msg *) * Parse_info.t (* starting point *)
+and esthet = Comment | Newline | Space
+
+type 'tok hooks = { kind : 'tok -> token_kind; tokf : 'tok -> Tok.t }
+
+exception Unclosed of string (* msg *) * Tok.t (* starting point *)
 
 val mk_trees : 'tok hooks -> 'tok list -> trees
+val mk_tokens : 'tok hooks -> 'tok list -> (token_kind * Tok.t) list
 
-val mk_tokens :
-  'tok hooks -> 'tok list -> (Parse_info.token_kind * Parse_info.t) list
 (* visitors, mappers, extractors, abstractors *)
 
 type visitor_out = trees -> unit

@@ -6,17 +6,8 @@
 # of the 'semgrep-python' wrapping.
 #
 
-# The docker base image below in the FROM currently uses OCaml 4.12.0
-# See https://github.com/returntocorp/ocaml-layer/blob/master/configs/alpine.sh
-#
-# coupling: if you modify the OCaml version there, you probably also need
-# to modify:
-# - scripts/osx-release.sh
-# - doc/SEMGREP_CORE_CONTRIBUTING.md
-# - https://github.com/Homebrew/homebrew-core/blob/master/Formula/semgrep.rb
-# Note that many .github/workflows/ use returntocorp/ocaml:alpine, which should
-# be the latest, but may differ from this one.
-FROM returntocorp/ocaml:alpine-2021-07-15 as build-semgrep-core
+# NOTE: This is just a test file for the Dockerfile parser !
+FROM returntocorp/ocaml:fake-tag as build-semgrep-core
 
 USER root
 # for ocaml-pcre now used in semgrep-core
@@ -29,7 +20,6 @@ WORKDIR /home/user
 
 COPY --chown=user .gitmodules /semgrep/.gitmodules
 COPY --chown=user .git/ /semgrep/.git/
-COPY --chown=user semgrep-core/ /semgrep/semgrep-core/
 COPY --chown=user scripts /semgrep/scripts
 
 WORKDIR /semgrep
@@ -45,27 +35,26 @@ RUN git submodule update --init --recursive --depth 1
 #  - scripts/install-alpine-semgrep-core
 #  - the setup target in Makefile
 RUN eval "$(opam env)" && ./scripts/install-tree-sitter-runtime
-RUN eval "$(opam env)" && opam install --deps-only -y semgrep-core/src/pfff/
-RUN eval "$(opam env)" && opam install --deps-only -y semgrep-core/src/ocaml-tree-sitter-core
-RUN eval "$(opam env)" && opam install --deps-only -y semgrep-core/
-RUN eval "$(opam env)" && make -C semgrep-core/ all
+RUN eval "$(opam env)" && opam install --deps-only -y src/ocaml-tree-sitter-core
+RUN eval "$(opam env)" && opam install --deps-only -y .
+RUN eval "$(opam env)" && make -C  all
 
 # Sanity checks
-RUN ./semgrep-core/_build/install/default/bin/semgrep-core -version
+RUN ./_build/install/default/bin/semgrep-core -version
 
 #
 # We change container, bringing only the 'semgrep-core' binary with us.
 #
 
 FROM python:3.9.1-alpine3.13
-LABEL maintainer="support@r2c.dev"
+LABEL maintainer="support@semgrep.com"
 
 # ugly: circle CI requires valid git and ssh programs in the container
 # when running semgrep on a repository containing submodules
 RUN apk add --no-cache git openssh
 
 COPY --from=build-semgrep-core \
-     /semgrep/semgrep-core/_build/install/default/bin/semgrep-core /usr/local/bin/semgrep-core
+     /semgrep/_build/install/default/bin/semgrep-core /usr/local/bin/semgrep-core
 RUN semgrep-core -version
 
 COPY semgrep /semgrep

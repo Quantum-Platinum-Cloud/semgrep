@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2022 r2c
+ * Copyright (C) 2022-2023 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -31,23 +31,27 @@
  * used in https://github.com/sourcegraph/lsif-jsonnet
  *
  * The main uses for this file are:
- *  - for Semgrep to allow people to use Jsonnet patterns to match
- *    over Jsonnet code
- *  - potentially for implementing a Jsonnet interpreter in OCaml,
+ *  - to support the language Jsonnet in Semgrep,
+ *    that is to give the ability for jsonnet developers to use Jsonnet patterns
+ *    to match over Jsonnet code, that is to write jsonnet rules (just like
+ *    C developers can write C rules).
+ *  - for advanced Semgrep users to write Semgrep rules in jsonnet instead
+ *    of YAML (Semgrep 2.0).
+ *  - for ojsonnet, a Jsonnet interpreter written in OCaml,
  *    so we can use it in osemgrep instead of having to write an OCaml
  *    binding to the Jsonnet C library. This could allow in turn to provide
  *    better error messages when there is an error in a Jsonnet
- *    semgrep rule. Indeed right now the error will be mostly
+ *    semgrep rule. Indeed, right now the error will be mostly
  *    reported on the resulting (also called "manifested") JSON.
- *    This could also enable certain holistic optimizations or
- *    static checks at some point.
+ *    This could also enable at some point certain holistic optimizations or
+ *    static checks.
  *)
 
 (*****************************************************************************)
 (* Tokens (leaves) *)
 (*****************************************************************************)
 
-type tok = Parse_info.t [@@deriving show]
+type tok = Tok.t [@@deriving show]
 type 'a wrap = 'a * tok [@@deriving show]
 type 'a bracket = tok * 'a * tok [@@deriving show]
 
@@ -75,7 +79,7 @@ type expr =
   | O of obj_inside bracket
   | A of arr_inside bracket
   (* entities *)
-  | Id of string wrap
+  | Id of ident
   | IdSpecial of special wrap
   (* =~ Let. Note that a series of 'local x = 1; local y = 2; x+y'
    * will be interpreted as nested Local. There is no real
@@ -103,6 +107,9 @@ type expr =
   | Error of tok (* 'error' *) * expr
   (* for the CST *)
   | ParenExpr of expr bracket
+  (* semgrep: *)
+  | Ellipsis of tok
+  | DeepEllipsis of expr bracket
 
 (* ------------------------------------------------------------------------- *)
 (* literals *)
@@ -196,14 +203,22 @@ and function_definition = {
   f_body : expr;
 }
 
-(* semgrep: LATER can have ParamEllipsis *)
-and parameter = P of ident * (tok (* '=' *) * expr) option
+and parameter =
+  | P of ident * (tok (* '=' *) * expr) option
+  (* semgrep: *)
+  | ParamEllipsis of tok
 
 (* ------------------------------------------------------------------------- *)
 (* Objects  *)
 (* ------------------------------------------------------------------------- *)
 and obj_inside = Object of obj_member list | ObjectComp of obj_comprehension
-and obj_member = OLocal of obj_local | OField of field | OAssert of assert_
+
+and obj_member =
+  | OLocal of obj_local
+  | OField of field
+  | OAssert of assert_
+  (* semgrep: *)
+  | OEllipsis of tok
 
 and field = {
   fld_name : field_name;
@@ -267,13 +282,11 @@ type any = E of expr
 (* Helpers *)
 (*****************************************************************************)
 
-let mk_string_ (str, tk) =
-  let fk = Parse_info.unsafe_fake_info "" in
-  (None, DoubleQuote, (fk, [ (str, tk) ], fk))
+let mk_string_ (l, (str, tk), r) = (None, DoubleQuote, (l, [ (str, tk) ], r))
 
 let string_of_string_ (x : string_) : string wrap =
   let _verbatimTODO, _kindTODO, (l, xs, r) = x in
-  let str = xs |> Common.map fst |> String.concat "" in
-  let infos = xs |> Common.map snd in
-  let tk = Parse_info.combine_infos l (infos @ [ r ]) in
+  let str = xs |> List.map fst |> String.concat "" in
+  let infos = xs |> List.map snd in
+  let tk = Tok.combine_toks l (infos @ [ r ]) in
   (str, tk)

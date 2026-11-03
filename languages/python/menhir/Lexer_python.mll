@@ -20,7 +20,6 @@ open Common
 open Lexing
 
 open Parser_python
-module PI = Parse_info
 module Flag = Flag_parsing_python
 
 (*****************************************************************************)
@@ -45,8 +44,8 @@ module Flag = Flag_parsing_python
 
 (* shortcuts *)
 let tok = Lexing.lexeme
-let tokinfo = Parse_info.tokinfo
-let error = Parse_info.lexical_error
+let tokinfo = Tok.tok_of_lexbuf
+let error = Parsing_error.lexical_error
 
 let unescaped s =
   let buf = Buffer.create (String.length s) in
@@ -128,11 +127,11 @@ let top_mode state =
   match !(state.mode) with
   | [] -> failwith "Lexer_python.top_mode: empty stack"
   | x::_ -> x
-let push_mode state mode = Common.push mode state.mode
-let pop_mode state = ignore(Common2.pop2 state.mode)
+let push_mode state mode = Stack_.push mode state.mode
+let pop_mode state = ignore(Stack_.pop state.mode)
 let set_mode state mode = begin pop_mode state; push_mode state mode end
 
-let pr_mode mode = pr2 (match mode with
+let pr_mode mode = UCommon.pr2 (match mode with
   | STATE_TOKEN -> "token"
   | STATE_OFFSET -> "offset"
   | STATE_UNDERSCORE_TOKEN -> "_token"
@@ -320,7 +319,7 @@ and _token python2 state = parse
         if state.nl_ignore <= 0 then begin
           state.curr_offset <- 0;
           let s = offset state lexbuf in
-          NEWLINE (Parse_info.tok_add_s s info)
+          NEWLINE (Tok.tok_add_s s info)
         end else begin
          set_mode state STATE_UNDERSCORE_TOKEN;
          TCommentSpace info
@@ -493,7 +492,9 @@ and _token python2 state = parse
         | "print" when python2 -> PRINT (tokinfo lexbuf)
         | "exec" when python2 -> EXEC (tokinfo lexbuf)
         (* python3-ext: no more: print, exec *)
-
+        (* Note that "self" is not listed above because it's not considered
+         * a Python keyword. In theory you could use different names for self.
+         *)
         | _          -> NAME (id, (tokinfo lexbuf))
     }
 
@@ -511,9 +512,9 @@ and _token python2 state = parse
 
   (* literals *)
   | integer as n longintpostfix
-      { LONGINT (int_of_string_opt n, tokinfo lexbuf) }
+      { LONGINT (Parsed_int.parse (n, tokinfo lexbuf)) }
   | integer as n
-      { INT (int_of_string_opt n, tokinfo lexbuf) }
+      { INT (Parsed_int.parse (n, tokinfo lexbuf)) }
 
   | floatnumber as n
       { FLOAT (float_of_string_opt n, tokinfo lexbuf) }
@@ -567,7 +568,7 @@ and sq_shortstrlit state pos pre = parse
   | (([^ '\\' '\r' '\n' '\''] | escapeseq)* as s) '\''
      {
        let full_str = Lexing.lexeme lexbuf in
-       STR (unescaped s, pre, PI.tok_add_s full_str pos) }
+       STR (unescaped s, pre, Tok.tok_add_s full_str pos) }
  | eof { error "EOF in string" lexbuf; EOF (tokinfo lexbuf) }
  | _  { error "unrecognized symbol in string" lexbuf; TUnknown(tokinfo lexbuf)}
 
@@ -576,14 +577,14 @@ and sq_longstrlit state pos pre = shortest
 | (([^ '\\'] | escapeseq)* as s) "'''"
     {
       let full_str = Lexing.lexeme lexbuf in
-      STR (unescaped s, pre, PI.tok_add_s full_str pos)
+      STR (unescaped s, pre, Tok.tok_add_s full_str pos)
     }
 
 and dq_shortstrlit state pos pre = parse
   | (([^ '\\' '\r' '\n' '\"'] | escapeseq)* as s) '"'
      {
        let full_str = Lexing.lexeme lexbuf in
-       STR (unescaped s, pre, PI.tok_add_s full_str pos) }
+       STR (unescaped s, pre, Tok.tok_add_s full_str pos) }
  | eof { error "EOF in string" lexbuf; EOF (tokinfo lexbuf) }
  | _  { error "unrecognized symbol in string" lexbuf; TUnknown(tokinfo lexbuf)}
 
@@ -591,7 +592,7 @@ and dq_longstrlit state pos pre = shortest
   | (([^ '\\'] | escapeseq)* as s) "\"\"\""
       {
         let full_str = Lexing.lexeme lexbuf in
-        STR (unescaped s, pre, PI.tok_add_s full_str pos) }
+        STR (unescaped s, pre, Tok.tok_add_s full_str pos) }
 
 (*****************************************************************************)
 (* Rules on interpolated strings *)

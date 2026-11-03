@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2019-2021 r2c
+ * Copyright (C) 2019-2023 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -15,24 +15,19 @@
 open Common
 module G = AST_generic
 module H = AST_generic_helpers
-
-(* Provide hash_* and hash_fold_* for the core ocaml types *)
-open Ppx_hash_lib.Std.Hash.Builtin
-
-let logger = Logging.get_logger [ __MODULE__ ]
+module Log = Log_semgrep.Log
 
 (*****************************************************************************)
 (* Prelude *)
 (*****************************************************************************)
 
+open Sexplib.Std
+
 (*****************************************************************************)
 (* Types *)
 (*****************************************************************************)
 
-(* less: could want to remember the position in the pattern of the metavar
- * for error reporting on pattern itself? so use a 'string AST_generic.wrap'?
- *)
-type mvar = string [@@deriving show, eq, hash]
+type mvar = Mvar.t [@@deriving eq, hash, ord, sexp, show]
 
 (* 'mvalue' below used to be just an alias to AST_generic.any, but it is more
  * precise to have a type just for the metavariable values; we do not
@@ -58,6 +53,8 @@ type mvalue =
   | S of AST_generic.stmt
   | T of AST_generic.type_
   | P of AST_generic.pattern
+  | Raw of AST_generic.raw_tree
+  | XmlAt of AST_generic.xml_attribute
   (* Those can be now empty with $...XXX metavariables.
    * coupling: if you add more constructors that allow an empty content,
    * you may need to modify JSON_report.range_of_any to not get
@@ -82,11 +79,19 @@ type mvalue =
       string
       * (* token without enclosing quotes *) AST_generic.tok
       * (* original token *) AST_generic.tok
-[@@deriving show, eq, hash]
+  (* We keep the `Any` variant here, despite it being a superset of the above
+     variants, as a "last resort" so that we can embed any match into an
+     mvalue.
+     This is primarily useful for the `as:` rule feature, which lets us
+     bind arbitrary matches to metavariables.
+  *)
+  | Any of AST_generic.any
+[@@deriving eq, ord, sexp, show]
 
 (* we sometimes need to convert to an any to be able to use
  * Lib_AST.ii_of_any, or Lib_AST.abstract_position_info_any
  *)
+(* coupling: this function should be an inverse to 'mvalue_of_any' below! *)
 let mvalue_to_any = function
   | E e -> G.E e
   | S s -> G.S s
@@ -96,14 +101,97 @@ let mvalue_to_any = function
    *)
   | Id (id, Some idinfo) -> G.E (G.N (G.Id (id, idinfo)) |> G.e)
   | Id (id, None) -> G.E (G.N (G.Id (id, G.empty_id_info ())) |> G.e)
-  | N x -> G.E (G.N x |> G.e)
+  | N x -> G.Name x
+  | XmlAt x -> G.XmlAt x
+  | Raw x -> G.E (G.RawExpr x |> G.e)
   | Ss x -> G.Ss x
   | Args x -> G.Args x
   | Params x -> G.Params x
   | Xmls x -> G.Xmls x
   | T x -> G.T x
   | P x -> G.P x
-  | Text (s, info, _) -> G.E (G.L (G.String (s, info)) |> G.e)
+  | Text (s, info, _) ->
+      G.E (G.L (G.String (Tok.unsafe_fake_bracket (s, info))) |> G.e)
+  | Any any -> any
+
+(* coupling: mvalue_to_any *)
+let mvalue_to_expr = function
+  | E e -> Some e
+  | Id (id, Some idinfo) -> Some (G.N (G.Id (id, idinfo)) |> G.e)
+  | Id (id, None) -> Some (G.N (G.Id (id, G.empty_id_info ())) |> G.e)
+  | N x -> Some (G.N x |> G.e)
+  | Raw x -> Some (G.RawExpr x |> G.e)
+  | Text (s, info, _) ->
+      Some (G.L (G.String (Tok.unsafe_fake_bracket (s, info))) |> G.e)
+  | S _
+  | XmlAt _
+  | Ss _
+  | Args _
+  | Params _
+  | Xmls _
+  | T _
+  | P _
+  | Any _ ->
+      None
+
+(* coupling: this function should be an inverse to the function above! *)
+let mvalue_of_any any =
+  match any with
+  | G.E { e = G.N (Id (id, idinfo)); _ } -> Id (id, Some idinfo)
+  | E { e = RawExpr x; _ }
+  | Raw x ->
+      Raw x
+  | E { e = L (String (_, (s, info), _)); _ } -> Text (s, info, G.fake "")
+  | E e -> E e
+  | S s -> S s
+  | Name x -> N x
+  | XmlAt x -> XmlAt x
+  | Ss x -> Ss x
+  | Args x -> Args x
+  | Params x -> Params x
+  | Xmls x -> Xmls x
+  | T x -> T x
+  | P x -> P x
+  | At _
+  | Fld _
+  | Flds _
+  | Partial _
+  | I _
+  | Str _
+  | Def _
+  | Dir _
+  | Pr _
+  | Tk _
+  | TodoK _
+  | Ar _
+  | Pa _
+  | Tp _
+  | Ta _
+  | Modn _
+  | Ce _
+  | Cs _
+  | ForOrIfComp _
+  | ModDk _
+  | En _
+  | Dk _
+  | Di _
+  | Lbli _
+  | Anys _ ->
+      Any any
+
+let location_aware_equal_mvalue mval1 mval2 =
+  let ranges_equal =
+    let any1, any2 = (mvalue_to_any mval1, mvalue_to_any mval2) in
+    let range1, range2 =
+      ( AST_generic_helpers.range_of_any_opt any1,
+        AST_generic_helpers.range_of_any_opt any2 )
+    in
+    match (range1, range2) with
+    | Some (l1, r1), Some (l2, r2) ->
+        Tok.equal_location l1 l2 && Tok.equal_location r1 r2
+    | _ -> true
+  in
+  ranges_equal && equal_mvalue mval1 mval2
 
 (* This is used for metavariable-pattern: where we need to transform the content
  * of a metavariable into a program so we can use evaluate_formula on it *)
@@ -116,24 +204,30 @@ let program_of_mvalue : mvalue -> G.program option =
   | Id (id, None) ->
       Some [ G.exprstmt (G.N (G.Id (id, G.empty_id_info ())) |> G.e) ]
   | N x -> Some [ G.exprstmt (G.N x |> G.e) ]
+  | Raw x -> Some [ G.exprstmt (G.RawExpr x |> G.e) ]
   | Ss stmts -> Some stmts
   | Params _
   | Args _
   | Xmls _
   | T _
   | P _
-  | Text _ ->
-      logger#debug "program_of_mvalue: not handled '%s'" (show_mvalue mval);
+  | XmlAt _
+  | Text _
+  (* `Any` should not be `Ss` or other variants which could be turned into a program *)
+  | Any _ ->
+      Log.warn (fun m ->
+          m "program_of_mvalue: not handled '%s'" (show_mvalue mval));
       None
 
-let range_of_mvalue mval =
-  let ( let* ) = Common.( >>= ) in
-  let* tok_start, tok_end = Visitor_AST.range_of_any_opt (mvalue_to_any mval) in
+let range_of_mvalue (mval : mvalue) : (Fpath.t * Range.t) option =
+  let* tok_start, tok_end =
+    AST_generic_helpers.range_of_any_opt (mvalue_to_any mval)
+  in
   (* We must return both the range *and* the file, due to metavariable-pattern
    * using temporary files. See [Match_rules.satisfies_metavar_pattern_condition]. *)
-  Some (tok_start.file, Range.range_of_token_locations tok_start tok_end)
+  Some (tok_start.pos.file, Range.range_of_token_locations tok_start tok_end)
 
-let ii_of_mval x = x |> mvalue_to_any |> Visitor_AST.ii_of_any
+let ii_of_mval x = x |> mvalue_to_any |> AST_generic_helpers.ii_of_any
 let str_of_mval x = show_mvalue x
 
 (* note that the mvalue acts as the value of the metavar and also
@@ -141,65 +235,7 @@ let str_of_mval x = show_mvalue x
    it is not Parse_info.Ab(stractPos)
 
    TODO: ensure that ["$A", Foo; "$B", Bar] and ["$B", Bar; "$A", Foo]
-   are equivalent for the equal and hash functions.
-   The current implementation is incorrect in general but should work in the
-   context of memoizing pattern matching.
+   are equivalent for the equal functions.
 *)
-type bindings = (mvar * mvalue) list (* = Common.assoc *)
-[@@deriving show, eq, hash]
-
-(* ex: $X, $FAIL, $VAR2, $_
- * Note that some languages such as PHP or Javascript allows '$' in identifier
- * names, so forcing metavariables to have uppercase letters at least allow
- * us to match specifically also identifiers in lower case (e.g., $foo will
- * only match the $foo identifiers in some concrete code; this is not a
- * metavariable).
- * We allow _ as a prefix to disable the unused-metavar check (we use
- * the same convention than OCaml).
- * However this conflicts with PHP superglobals, hence the special
- * cases below in is_metavar_name.
- * coupling: AST_generic.is_metavar_name
- *)
-let metavar_regexp_string = "^\\(\\$[A-Z_][A-Z_0-9]*\\)$"
-
-(*
- * Hacks abusing existing constructs to encode extra constructions.
- * One day we will have a pattern_ast.ml that mimics mostly
- * AST.ml and extends it with special sgrep constructs.
- *)
-let is_metavar_name s =
-  match s with
-  (* ugly: we should probably pass the language to is_metavar_name, but
-   * that would require to thread it through lots of functions, so for
-   * now we have this special case for PHP superglobals.
-   * ref: https://www.php.net/manual/en/language.variables.superglobals.php
-   *)
-  | "$_SERVER"
-  | "$_GET"
-  | "$_POST"
-  | "$_FILES"
-  | "$_COOKIE"
-  | "$_SESSION"
-  | "$_REQUEST"
-  | "$_ENV"
-    (* todo: there's also "$GLOBALS" but this may interface with existing rules*)
-    ->
-      false
-  | __else__ -> s =~ metavar_regexp_string
-
-(* $...XXX multivariadic metavariables. Note that I initially chose
- * $X... but this leads to parsing conflicts in Javascript.
- *)
-let metavar_ellipsis_regexp_string = "^\\(\\$\\.\\.\\.[A-Z_][A-Z_0-9]*\\)$"
-let is_metavar_ellipsis s = s =~ metavar_ellipsis_regexp_string
-
-module Structural = struct
-  let equal_mvalue = AST_utils.with_structural_equal equal_mvalue
-  let equal_bindings = AST_utils.with_structural_equal equal_bindings
-end
-
-module Referential = struct
-  let equal_mvalue = AST_utils.with_referential_equal equal_mvalue
-  let equal_bindings = AST_utils.with_referential_equal equal_bindings
-  let hash_bindings = hash_bindings
-end
+type bindings = (mvar * mvalue) list
+(* = Common.assoc *) [@@deriving eq, ord, sexp, show]

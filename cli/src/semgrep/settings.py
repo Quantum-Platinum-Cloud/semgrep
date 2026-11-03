@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2021-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 """
 Manages system settings for Semgrep
 
@@ -14,9 +26,11 @@ callers should handle this gracefully.
 import os
 import uuid
 from pathlib import Path
+from tempfile import mkstemp
 from typing import Any
 from typing import cast
 from typing import Mapping
+from typing import Optional
 
 from attr import define
 from attr import field
@@ -34,7 +48,7 @@ yaml.default_flow_style = False
 
 class SettingsSchema(TypedDict, total=False):
     has_shown_metrics_notification: bool
-    api_token: str
+    api_token: Optional[str]
     anonymous_user_id: str
 
 
@@ -42,7 +56,23 @@ SettingsKeys = Literal[
     "has_shown_metrics_notification", "api_token", "anonymous_user_id"
 ]
 
-DEFAULT_SETTINGS: SettingsSchema = {"anonymous_user_id": str(uuid.uuid4())}
+
+def generate_anonymous_user_id(api_token: Optional[str]) -> str:
+    return (
+        str(uuid.uuid4())
+        if api_token is None
+        else str(uuid.uuid5(uuid.UUID("0" * 32), api_token))
+    )
+
+
+def generate_default_settings(env_api_token: Optional[str] = None) -> SettingsSchema:
+    # If the API token is set via an envvar, we still use it to generate the
+    # anonymous user ID, but we do not persist it on disk (so
+    # `SettingsSchema.api_token` remains unset here.)
+    return {
+        "has_shown_metrics_notification": False,
+        "anonymous_user_id": generate_anonymous_user_id(env_api_token),
+    }
 
 
 @define
@@ -64,30 +94,44 @@ class Settings:
     def get_default_contents(self) -> SettingsSchema:
         """If file exists, read file. Otherwise use default"""
         # Must perform access check first in case we don't have permission to stat the path
+        env = Env()
+        default_settings = generate_default_settings(env.app_token)
         if not os.access(self.path, os.R_OK) or not self.path.is_file():
-            return DEFAULT_SETTINGS.copy()
+            return default_settings
 
         with self.path.open() as fd:
             yaml_contents = yaml.load(fd)
 
         if not isinstance(yaml_contents, Mapping):
             logger.warning(
-                f"Bad settings format; {self.path} will be overriden. Contents:\n{yaml_contents}"
+                f"Bad settings format; {self.path} will be overridden. Contents:\n{yaml_contents}"
             )
-            return DEFAULT_SETTINGS.copy()
+            return default_settings
 
-        return cast(SettingsSchema, {**DEFAULT_SETTINGS, **yaml_contents})
+        return cast(SettingsSchema, {**default_settings, **yaml_contents})
 
     def __attrs_post_init__(self) -> None:
         self.save()  # in case we retrieved default contents
 
+    # coupling: src/osemgrep/configuring/Semgrep_setting.ml save
     def save(self) -> None:
         try:
             if not self.path.parent.exists():
                 self.path.parent.mkdir(parents=True, exist_ok=True)
 
-            with self.path.open("w") as fd:
-                yaml.dump(self._contents, fd)
+            dir = str(self.path.parent)
+            fd, tmp_path = mkstemp(suffix=".yml", prefix="settings", dir=dir, text=True)
+            with os.fdopen(fd, "w") as f:
+                yaml.dump(self._contents, f)
+
+            # By writing to a guarenteed unique file and then renaming
+            # that file.  The written contents are guarenteed to be
+            # valid. If we write directly to the file, there is a
+            # chance that concurrent instances of the program be
+            # writing to the file at the same time an get race
+            # conditions.
+            os.replace(tmp_path, self.path)
+
         except PermissionError:
             logger.verbose("Could not write settings file at %s", self.path)
 

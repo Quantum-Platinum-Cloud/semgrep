@@ -1,7 +1,19 @@
+(*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* Expanding or extracting macros, at the token level *)
 
 (* the either is to differentialte macro-variables from macro-functions *)
-type define_body = (unit, string list) Common.either * Parser_cpp.token list
+type define_body = (unit, string list) Either.t * Parser_cpp.token list
 
 (* TODO
    (* corresponds to what is in the yacfe configuration file (e.g. standard.h) *)
@@ -27,7 +39,7 @@ type define_body = (unit, string list) Common.either * Parser_cpp.token list
 
 (* extracting define_def, e.g. from a standard.h; assume have called
  * fix_tokens_define before to have the TDefEol *)
-val extract_macros : Parser_cpp.token list -> (string, define_body) Common.assoc
+val extract_macros : Parser_cpp.token list -> (string, define_body) Assoc.t
 
 (* TODO
    val string_of_define_def: define_def -> string
@@ -52,6 +64,6 @@ val apply_macro_defs :
   ?evaluate_concatop:bool ->
   ?inplace_when_single:bool ->
 *)
-  (string, define_body (* define_def *)) Hashtbl.t ->
+  (string, define_body (* define_def *)) Base.Hashtbl.t ->
   Token_views_cpp.paren_grouped list ->
   unit

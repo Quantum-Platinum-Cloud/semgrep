@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2021-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import logging
 import os
 import shutil
@@ -181,7 +193,7 @@ class BenchmarkRunSetupData:
     run_name: str = field(default="benchmark_run")
     rule_configs: List[RuleConfig] = field(default=["p/r2c"])
     repositories: List[Repository] = field(factory=list)
-    semgrep_options: List[str] = field(factory=list)
+    semgrep_options: List[str] = field(default=[])
 
 
 @define

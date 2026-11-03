@@ -33,23 +33,19 @@
 (* ------------------------------------------------------------------------- *)
 (* Token/info *)
 (* ------------------------------------------------------------------------- *)
-(* Contains among other things the position of the token through
- * the Parse_info.token_location embedded inside it, as well as the
- * transformation field that makes possible spatch on the code.
- *)
-type tok = Parse_info.t [@@deriving show] (* with tarzan *)
+type tok = Tok.t [@@deriving show]
 
 (* a shortcut to annotate some information with token/position information *)
-type 'a wrap = 'a * tok [@@deriving show] (* with tarzan *)
+type 'a wrap = 'a * tok [@@deriving show]
 
 (* round(), square[], curly{}, angle<> brackets *)
-type 'a bracket = tok * 'a * tok [@@deriving show] (* with tarzan *)
+type 'a bracket = tok * 'a * tok [@@deriving show]
 
 (* ------------------------------------------------------------------------- *)
 (* Ident, qualifier *)
 (* ------------------------------------------------------------------------- *)
 (* For functions/methods/parameters/fields/labels *)
-type ident = string wrap [@@deriving show] (* with tarzan *)
+type ident = string wrap [@@deriving show]
 
 (* For type names  (called names in ast.go). It could also be used for
  * imported entities from other module, but they are currently parsed as
@@ -57,13 +53,17 @@ type ident = string wrap [@@deriving show] (* with tarzan *)
  * that require a semantic analysis to disambiguate.
  *)
 type qualified_ident = ident list (* 1 or 2 elements *) [@@deriving show]
-(* with tarzan *)
 
 (*****************************************************************************)
 (* Type *)
 (*****************************************************************************)
 type type_ =
   | TName of qualified_ident (* includes the basic types: bool/int/... *)
+  (* Type-set terms used in generic constraints. *)
+  | TUnderlying of tok (* ~ *) * type_
+  | TUnion of type_ * tok (* | *) * type_
+  (* Like TGeneric, but retains a non-name base from the CST. *)
+  | TApply of type_ * type_arguments
   | TPtr of tok * type_
   (* generics: generalize TArray and TMap to any types.
    * alt: we could merge it with TName
@@ -93,6 +93,12 @@ and func_type = {
 and parameter_binding =
   | ParamClassic of parameter
   (* sgrep-ext: *)
+  (* For metavariable ellipsis identifier (like $...ARGS), we don't
+     usually separate this out at the AST level. However, single
+     identifiers as parameters are parsed as types in Go, so we can't
+     reuse the ordinary identifier construct. So we use this.
+  *)
+  | ParamMetavarEllipsis of ident
   | ParamEllipsis of tok
 
 and parameter = {
@@ -107,6 +113,7 @@ and struct_field = struct_field_kind * tag option
 and struct_field_kind =
   | Field of ident * type_ (* could factorize with entity *)
   | EmbeddedField of tok option (* * *) * qualified_ident
+  | EmbeddedGenericField of tok option (* * *) * type_
   (* sgrep-ext: *)
   | FieldEllipsis of tok
 
@@ -117,6 +124,7 @@ and interface_field =
   | Method of ident * func_type
   (* "embedded" interfaces *)
   | EmbeddedInterface of qualified_ident
+  | EmbeddedGenericInterface of type_
   (* "general" interfaces *)
   | Constraints of constraint_ list (* at least one element *)
   (* sgrep-ext: *)
@@ -124,7 +132,7 @@ and interface_field =
 
 (* the 'type_' below can't be an interface itself and can't be a type param *)
 and constraint_ = tok option (* '~', "underlying" type *) * type_
-and expr_or_type = (expr, type_) Common.either
+and expr_or_type = (expr, type_) Either_.t
 
 (*****************************************************************************)
 (* Expression *)
@@ -139,7 +147,7 @@ and expr =
    * To disambiguate requires semantic information.
    * Selector (Name,'.', ident) can be many things.
    *)
-  | Id of ident (* * AST_generic.resolved_name option ref *)
+  | Id of ident
   (* A Selector can be a
    *  - a field access of a struct
    *  - a top decl access of a package
@@ -159,13 +167,15 @@ and expr =
    * you need typing information to know that.
    *)
   | Cast of type_ * expr bracket
+  (* A generic function value, without a call, e.g. f[[]int]. *)
+  | TypeInstantiation of type_ * type_arguments
   (* special cases of Unary *)
   | Deref of tok (* * *) * expr
   (* less: some &T{...} should be transformed in call to new? *)
   | Ref of tok (* & *) * expr
   | Receive of tok * expr (* denote a channel *)
-  | Unary of AST_generic_.operator (* +/-/~/! *) wrap * expr
-  | Binary of expr * AST_generic_.operator wrap * expr
+  | Unary of AST_generic.operator (* +/-/~/! *) wrap * expr
+  | Binary of expr * AST_generic.operator wrap * expr
   (* x.(<type>), panic if false unless used as x, ok = x.(<type>) *)
   | TypeAssert of expr * type_ bracket
   (* x.(type)
@@ -186,11 +196,13 @@ and expr =
 (* old: was just a string in ast.go *)
 and literal =
   (* less: Bool of bool wrap | Nil of tok? *)
-  | Int of int option wrap
+  | Int of Parsed_int.t
   | Float of float option wrap
   | Imag of string wrap
   | Rune of string wrap (* unicode char *)
-  | String of string wrap (* unicode string *)
+  | String of string wrap
+(* unicode string *)
+(* TODO: bracket *)
 
 and index = expr
 and arguments = argument list
@@ -271,8 +283,8 @@ and simple =
    *  a,b = foo()
    *)
   | Assign of expr list (* lhs, pattern *) * tok * expr list (* rhs *)
-  | AssignOp of expr * AST_generic_.operator wrap * expr
-  | IncDec of expr * AST_generic_.incr_decr wrap * AST_generic_.prefix_postfix
+  | AssignOp of expr * AST_generic.operator wrap * expr
+  | IncDec of expr * AST_generic.incr_decr wrap * AST_generic.prefix_postfix
   (* declare or reassign, and special semantic when Receive operation *)
   | DShortVars of expr list * tok (* := *) * expr list
 
@@ -292,7 +304,6 @@ and decl =
   | DTypeAlias of ident * tok (* = *) * type_
   (* this introduces a distinct type, with different method set *)
   | DTypeDef of ident * type_parameters option (* generics: *) * type_
-(* with tarzan *)
 
 and function_ = func_type * stmt
 
@@ -318,7 +329,6 @@ and import_kind =
   (* inline in current file scope all the entities of the imported module *)
   | ImportDot of tok
 [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 (*****************************************************************************)
 (* Toplevel *)
@@ -336,7 +346,6 @@ type top_decl =
   (* tree-sitter-go: not used in pfff Go grammar *)
   | STop of stmt
 [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 (* old: used to be a record with package, imports, and then decls but
  * tree-sitter-go is more flexible and so I put package and imports in
@@ -344,7 +353,6 @@ type top_decl =
  * by allowing to have a pattern with just a package declaration for example.
  *)
 type program = top_decl list [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 (*****************************************************************************)
 (* Any *)
@@ -374,7 +382,6 @@ type any =
   | Items of item list
   | Partial of partial
 [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 (*****************************************************************************)
 (* Helpers *)
@@ -387,8 +394,8 @@ let stmt1_with b xs =
   | [ st ] -> st
   | xs -> Block (b xs)
 
-let stmt1 tok xs = stmt1_with (Parse_info.fake_bracket tok) xs
-let unsafe_stmt1 xs = stmt1_with Parse_info.unsafe_fake_bracket xs
+let stmt1 tok xs = stmt1_with (Tok.fake_bracket tok) xs
+let unsafe_stmt1 xs = stmt1_with Tok.unsafe_fake_bracket xs
 
 let item1 xs =
   match xs with
@@ -406,9 +413,9 @@ let package_and_imports_of_program xs =
   in
   let imports =
     xs
-    |> Common.map_filter (function
-         | Import x -> Some x
-         | _ -> None)
+    |> List.filter_map (function
+      | Import x -> Some x
+      | _ -> None)
   in
   (package, imports)
 

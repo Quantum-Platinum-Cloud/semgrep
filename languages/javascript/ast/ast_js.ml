@@ -12,7 +12,6 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * license.txt for more details.
  *)
-open Common
 
 (*****************************************************************************)
 (* Prelude *)
@@ -77,31 +76,27 @@ open Common
 (* Token/info *)
 (* ------------------------------------------------------------------------- *)
 
-(* Contains among other things the position of the token through
- * the Parse_info.token_location embedded inside it, as well as the
- * transformation field that makes possible spatch on the code.
- *)
-type tok = Parse_info.t [@@deriving show]
+type tok = Tok.t [@@deriving show]
 
 (* a shortcut to annotate some information with token/position information *)
-type 'a wrap = 'a * tok [@@deriving show] (* with tarzan *)
+type 'a wrap = 'a * tok [@@deriving show]
 
 (* round(), square[], curly{}, angle<> brackets *)
-type 'a bracket = tok * 'a * tok [@@deriving show] (* with tarzan *)
-type a_todo_category = string wrap [@@deriving show] (* with tarzan *)
+type 'a bracket = tok * 'a * tok [@@deriving show]
+type a_todo_category = string wrap [@@deriving show]
 
 (* real or fake when ASI (automatic semicolon insertion) *)
-type sc = Parse_info.t [@@deriving show] (* with tarzan *)
+type sc = Tok.t [@@deriving show]
 
 (* ------------------------------------------------------------------------- *)
 (* Name *)
 (* ------------------------------------------------------------------------- *)
 
-type a_ident = string wrap [@@deriving show]
+type a_ident = { str : string; tok : tok; fake : bool } [@@deriving show]
 
-(* old: there used to be 'resolved_name' and 'qualified_name' types, but
- * the name resolution is now done on the generic AST instead.
- *)
+let real_id str tok = { str; tok; fake = false }
+let fake_id str tok = { str; tok; fake = true }
+let to_real_id (str, tok) = { str; tok; fake = false }
 
 type special =
   (* Special values *)
@@ -149,26 +144,36 @@ type special =
   (* CommonJS part2 *)
   | Require
   | UseStrict
-  | ArithOp of AST_generic_.operator
+  | ArithOp of AST_generic.operator
   (* less: should be in statement and unsugared in x+=1 or even x = x + 1 *)
-  | IncrDecr of (AST_generic_.incr_decr * AST_generic_.prefix_postfix)
+  | IncrDecr of (AST_generic.incr_decr * AST_generic.prefix_postfix)
 [@@deriving show { with_path = false }]
-(* with tarzan *)
 
-type a_label = string wrap [@@deriving show] (* with tarzan *)
+type a_label = string wrap [@@deriving show]
 
 (* the filename is not "resolved".
  * alt: use a reference like for resolved_name set in graph_code_js.ml and
  * module_path_js.ml? *)
-type a_filename = string wrap [@@deriving show] (* with tarzan *)
+type a_filename = string wrap [@@deriving show]
 
 (* Used for decorators and for TyName in AST_generic.type_.
  * Otherwise for regular JS dotted names are encoded with ObjAccess instead.
  *)
-type a_dotted_ident = a_ident list [@@deriving show] (* with tarzan *)
+type a_dotted_ident = a_ident list [@@deriving show]
 
-(* when doing export default Foo and import Bar, ... *)
-let default_entity = "!default!"
+(* In ECMAScript modules, there's a notion of a "default" import/export, which
+   is used, e.g., when doing `import bar from 'foo';`
+   (cf. `import { bar } from 'foo';`). In these cases, `default` is a keyword
+   and cannot be used as an identifier, so we can use it here directly to refer
+   to that default entity. This allows us to have a pattern matching the name
+   `foo.default` to match against the imported name in both `import { default
+   as example } from 'foo';` and `import example from 'foo';`, as it ought
+   to---this value being used in the latter case to construct the name.
+
+   When not using ECMAScript modules, this isn't a keyword, but we don't use
+   it, so there's no chance of a conflict.
+*)
+let default_entity = "default"
 
 type property_name =
   (* this can even be a string or number *)
@@ -208,12 +213,12 @@ and expr =
   | ArrAccess of expr * expr bracket
   (* ident is a Some when recursive lambda or assigned in module.exports *)
   | Fun of function_definition * a_ident option
-  | Apply of expr * a_arguments
+  | Apply of expr * type_ list bracket * a_arguments
   | New of tok * expr * a_arguments
   (* copy-paste of AST_generic.xml (but with different 'expr') *)
   | Xml of xml
   (* could unify with Apply, but need Lazy special then *)
-  | Conditional of expr * expr * expr
+  | Conditional of expr * tok (* '?' *) * expr * tok (* ':' *) * expr
   (* typescript: *)
   (* I'm not sure E : T is valid TS code actually; tree-sitter-ts allows it
    * but I can't find doc about it. Looks like the 'as' or <T> syntax
@@ -221,8 +226,11 @@ and expr =
    *)
   | Cast of expr * tok (* ':' *) * type_
   | TypeAssert of expr * tok (* 'as' or '<' *) * type_ (* X as T or <T> X *)
+  | Satisfies of expr * tok (* 'satisfies' *) * type_
+  | Instantiation of expr * type_ list bracket
   (* this is used mostly for unsupported typescript features *)
   | ExprTodo of a_todo_category * expr list
+  | ParenExpr of tok * expr * tok
   (* sgrep-ext: *)
   | Ellipsis of tok
   | DeepEllipsis of expr bracket
@@ -233,7 +241,7 @@ and expr =
 and literal =
   | Bool of bool wrap
   | Num of float option wrap
-  | String of string wrap
+  | String of string wrap (* TODO: bracket, like for Regexp below *)
   | Regexp of string wrap bracket (* // *) * string wrap option (* modifier *)
 
 and a_arguments = a_argument list bracket
@@ -311,8 +319,8 @@ and for_header =
   | ForEllipsis of tok
 
 (* the expr is usually just an assign *)
-and vars_or_expr = (var list, expr) Common.either
-and var_or_expr = (var, expr) Common.either
+and vars_or_expr = (var list, expr) Either_.t
+and var_or_expr = (var, expr) Either_.t
 and case = Case of tok * expr * stmt | Default of tok * stmt
 
 and catch =
@@ -348,7 +356,7 @@ and type_ =
   | TyArray of type_ * (tok * unit * tok)
   | TyTuple of (tok * tuple_type_member list * tok)
   | TyFun of parameter list * type_ option
-  | TyRecordAnon of (tok * unit * tok)
+  | TyRecordAnon of (tok * property list * tok)
   | TyOr of type_ * tok * type_
   | TyAnd of type_ * tok * type_
   (* ex: KeyOf, This, *, LitType, LookupType, CondType, IndexKey, Typeof
@@ -397,6 +405,7 @@ and keyword_attribute =
   (* only inside classes *)
   | Get
   | Set
+  | Accessor
 
 (*****************************************************************************)
 (* Definitions *)
@@ -434,10 +443,10 @@ and var_kind = Var | Let | Const
 and var = entity * variable_definition
 
 and function_definition = {
-  f_kind : AST_generic_.function_kind wrap;
+  f_kind : AST_generic.function_kind wrap;
   (* less: move that in entity? but some anon func have attributes too *)
   f_attrs : attribute list;
-  f_params : parameter list;
+  f_params : parameter list bracket;
   (* typescript-ext: *)
   f_rettype : type_ option;
   f_body : stmt;
@@ -467,11 +476,11 @@ and parameter_classic = {
  * For an interface, the parent is always a type_
  * TODO: expr can have <type_arguments>
  *)
-and parent = (expr, type_) Common.either
+and parent = (expr, type_) Either_.t
 
 and class_definition = {
   (* typescript-ext: Interface is now possible *)
-  c_kind : AST_generic_.class_kind wrap;
+  c_kind : AST_generic.class_kind wrap;
   (* typescript-ext: can have multiple parents *)
   c_extends : parent list;
   (* typescript-ext: interfaces *)
@@ -554,14 +563,14 @@ and import_specifier = a_ident * a_ident option
  *)
 (* less: can remove and below when StmtTodo disappear *)
 and a_toplevel = stmt
-(* [@@deriving show { with_path = false} ] (* with tarzan *) *)
+(* [@@deriving show { with_path = false} ] *)
 
 (*****************************************************************************)
 (* Program *)
 (*****************************************************************************)
 
 and a_program = a_toplevel list
-(* [@@deriving show { with_path = false} ] (* with tarzan *) *)
+(* [@@deriving show { with_path = false} ] *)
 
 (*****************************************************************************)
 (* Any *)
@@ -593,7 +602,6 @@ and any =
   | Partial of partial
   | Tk of tok
 [@@deriving show { with_path = false }]
-(* with tarzan *)
 
 (*****************************************************************************)
 (* Helpers *)
@@ -623,9 +631,9 @@ let special_of_id_opt s =
 let idexp id = Id id
 
 let idexp_or_special id =
-  match special_of_id_opt (fst id) with
+  match special_of_id_opt id.str with
   | None -> idexp id
-  | Some special -> IdSpecial (special, snd id)
+  | Some special -> IdSpecial (special, id.tok)
 
 (* note that this should be avoided as much as possible for sgrep, because
  * what was before a simple sequence of stmts in the same block can suddently
@@ -637,12 +645,12 @@ let stmt1_with b xs =
   | [ x ] -> x
   | xs -> Block (b xs)
 
-let stmt1 tok xs = stmt1_with (Parse_info.fake_bracket tok) xs
-let unsafe_stmt1 xs = stmt1_with Parse_info.unsafe_fake_bracket xs
+let stmt1 tok xs = stmt1_with (Tok.fake_bracket tok) xs
+let unsafe_stmt1 xs = stmt1_with Tok.unsafe_fake_bracket xs
 let basic_entity id = { name = id; attrs = [] }
 
 let mk_default_entity_def tok exp =
-  let n = (default_entity, tok) in
+  let n = real_id default_entity tok in
   (* TODO: look at exp and transform in FuncDef/ClassDef? *)
   let def =
     ( basic_entity n,
@@ -658,8 +666,8 @@ let var_pattern_to_var v_kind pat tok init_opt =
   (* no need special_multivardef_pattern trick here *)
   | Id id, None -> (basic_entity id, { v_kind; v_init = None; v_type = None })
   | _ ->
-      let s = AST_generic_.special_multivardef_pattern in
-      let id = (s, tok) in
+      let s = AST_generic.special_multivardef_pattern in
+      let id = fake_id s tok in
       let init =
         match init_opt with
         | Some init -> Assign (pat, tok, init)
@@ -670,9 +678,9 @@ let var_pattern_to_var v_kind pat tok init_opt =
 
 let build_var kwd (id_or_pat, ty_opt, initopt) =
   match id_or_pat with
-  | Left id ->
+  | Either.Left id ->
       (basic_entity id, { v_kind = kwd; v_init = initopt; v_type = ty_opt })
-  | Right pat -> var_pattern_to_var kwd pat (snd kwd) initopt
+  | Either.Right pat -> var_pattern_to_var kwd pat (snd kwd) initopt
 
 let build_vars kwd vars = vars |> List.map (build_var kwd)
 let vars_to_defs xs = xs |> List.map (fun (ent, v) -> (ent, VarDef v))
@@ -693,12 +701,12 @@ let parameter_to_pattern tok (param : parameter) : a_pattern =
       let pat =
         match p_type with
         | None -> pat
-        | Some type_ -> Cast (pat, Parse_info.fake_info tok ":", type_)
+        | Some type_ -> Cast (pat, Tok.fake_tok tok ":", type_)
       in
       let pat =
         match p_default with
         | None -> pat
-        | Some expr -> Assign (pat, Parse_info.fake_info tok "=", expr)
+        | Some expr -> Assign (pat, Tok.fake_tok tok "=", expr)
       in
       (* TODO? *)
       ignore p_attrs;
@@ -708,7 +716,7 @@ let parameter_to_pattern tok (param : parameter) : a_pattern =
 
 let mk_const_var id e =
   ( basic_entity id,
-    VarDef { v_kind = (Const, snd id); v_init = Some e; v_type = None } )
+    VarDef { v_kind = (Const, id.tok); v_init = Some e; v_type = None } )
 
 let add_decorators_to_declaration decorators declaration =
   let ent, defkind = declaration in
@@ -718,12 +726,11 @@ let add_decorators_to_declarations decorators declarations =
   List.map (add_decorators_to_declaration decorators) declarations
 
 (*****************************************************************************)
-(* Helpers, could also be put in lib_parsing.ml instead *)
+(* Helpers. TODO: move in Tok.ml instead *)
 (*****************************************************************************)
-module PI = Parse_info
 
 (* used both by Parsing_hacks_js and Parse_js *)
 let fakeInfoAttach info =
-  let info = PI.rewrap_str "';' (from ASI)" info in
-  let pinfo = PI.unsafe_token_location_of_info info in
-  { PI.token = PI.FakeTokStr (";", Some (pinfo, -1)); transfo = PI.NoTransfo }
+  let info = Tok.rewrap_str "';' (from ASI)" info in
+  let loc = Tok.unsafe_loc_of_tok info in
+  Tok.FakeTok (";", Some (loc, -1))

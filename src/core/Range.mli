@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2021-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* charpos is 0-indexed. First char of a file is at charpos:0
  * (unlike in Emacs where point starts at 1).
  *)
@@ -13,6 +25,9 @@ val pp : Format.formatter -> t -> unit
 
 exception NotValidRange of string
 
+val equal : t -> t -> bool
+val compare : t -> t -> int
+
 (* included or equal *)
 val ( $<=$ ) : t -> t -> bool
 
@@ -21,19 +36,9 @@ val ( $<$ ) : t -> t -> bool
 
 (* disjoint *)
 val ( $<>$ ) : t -> t -> bool
-
-(* start_line - end_line -> filename -> range *)
-val range_of_line_spec : string -> Common.filename -> t
-
-(* start_line:start_col - end_line:end_col -> filename -> range *)
-val range_of_linecol_spec : string -> Common.filename -> t
-
-val range_of_token_locations :
-  Parse_info.token_location -> Parse_info.token_location -> t
-
-val range_of_tokens : Parse_info.t list -> t option
+val range_of_token_locations : Tok.location -> Tok.location -> t
 
 (* Note that the file content is memoized, so multiple calls to
  * content_at_range will not read_file again and again the same file.
  *)
-val content_at_range : Common.filename -> t -> string
+val content_at_range : Fpath.t -> t -> string

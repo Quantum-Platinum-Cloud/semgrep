@@ -1,3 +1,17 @@
+(*
+   Copyright (c) 2022-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+module OutJ = Semgrep_output_v1_j
+
 (*****************************************************************************)
 (* Prelude *)
 (*****************************************************************************)
@@ -6,8 +20,7 @@
 
    Translated from error.py
 
-   LATER: we should merge with Semgrep_core_error.ml, as well
-   as the errors defined in semgrep_output_v1.atd (especially core_error).
+   LATER: we should merge with Core_error.ml
 
    coupling: See the CLI.safe_run function which should catch all the exns
    defined in this module and return an appropriate exit code.
@@ -21,11 +34,9 @@
    See CLI.safe_run()
 *)
 exception Semgrep_error of string * Exit_code.t option
-exception Exit of Exit_code.t
+exception Exit_code of Exit_code.t
 
 (* TOPORT?
-   exception Semgrep_core_error of Output_from_core_t.core_error
-
    (*
       python: class ErrorWithSpan(SemgrepError)
 
@@ -66,25 +77,79 @@ exception Exit of Exit_code.t
 *)
 
 (*****************************************************************************)
+(* Shortcuts *)
+(*****************************************************************************)
+
+let abort msg = raise (Semgrep_error (msg, None))
+let exit_code_exn code = raise (Exit_code code)
+
+(*****************************************************************************)
 (* string of/registering exns *)
 (*****************************************************************************)
 
-(* TODO
-   let register_exception_printer () =
-     Printexc.register_printer (function
-       | Semgrep_error err -> Some (string_of_error err)
-       | _else_ -> None)
-
-   (*
-      Modify the behavior of 'Printexc.to_string' to print Semgrep exceptions
-      nicely.
-   *)
-   let () = register_exception_printer ()
-*)
+let () =
+  Printexc.register_printer (function
+    | Semgrep_error (msg, opt_exit_code) ->
+        let base_msg = Printf.sprintf "Fatal error: %s" msg in
+        Some
+          (match opt_exit_code with
+          | None -> base_msg
+          | Some exit_code ->
+              Printf.sprintf "%s\nExit code %i: %s" base_msg exit_code.code
+                exit_code.description)
+    | Exit_code exit_code ->
+        Some
+          (Printf.sprintf "Exit code %i: %s" exit_code.code
+             exit_code.description)
+    | _ -> None)
 
 (*****************************************************************************)
 (* Misc *)
 (*****************************************************************************)
 
-let abort msg = raise (Semgrep_error (msg, None))
-let exit code = raise (Exit code)
+(* This is used for the CLI text output and also for the metrics
+ * payload.errors.errors.
+ * The resulting string used to be stored also in the cli_error.type_ field,
+ * but we now store directly the error_type (which should have the
+ * same string representation for most cases as before except
+ * for the constructors with arguments).
+ * python: error_type_string() in error.py
+ *)
+let rec string_of_error_type (error_type : OutJ.error_type) : string =
+  match error_type with
+  (* python: convert to the same string of core.ParseError for now *)
+  | PartialParsing _ -> string_of_error_type ParseError
+  (* other constructors with arguments *)
+  | PatternParseError _ -> string_of_error_type PatternParseError0
+  | IncompatibleRule _ -> string_of_error_type IncompatibleRule0
+  | DependencyResolutionError _ -> "Dependency resolution error"
+  (* All the other cases don't have arguments in Semgrep_output_v1.atd
+   * and have some <json name="..."> annotations to generate the right string
+   * so we can mostly just call Out.string_of_error_type (and remove the
+   * quotes)
+   *)
+  | PatternParseError0
+  | IncompatibleRule0
+  | LexicalError
+  | RuleParseError
+  | SemgrepWarning
+  | SemgrepError
+  | InvalidRuleSchemaError
+  | UnknownLanguageError
+  | MissingPlugin
+  | ParseError
+  | OtherParseError
+  | AstBuilderError
+  | InvalidYaml
+  | MatchingError
+  | SemgrepMatchFound
+  | TooManyMatches
+  | FatalError
+  | Timeout
+  | FixpointTimeout
+  | OutOfMemory
+  | StackOverflow
+  | TimeoutDuringInterfile
+  | OutOfMemoryDuringInterfile ->
+      OutJ.string_of_error_type error_type
+      |> JSON.remove_enclosing_quotes_of_jstring

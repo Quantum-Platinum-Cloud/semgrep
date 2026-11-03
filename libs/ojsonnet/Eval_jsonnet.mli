@@ -1,4 +1,16 @@
-exception Error of string * Parse_info.t
+(*
+   Copyright (c) 2022-2024 Semgrep Inc.
 
-(* may raise Error *)
-val eval_program : Core_jsonnet.program -> Value_jsonnet.value_
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(* Rely on Conf_ojsonnet flags *)
+
+val eval_program : Core_jsonnet.program -> Value_jsonnet.t
+val manifest_value : Value_jsonnet.t -> JSON.t

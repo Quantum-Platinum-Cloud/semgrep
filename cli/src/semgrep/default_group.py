@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2021-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 from typing import Any
 from typing import List
 from typing import Optional
@@ -85,5 +97,5 @@ class DefaultGroup(click.Group):
         """
         cmd_name, cmd, args = super().resolve_command(ctx, args)
         if hasattr(ctx, "_default_command_overwrite_args0"):
-            args.insert(0, ctx._default_command_overwrite_args0)  # type: ignore
+            args.insert(0, ctx._default_command_overwrite_args0)
         return cmd_name, cmd, args

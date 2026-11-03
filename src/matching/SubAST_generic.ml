@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2019-2022 r2c
+ * Copyright (C) 2019-2022 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -12,10 +12,10 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * LICENSE for more details.
  *)
-
 open AST_generic
+open Common
+module Log = Log_matching.Log
 module H = AST_generic_helpers
-module V = Visitor_AST
 
 (*****************************************************************************)
 (* Prelude *)
@@ -24,7 +24,7 @@ module V = Visitor_AST
  *
  *)
 
-let go_really_deeper_stmt = ref true
+let go_really_deeper_stmt = true
 
 (*****************************************************************************)
 (* Sub-expressions and sub-statements *)
@@ -35,6 +35,14 @@ let subexprs_of_any_list xs =
   |> List.fold_left
        (fun x -> function
          | E e -> e :: x
+         | _ -> x)
+       []
+
+let substmts_of_any_list xs =
+  xs
+  |> List.fold_left
+       (fun x -> function
+         | S s -> s :: x
          | _ -> x)
        []
 
@@ -64,24 +72,24 @@ let subexprs_of_stmt_kind = function
   | For (_, MultiForEach es, _) ->
       es
       |> List.filter_map (function
-           | FE (_, _, e) -> Some [ e ]
-           | FECond ((_, _, e1), _, e2) -> Some [ e1; e2 ]
-           | FEllipsis _ -> None)
-      |> List.concat
+        | FE (_, _, e) -> Some [ e ]
+        | FECond ((_, _, e1), _, e2) -> Some [ e1; e2 ]
+        | FEllipsis _ -> None)
+      |> List_.flatten
   | For (_, ForClassic (xs, eopt1, eopt2), _) ->
       (xs
-      |> Common.map_filter (function
-           | ForInitExpr e -> Some e
-           | ForInitVar (_, vdef) -> vdef.vinit))
+      |> List.filter_map (function
+        | ForInitExpr e -> Some e
+        | ForInitVar (_, vdef) -> vdef.vinit))
       @ Option.to_list eopt1 @ Option.to_list eopt2
   | Assert (_, (_, args, _), _) ->
       args
-      |> Common.map_filter (function
-           | Arg e -> Some e
-           | _ -> None)
-  | For (_, ForIn (_, es), _) -> es
+      |> List.filter_map (function
+        | Arg e -> Some e
+        | _ -> None)
   | OtherStmt (_op, xs) -> subexprs_of_any_list xs
   | OtherStmtWithStmt (_, xs, _) -> subexprs_of_any_list xs
+  | RawStmt x -> Raw_tree.anys x |> subexprs_of_any_list
   (* 0 *)
   | DirectiveStmt _
   | Block _
@@ -99,25 +107,25 @@ let subexprs_of_stmt_kind = function
 let subexprs_of_stmt st = subexprs_of_stmt_kind st.s
 
 let subexprs_of_args args =
-  args |> unbracket
-  |> Common.map_filter (function
-       | Arg e
-       | ArgKwd (_, e)
-       | ArgKwdOptional (_, e) ->
-           Some e
-       | ArgType _
-       | OtherArg _ ->
-           None)
+  args |> Tok.unbracket
+  |> List.filter_map (function
+    | Arg e
+    | ArgKwd (_, e)
+    | ArgKwdOptional (_, e) ->
+        Some e
+    | ArgType _
+    | OtherArg _ ->
+        None)
 
 (* used for deep expression matching *)
 let subexprs_of_expr with_symbolic_propagation e =
   match e.e with
-  | N (Id (_, { id_svalue = { contents = Some (Sym e1) }; _ }))
+  | N (Id (_, { id_svalue = { contents = Sym e1 }; _ }))
     when with_symbolic_propagation ->
       [ e1 ]
   | L _
   | N _
-  | IdSpecial _
+  | Special _
   | Ellipsis _
   | TypedMetavar _ ->
       []
@@ -126,6 +134,8 @@ let subexprs_of_expr with_symbolic_propagation e =
   | Cast (_, _, e)
   | Ref (_, e)
   | DeRef (_, e)
+  | Alias (_, e)
+  | LocalImportAll (_, _, e)
   | DeepEllipsis (_, e, _)
   | DotAccessEllipsis (e, _) ->
       [ e ]
@@ -138,32 +148,29 @@ let subexprs_of_expr with_symbolic_propagation e =
   | Seq xs -> xs
   | Record (_, flds, _) ->
       flds |> Common2.map_flatten (function F st -> subexprs_of_stmt st)
-  | Container (_, xs) -> unbracket xs
+  | Container (_, xs) -> Tok.unbracket xs
   | Comprehension (_, (_, (e, xs), _)) ->
       e
       :: (xs
-         |> Common.map (function
-              | CompFor (_, _pat, _, e) -> e
-              | CompIf (_, e) -> e))
-  | New (_, _t, args) -> subexprs_of_args args
+         |> List.map (function
+           | CompFor (_, _pat, _, e) -> e
+           | CompIf (_, e) -> e))
+  | New (_, _t, _ii, args) -> subexprs_of_args args
   | Call (e, args) ->
       (* not sure we want to return 'e' here *)
       e :: subexprs_of_args args
   | SliceAccess (e1, e2) ->
       e1
-      :: (e2 |> unbracket
+      :: (e2 |> Tok.unbracket
          |> (fun (a, b, c) -> [ a; b; c ])
-         |> Common.map Option.to_list |> List.flatten)
+         |> List.concat_map Option.to_list)
   | Yield (_, eopt, _) -> Option.to_list eopt
   | StmtExpr st -> subexprs_of_stmt st
   | OtherExpr (_, anys) ->
       (* in theory we should go deeper in any *)
       subexprs_of_any_list anys
   | RawExpr x -> Raw_tree.anys x |> subexprs_of_any_list
-  | Alias (_, e1) -> [ e1 ]
   | Lambda def -> subexprs_of_stmt (H.funcbody_to_stmt def.fbody)
-  (* TODO? or call recursively on e? *)
-  | ParenExpr (_, e, _) -> [ e ]
   | Xml { xml_attrs; xml_body; _ } ->
       List.filter_map
         (function
@@ -184,8 +191,12 @@ let subexprs_of_expr with_symbolic_propagation e =
   | AnonClass _
   | LetPattern _ ->
       []
-  | DisjExpr _ -> raise Common.Impossible
-  [@@profiling]
+  | DisjExpr _ ->
+      Logs_.msg_with_detail ~src:Log_matching.src Logs.Error
+        (spf "%s: impossible AST: DisjExpr" __FUNCTION__) (fun () ->
+          show_expr e);
+      []
+[@@profiling]
 
 (* Need this wrapper because [@@profiling] has the side-effect of removing labels. *)
 let subexprs_of_expr ?(symbolic_propagation = false) e =
@@ -199,9 +210,10 @@ let subexprs_of_expr ?(symbolic_propagation = false) e =
  * but not necessarily any expressions like 'bar() || foo();'.
  * See tests/ts/deep_exprtmt.ts for more examples.
  *)
-let subexprs_of_expr_implicit with_symbolic_propagation e =
+let subexprs_of_expr_implicit (with_symbolic_propagation : bool) (e : expr) :
+    expr list =
   match e.e with
-  | N (Id (_, { id_svalue = { contents = Some (Sym e1) }; _ }))
+  | N (Id (_, { id_svalue = { contents = Sym e1 }; _ }))
     when with_symbolic_propagation ->
       [ e1 ]
   (* cases where we extract a subexpr *)
@@ -220,7 +232,6 @@ let subexprs_of_expr_implicit with_symbolic_propagation e =
        *)
       e :: subexprs_of_args args
   | Cast (_, _, e)
-  | ParenExpr (_, e, _)
   | Await (_, e) ->
       [ e ]
   | Yield (_, eopt, _) -> Option.to_list eopt
@@ -233,7 +244,7 @@ let subexprs_of_expr_implicit with_symbolic_propagation e =
    * '$F.name' that is matching cmd = [stuff, fout.name, otherstuff].
    * They should rewrite the rule and use '... <... $F.name ...>' there.
    *)
-  | Container (_, xs) -> unbracket xs
+  | Container (_, xs) -> Tok.unbracket xs
   (* TODO: ugly but in semgrep-rules/terraform/.../missing-athena...yaml
    * we look for '{ ... encryption_configuration {...} ...}' and
    * the encryption_configuration can actually be nested deeper.
@@ -244,7 +255,7 @@ let subexprs_of_expr_implicit with_symbolic_propagation e =
   (* cases where we should not extract a subexpr *)
   | L _
   | N _
-  | IdSpecial _
+  | Special _
   | Ellipsis _ ->
       []
   | Ref (_, _e)
@@ -255,10 +266,11 @@ let subexprs_of_expr_implicit with_symbolic_propagation e =
   | ArrayAccess (_e1, (_, _e2, _)) -> []
   | SliceAccess (_e1, _e2) -> []
   | Comprehension (_, (_, (_e, _xs), _)) -> []
-  | New (_, _t, _args) -> []
+  | New (_, _t, _ii, _args) -> []
   | OtherExpr (_, _anys) -> []
   | RawExpr _ -> []
   | Alias (_, _e1) -> []
+  | LocalImportAll (_, _, _e1) -> []
   | Xml _xmlbody -> []
   | Constructor _ -> []
   | RegexpTemplate _ -> []
@@ -269,8 +281,11 @@ let subexprs_of_expr_implicit with_symbolic_propagation e =
   | DeepEllipsis _
   | DotAccessEllipsis _
   | DisjExpr _ ->
-      raise Common.Impossible
-  [@@profiling]
+      Logs_.msg_with_detail ~src:Log_matching.src Logs.Error
+        (spf "%s: impossible AST: DisjExpr" __FUNCTION__) (fun () ->
+          show_expr e);
+      []
+[@@profiling]
 
 (* Need this wrapper because [@@profiling] has the side-effect of removing labels. *)
 let subexprs_of_expr_implicit ?(symbolic_propagation = false) e =
@@ -304,21 +319,27 @@ let substmts_of_stmt st =
   | Block (_, xs, _) -> xs
   | Switch (_, _, xs) ->
       xs
-      |> Common.map (function
-           | CasesAndBody (_, st) -> [ st ]
-           | CaseEllipsis _ -> [])
-      |> List.flatten
-  | Try (_, st, xs, opt) -> (
+      |> List.concat_map (function
+        | CasesAndBody (_, st) -> [ st ]
+        | CaseEllipsis _ -> [])
+  | Try (_, st, xs, opt1, opt2) -> (
       [ st ]
-      @ (xs |> Common.map Common2.thd3)
+      @ (xs |> List.map Common2.thd3)
+      @ (match opt1 with
+        | None -> []
+        | Some (_, st) -> [ st ])
       @
-      match opt with
+      match opt2 with
       | None -> []
       | Some (_, st) -> [ st ])
-  | DisjStmt _ -> raise Common.Impossible
+  | DisjStmt _ ->
+      Logs_.msg_with_detail ~src:Log_matching.src Logs.Error
+        (spf "%s: impossible AST: DisjStmt" __FUNCTION__) (fun () ->
+          show_stmt st);
+      []
   (* this may slow down things quite a bit *)
   | DefStmt (_ent, def) -> (
-      if not !go_really_deeper_stmt then []
+      if not go_really_deeper_stmt then []
       else
         match def with
         | VarDef _
@@ -335,45 +356,29 @@ let substmts_of_stmt st =
         (* this will add lots of substatements *)
         | FuncDef def -> [ H.funcbody_to_stmt def.fbody ]
         | ClassDef def ->
-            def.cbody |> unbracket |> Common.map (function F st -> st))
+            def.cbody |> Tok.unbracket |> List.map (function F st -> st))
+  | RawStmt x -> Raw_tree.anys x |> substmts_of_any_list
 
 (*****************************************************************************)
 (* Visitors  *)
 (*****************************************************************************)
 (* TODO: move in pfff at some point *)
-let do_visit_with_ref mk_hooks any =
+let do_visit_with_ref visitor any =
   let res = ref [] in
-  let hooks = mk_hooks res in
-  let vout = V.mk_visitor hooks in
-  vout any;
+  visitor#visit_any res any;
   List.rev !res
 
 let lambdas_in_expr e =
-  do_visit_with_ref
-    (fun aref ->
-      {
-        V.default_visitor with
-        V.kexpr =
-          (fun (k, _) e ->
-            match e.e with
-            | Lambda def -> Common.push def aref
-            | _ -> k e);
-      })
-    (E e)
-  [@@profiling]
+  let visitor =
+    object (_self : 'self)
+      inherit [_] AST_generic.iter_no_id_info
 
-(* opti: using memoization speed things up a bit too
- * (but again, this is still slow when called many many times).
- * todo? note that this is not the optimal memoization we can do because
- * using Hashtbl where the key is a full expression can be slow (hashing
- * huge expressions still takes some time). It would be better to
- * return a unique identifier to each expression to remove the hashing cost.
- *)
-let hmemo = Hashtbl.create 101
-
-let lambdas_in_expr_memo a =
-  Common.memoized hmemo a (fun () -> lambdas_in_expr a)
-  [@@profiling]
+      (* TODO Should we recurse into the Lambda? *)
+      method! visit_Lambda aref def = Stack_.push def aref
+    end
+  in
+  do_visit_with_ref visitor (E e)
+[@@profiling]
 
 (*****************************************************************************)
 (* Really substmts_of_stmts *)
@@ -381,7 +386,7 @@ let lambdas_in_expr_memo a =
 
 let flatten_substmts_of_stmts xs =
   (* opti: using a ref, List.iter, and Common.push instead of a mix of
-   * List.map, List.flatten and @ below speed things up
+   * List.map, List_.flatten and @ below speed things up
    * (but it is still slow when called many many times)
    *)
   let res = ref [] in
@@ -389,19 +394,19 @@ let flatten_substmts_of_stmts xs =
 
   let rec aux x =
     (* return the current statement first, and add substmts *)
-    Common.push x res;
+    Stack_.push x res;
 
     (* this can be really slow because lambdas_in_expr() below can be called
      * a zillion times on big files (see tests/PERF/) if we do the
      * matching naively in m_stmts_deep.
      *)
-    (if !go_really_deeper_stmt then
-     let es = subexprs_of_stmt x in
-     (* getting deeply nested lambdas stmts *)
-     let lambdas = es |> Common.map lambdas_in_expr_memo |> List.flatten in
-     lambdas
-     |> Common.map (fun def -> H.funcbody_to_stmt def.fbody)
-     |> List.iter aux);
+    (if go_really_deeper_stmt then
+       let es = subexprs_of_stmt x in
+       (* getting deeply nested lambdas stmts *)
+       let lambdas = es |> List.concat_map lambdas_in_expr in
+       lambdas
+       |> List.map (fun def -> H.funcbody_to_stmt def.fbody)
+       |> List.iter aux);
 
     let xs = substmts_of_stmt x in
     match xs with
@@ -419,4 +424,4 @@ let flatten_substmts_of_stmts xs =
            This is used as part of the caching optimization. *)
         Some (List.rev !res, last)
   else None
-  [@@profiling]
+[@@profiling]

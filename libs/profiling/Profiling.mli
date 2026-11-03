@@ -1,23 +1,54 @@
-(* Pad's poor's man profiler. See pfff/Main.ml for example of use
- * and the -profile command-line flag
+(*
+   Copyright (c) 2023-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+
+(**
+   Measure how long this or that piece of code takes to run.
+
+   Pad's poor's man profiler. See pfff's Main.ml for example of use
+   and the -profile command-line flag
  *)
+
+(** Configuration *)
 type prof = ProfAll | ProfNone | ProfSome of string list
 
 val profile : prof ref
-val show_trace_profile : bool ref
-val _profile_table : (string, float ref * int ref) Hashtbl.t ref
-val profile_code : string -> (unit -> 'a) -> 'a
-val profile_diagnostic : unit -> string
-val profile_code_exclusif : string -> (unit -> 'a) -> 'a
-val profile_code_inside_exclusif_ok : string -> (unit -> 'a) -> 'a
-val report_if_take_time : int -> string -> (unit -> 'a) -> 'a
+(** Global configuration *)
 
-(* similar to profile_code but print some information during execution too *)
-(* similar to profile_code but print some information during execution too *)
-val profile_code2 : string -> (unit -> 'a) -> 'a
+type entry = {
+  name : string;
+  total_time : float;
+      (** Total clock time in seconds. Divide by [float count]
+          to get the mean. *)
+  count : int;
+}
+(** Result
 
-(* to use with Arg, to add a -profile that enables profiling *)
+    Sorry, no detailed stats such as the median or other percentiles.
+*)
+
+val measure : string -> (unit -> 'a) -> 'a
+(** Measure how long it takes to execute a block of code under the given
+    name. *)
+
+val export : unit -> entry list
+(** Produce a list of all the timed entries, sorted by decreasing total
+    time. *)
+
+val report : unit -> string
+(** Produce a human-readable report *)
+
 val flags : unit -> (string * Arg.spec * string) list
+(** To use with [Arg], to add a [-profile] that enables profiling *)
 
-(* print on stderr, usually called just before exit *)
-val print_diagnostics_and_gc_stats : unit -> unit
+val log_diagnostics_and_gc_stats : unit -> unit
+(** Log and print on stderr, usually called just before exit *)

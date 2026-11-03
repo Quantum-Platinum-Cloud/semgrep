@@ -5,15 +5,16 @@
 ; Eventually, this will be merged with the /configuring library from semgrep-core
 
 (library
+  (public_name semgrep.osemgrep_configuring)
   (name osemgrep_configuring)
   (wrapped false)
   (libraries
    uri
+   uuidm
    commons
 
    osemgrep_core ; for Error.ml
   )
- (inline_tests)
  (preprocess
    (pps
      ppx_profiling

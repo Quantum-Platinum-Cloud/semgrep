@@ -13,8 +13,8 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * license.txt for more details.
  *)
-module PI = Parse_info
 open Parser_go
+module PI = Lib_ast_fuzzy
 
 (*****************************************************************************)
 (* Token Helpers *)
@@ -64,7 +64,7 @@ let visitor_info_of_tok f = function
   | TCommentSpace ii -> TCommentSpace (f ii)
   | TComment ii -> TComment (f ii)
   | TCommentNewline ii -> TCommentNewline (f ii)
-  | LINT (s, ii) -> LINT (s, f ii)
+  | LINT pi -> LINT (Parsed_int.map_tok f pi)
   | LFLOAT (s, ii) -> LFLOAT (s, f ii)
   | LIMAG (s, ii) -> LIMAG (s, f ii)
   | LRUNE (s, ii) -> LRUNE (s, f ii)
@@ -146,4 +146,4 @@ let info_of_tok tok =
   |> ignore;
   match !res with
   | Some x -> x
-  | None -> Parse_info.unsafe_fake_info "NOTOK"
+  | None -> Tok.unsafe_fake_tok "NOTOK"

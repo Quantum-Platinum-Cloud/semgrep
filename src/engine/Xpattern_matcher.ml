@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2019-2022 r2c
+ * Copyright (C) 2019-2022 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -14,29 +14,29 @@
  *)
 open Common
 module MV = Metavariable
-module PI = Parse_info
-module PM = Pattern_match
-module RP = Report
+module PM = Core_match
+module RP = Core_result
 module G = AST_generic
 
 (*****************************************************************************)
 (* Prelude *)
 (*****************************************************************************)
+(* Helpers to factorize code between the regexp and spacegrep matcher *)
 
 (*****************************************************************************)
 (* Types *)
 (*****************************************************************************)
 
 (* This type and matches_of_matcher() below factorize code between
- * the regexp, spacegrep, and now comby matchers.
+ * the regexp and spacegrep.
  *)
 type ('target_content, 'xpattern) t = {
   (* init returns an option to let the matcher the option to skip
    * certain files (e.g., big binary or minified files for spacegrep)
    *)
-  init : filename -> 'target_content option;
+  init : Fpath.t -> 'target_content option * float option;
   matcher :
-    'target_content -> filename -> 'xpattern -> (match_range * MV.bindings) list;
+    'target_content -> Fpath.t -> 'xpattern -> (match_range * MV.bindings) list;
 }
 
 (* bugfix: I used to just report one token_location, and if the match
@@ -45,76 +45,78 @@ type ('target_content, 'xpattern) t = {
  * expect a different location if the end part is on a different line
  * (e.g., the semgrep Python wrapper), so I now return a pair.
  *)
-and match_range = PI.token_location * PI.token_location
+and match_range = Tok.location * Tok.location
 
 (*****************************************************************************)
 (* Helpers *)
 (*****************************************************************************)
 
 (* todo: same, we should not need that *)
-let info_of_token_location loc =
-  { PI.token = PI.OriginTok loc; transfo = PI.NoTransfo }
+let info_of_token_location loc = Tok.OriginTok loc
 
 let (matches_of_matcher :
       ('xpattern * Xpattern.pattern_id * string) list ->
       ('target_content, 'xpattern) t ->
-      filename ->
-      RP.times RP.match_result) =
- fun xpatterns matcher file ->
-  if xpatterns =*= [] then RP.empty_semgrep_result
+      Fpath.t ->
+      Origin.t ->
+      Core_profiling.times Core_result.match_result) =
+ fun xpatterns matcher internal_path origin ->
+  if xpatterns =*= [] then Core_result.empty_match_result
   else
-    let target_content_opt, parse_time =
-      Common.with_time (fun () -> matcher.init file)
-    in
+    let target_content_opt, parse_time = matcher.init internal_path in
     match target_content_opt with
-    | None -> RP.empty_semgrep_result (* less: could include parse_time *)
+    | None ->
+        Core_result.empty_match_result (* less: could include parse_time *)
     | Some target_content ->
         let res, match_time =
           Common.with_time (fun () ->
               xpatterns
-              |> Common.map (fun (xpat, id, pstr) ->
-                     let xs = matcher.matcher target_content file xpat in
-                     xs
-                     |> Common.map (fun ((loc1, loc2), env) ->
-                            (* this will be adjusted later *)
-                            let rule_id = Match_env.fake_rule_id (id, pstr) in
-                            {
-                              PM.rule_id;
-                              file;
-                              range_loc = (loc1, loc2);
-                              env;
-                              taint_trace = None;
-                              tokens = lazy [ info_of_token_location loc1 ];
-                            }))
-              |> List.flatten)
+              |> List.concat_map (fun (xpat, id, pstr) ->
+                  let xs = matcher.matcher target_content internal_path xpat in
+                  xs
+                  |> List.map (fun ((loc1, loc2), env) ->
+                      (* this will be adjusted later *)
+                      let rule_id = Match_env.fake_rule_id (id, pstr) in
+                      {
+                        PM.rule_id;
+                        path =
+                          { internal_path_to_content = internal_path; origin };
+                        range_loc = (loc1, loc2);
+                        env;
+                        taint_trace = None;
+                        ast_node = None;
+                        tokens = lazy_safe [ info_of_token_location loc1 ];
+                        engine_of_match = `OSS;
+                        validation_state = `No_validator;
+                        severity_override = None;
+                        metadata_override = None;
+                        sca_match = None;
+                        fix_text = None;
+                        facts = [];
+                      })))
         in
-        RP.make_match_result res Report.ErrorSet.empty
-          { RP.parse_time; match_time }
+        RP.mk_match_result res Core_error.ErrorSet.empty
+          { Core_profiling.parse_time = parse_time ||| 0.0; match_time }
 
-(* todo: same, we should not need that *)
-let hmemo = Hashtbl.create 101
+let full_convs_cache = SharedMemo.create ()
 
-let line_col_of_charpos file charpos =
-  let conv =
-    Common.memoized hmemo file (fun () ->
-        Parsing_helpers.full_charpos_to_pos_large file)
-  in
-  conv charpos
+let () =
+  (* nosemgrep: forbid-tmp *)
+  UTmp.register_temp_file_cleanup_hook (fun file ->
+      SharedMemo.remove full_convs_cache file)
 
-(* Like Common2.with_tmp_file but also invalidates the hmemo cache when finished
- *
- * https://github.com/returntocorp/semgrep/issues/5277 *)
-let with_tmp_file ~str ~ext f =
-  Common2.with_tmp_file ~str ~ext (fun file ->
-      Fun.protect
-        ~finally:(fun () -> Hashtbl.remove hmemo file)
-        (fun () -> f file))
+let full_convs_memoed =
+  SharedMemo.make_with_state full_convs_cache Pos.full_converters_large
+
+let line_col_of_charpos (file : Fpath.t) (charpos : int) : int * int =
+  let conv = full_convs_memoed file in
+  conv.bytepos_to_linecol_fun charpos
 
 let mval_of_string str t =
   let literal =
-    match int_of_string_opt str with
-    | Some i -> G.Int (Some i, t)
+    match Parsed_int.parse (str, t) with
+    | (Some _, _) as pi -> G.Int pi
     (* TODO? could try float_of_string_opt? *)
-    | None -> G.String (str, t)
+    | _ -> G.String (Tok.unsafe_fake_bracket (str, t))
   in
   MV.E (G.L literal |> G.e)

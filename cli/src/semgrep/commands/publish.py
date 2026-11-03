@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2022-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import sys
 from enum import Enum
 from pathlib import Path
@@ -11,9 +23,9 @@ import click
 
 from semgrep.app import auth
 from semgrep.commands.wrapper import handle_command_errors
-from semgrep.config_resolver import get_config
+from semgrep.config_resolver import Config
 from semgrep.error import FATAL_EXIT_CODE
-from semgrep.project import get_project_url
+from semgrep.git import get_project_url
 from semgrep.state import get_state
 from semgrep.test import get_config_filenames
 from semgrep.test import get_config_test_filenames
@@ -31,7 +43,7 @@ class VisibilityState(str, Enum):
 class VisibilityStateType(click.ParamType):
     name = "visibility_state"
 
-    def get_metavar(self, _param: click.Parameter) -> str:
+    def get_metavar(self, param: click.Parameter, ctx: click.Context) -> str:
         return "[org_private|unlisted|public]"
 
     def convert(
@@ -155,7 +167,10 @@ def _upload_rule(
         test_code_file: optional test case to attach with the rule
     """
     state = get_state()
-    config, errors = get_config(None, None, [str(rule_file)], project_url=None)
+    config, errors = Config.from_config_list(
+        configs=[str(rule_file)],
+        project_url=None,
+    )
 
     if errors:
         click.echo(
@@ -189,7 +204,7 @@ def _upload_rule(
         "registry_check_id": registry_id,
     }
     response = state.app_session.post(
-        f"{state.env.semgrep_url}/api/registry/rule", json=request_json
+        f"{state.env.semgrep_url}/api/registry/rules", json=request_json
     )
 
     if not response.ok:

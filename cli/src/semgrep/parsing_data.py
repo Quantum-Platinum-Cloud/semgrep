@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2022-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import os
 from dataclasses import dataclass
 from typing import Dict
@@ -6,9 +18,9 @@ from typing import TYPE_CHECKING
 
 
 if TYPE_CHECKING:
-    from semgrep.core_runner import Plan
+    from semgrep.core_targets_plan import Plan
 
-import semgrep.output_from_core as core
+import semgrep.semgrep_interfaces.semgrep_output_v1 as out
 from semgrep.semgrep_types import Language
 
 
@@ -31,27 +43,29 @@ class ParsingData:
         parsing statistics
         """
         for task in plan.target_mappings:
-            if task.language in ["regex", "generic"]:
+            if not task.analyzer.definition.is_target_language:
                 continue
-            self._file_info[task.path] = (task.language, True)
+            self._file_info[task.path.original.fpath.value] = (task.analyzer, True)
             entry = self._parse_errors_by_lang.get(
-                task.language, LanguageParseData(0, 0, 0, 0)
+                task.analyzer, LanguageParseData(0, 0, 0, 0)
             )
             try:
-                entry.num_bytes += os.path.getsize(task.path)
+                entry.num_bytes += os.path.getsize(task.path.fpath)
                 entry.num_targets += 1
             except OSError:
                 # Don't count the target if the path doesn't exist
                 pass
-            self._parse_errors_by_lang[task.language] = entry
+            self._parse_errors_by_lang[task.analyzer] = entry
 
-    def add_error(self, err: core.CoreError) -> None:
+    def add_error(self, err: out.CoreError) -> None:
         """
         Records the targets/bytes which were not parsed as a result of the
         given error. The file the error originated from should have been
         registered from the original plan with `add_targets`.
         """
-        path = err.location.path
+        if not err.location:
+            return
+        path = err.location.path.value
         try:
             (lang, no_error_yet) = self._file_info[path]
         except KeyError:
@@ -73,10 +87,10 @@ class ParsingData:
         if isinstance(
             err.error_type.value,
             (
-                core.LexicalError,
-                core.ParseError,
-                core.SpecifiedParseError,
-                core.AstBuilderError,
+                out.LexicalError,
+                out.ParseError,
+                out.OtherParseError,
+                out.AstBuilderError,
             ),
         ):
             try:
@@ -87,7 +101,7 @@ class ParsingData:
                 # purposes.
                 pass
         # Partial errors for a subsection of the file
-        elif isinstance(err.error_type.value, core.PartialParsing):
+        elif isinstance(err.error_type.value, out.PartialParsing):
             for loc in err.error_type.value.value:
                 lang_parse_data.error_bytes += loc.end.offset - loc.start.offset
         else:
