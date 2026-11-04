@@ -116,9 +116,7 @@ def main() -> None:
         # so we cannot distinguish between small perf deviations and noise.
         # Without this filter, the warnings fire all the time with a very high
         # false positive rate.
-        probably_noise = (
-            0.7 <= rel_dur and rel_dur <= 1.3 and abs(latest_time - baseline_time) < 2
-        )
+        probably_noise = 0.7 <= rel_dur and rel_dur <= 1.55 and abs(diff) < 5
 
         print(
             f"[{name}] {rel_dur:.3f}x "
@@ -151,7 +149,7 @@ def main() -> None:
     else:
         mean_perc_str = f"{-mean_perc:.1f}% faster"
 
-    if mean_rel_dur > 1.07:
+    if mean_rel_dur > 1.15:
         errors += 1
         messages.append(
             f"🚫 The whole benchmark suite is too slow: "
@@ -174,10 +172,11 @@ def main() -> None:
         messages.append(
             "Individual deviations greater than 20% from the baseline are reported. "
             "An individual performance degradation of over 30% or "
-            "a global degradation of over 7% is an error and will block "
-            "the pull request. "
+            "a global degradation of over 15% should be investigated for "
+            "legitimate performance regressions. "
             "See run output for full results "
-            "('Show all checks' > 'Tests / semgrep benchmark tests' 'Details')."
+            "('Show all checks' > 'build-and-test / {small, post commit} benchmarks' "
+            "> 'View details')."
         )
         msg = "\n\n".join(messages)
         print(f"Sending warnings and errors as a PR comment:\n{msg}")

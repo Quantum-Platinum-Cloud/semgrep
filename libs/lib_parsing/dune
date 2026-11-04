@@ -1,14 +1,29 @@
 (library
- (public_name pfff-h_program-lang)
- (name pfff_h_program_lang)
+ (public_name lib_parsing)
+ (name lib_parsing)
  (wrapped false)
  (libraries
-   stdcompat
-   yojson uucp uutf alcotest
+   base
+   collections
+   fpath
+   sexplib
+   paths
+   git_wrapper
 
    commons
+   commons2
    profiling
-   tree-sitter.run ; Parse_tree_sitter_helpers
  )
- (preprocess (pps ppx_profiling ppx_deriving.show ppx_deriving.eq))
+ (inline_tests)
+ (preprocess
+   (pps
+     ppx_profiling
+     ppx_deriving.show
+     ppx_deriving.ord
+     ppx_deriving.eq
+     ppx_hash
+     ppx_sexp_conv
+     ppx_inline_test
+   )
+ )
 )

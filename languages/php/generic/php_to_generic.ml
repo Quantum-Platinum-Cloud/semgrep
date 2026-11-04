@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2020 r2c
+ * Copyright (C) 2020 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -13,6 +13,7 @@
  * LICENSE for more details.
  *)
 open Common
+open Either_
 open Ast_php
 module G = AST_generic
 module H = AST_generic_helpers
@@ -32,14 +33,14 @@ module H = AST_generic_helpers
 (*****************************************************************************)
 let id x = x
 let option = Option.map
-let list = Common.map
+let list = List.map
 let bool = id
 let string = id
 
 (* raise AST_generic.Error *)
 let error = AST_generic.error
 let fake = AST_generic.fake
-let fb = AST_generic.fake_bracket
+let fb = Tok.unsafe_fake_bracket
 
 (*****************************************************************************)
 (* Entry point *)
@@ -56,18 +57,20 @@ let ident v = wrap string v
 let var v = wrap string v
 let qualified_ident v = list ident v
 
-let name_of_qualified_ident xs =
+(* Note, Funtions and Classes are case insensitive, variables are case
+ * sensitive. *)
+let name_of_qualified_ident ~case_insensitive xs =
   let xs = qualified_ident xs in
-  H.name_of_ids xs
+  H.name_of_ids ~case_insensitive xs
 
 let name v = qualified_ident v
-let fixOp x = H.conv_incr x
+let fixOp x = x
 
 let binaryOp (x, t) =
   match x with
   | BinaryConcat -> Left (G.Concat, t)
   | CombinedComparison -> Left (G.Cmp, t)
-  | ArithOp op -> Left (H.conv_op op, t)
+  | ArithOp op -> Left (op, t)
 
 let unaryOp x = x
 
@@ -96,7 +99,7 @@ let list_expr_to_opt xs =
   | [ e ] -> Some e
   | x :: xs -> Some (G.Seq (x :: xs) |> G.e)
 
-let for_var xs = xs |> Common.map (fun e -> G.ForInitExpr e)
+let for_var xs = xs |> List.map (fun e -> G.ForInitExpr e)
 
 let rec stmt_aux = function
   | Expr (v1, t) ->
@@ -106,11 +109,11 @@ let rec stmt_aux = function
       let v1 = bracket (list stmt) v1 in
       [ G.Block v1 |> G.s ]
   | If (t, v1, v2, v3) ->
-      let v1 = expr v1 and v2 = stmt v2 and v3 = stmt v3 in
-      [ G.If (t, G.Cond v1, v2, Some (* TODO *) v3) |> G.s ]
+      let v1 = expr v1 and v2 = stmt v2 and v3 = Option.map stmt v3 in
+      [ G.If (t, G.Cond v1, v2, v3) |> G.s ]
   | Switch (t, v1, v2) ->
       let v1 = expr v1
-      and v2 = list case v2 |> Common.map (fun x -> G.CasesAndBody x) in
+      and v2 = list case v2 |> List.map (fun x -> G.CasesAndBody x) in
       [ G.Switch (t, Some (G.Cond v1), v2) |> G.s ]
   | While (t, v1, v2) ->
       let v1 = expr v1 and v2 = stmt v2 in
@@ -145,7 +148,7 @@ let rec stmt_aux = function
   | Goto (t, id) -> [ G.Goto (t, ident id, G.sc) |> G.s ]
   | Try (t, v1, v2, v3) ->
       let v1 = stmt v1 and v2 = list catch v2 and v3 = finally v3 in
-      [ G.Try (t, v1, v2, v3) |> G.s ]
+      [ G.Try (t, v1, v2, None, v3) |> G.s ]
   | ClassDef v1 ->
       let ent, def = class_def v1 in
       [ G.DefStmt (ent, G.ClassDef def) |> G.s ]
@@ -179,7 +182,9 @@ let rec stmt_aux = function
               [
                 G.DirectiveStmt
                   (G.ImportFrom
-                     (t, G.DottedName (List.rev path), [ (name, None) ])
+                     ( t,
+                       G.DottedName (List.rev path),
+                       [ H.mk_import_from_kind name None ] )
                   |> G.d)
                 |> G.s;
               ]
@@ -187,21 +192,21 @@ let rec stmt_aux = function
   | StaticVars (t, v1) ->
       v1
       |> list (fun (v1, v2) ->
-             let v1 = var v1 and v2 = option expr v2 in
-             let attrs = [ G.KeywordAttr (G.Static, t) ] in
-             let ent = G.basic_entity v1 ~attrs in
-             let def = { G.vinit = v2; vtype = None } in
-             G.DefStmt (ent, G.VarDef def) |> G.s)
+          let v1 = var v1 and v2 = option expr v2 in
+          let attrs = [ G.KeywordAttr (G.Static, t) ] in
+          let ent = G.basic_entity v1 ~case_insensitive:false ~attrs in
+          let def = { G.vinit = v2; vtype = None; vtok = G.no_sc } in
+          G.DefStmt (ent, G.VarDef def) |> G.s)
   | Global (t, v1) ->
       v1
-      |> Common.map (fun e ->
-             match e with
-             | Id [ id ] ->
-                 let ent = G.basic_entity id in
-                 G.DefStmt (ent, G.UseOuterDecl t) |> G.s
-             | _ ->
-                 let e = expr e in
-                 G.OtherStmt (G.OS_GlobalComplex, [ G.E e ]) |> G.s)
+      |> List.map (fun e ->
+          match e with
+          | Id [ id ] ->
+              let ent = G.basic_entity ~case_insensitive:false id in
+              G.DefStmt (ent, G.UseOuterDecl t) |> G.s
+          | _ ->
+              let e = expr e in
+              G.OtherStmt (G.OS_GlobalComplex, [ G.E e ]) |> G.s)
 
 and alias x =
   let x = ident x in
@@ -213,7 +218,12 @@ and opt_expr_to_label_ident = function
   | None -> G.LNone
   | Some e -> (
       match e with
-      | Int (Some i, tok) -> G.LInt (i, tok)
+      | Int ((Some _, tok) as pi) -> (
+          match Parsed_int.to_int_opt pi with
+          | None ->
+              let e = expr e in
+              G.LDynamic e
+          | Some i -> G.LInt (i, tok))
       | Id [ label ] -> G.LId label
       | _ ->
           let e = expr e in
@@ -229,7 +239,7 @@ and case = function
 
 and catch (t, v1, v2, v3) =
   let v1 = hint_type v1 and v2 = var v2 and v3 = stmt v3 in
-  let exn = G.CatchParam (G.param_of_type v1 ~pname:(Some v2)) in
+  let exn = G.CatchParam (G.param_of_type v1 ~pname:v2) in
   (t, exn, v3)
 
 (* a list of finally??? php ... *)
@@ -237,7 +247,7 @@ and finally (v : finally list) =
   let xs = list (fun (t, xs) -> (t, stmt xs)) v in
   match xs with
   | [] -> None
-  | (t, x) :: xs -> Some (t, G.stmt1 (x :: Common.map snd xs))
+  | (t, x) :: xs -> Some (t, G.stmt1 (x :: List.map snd xs))
 
 and expr e : G.expr =
   match e with
@@ -246,17 +256,15 @@ and expr e : G.expr =
   | Bool v1 ->
       let v1 = wrap id v1 in
       G.L (G.Bool v1) |> G.e
-  | Int v1 ->
-      let v1 = wrap id v1 in
-      G.L (G.Int v1) |> G.e
+  | Int v1 -> G.L (G.Int v1) |> G.e
   | Double v1 ->
       let v1 = wrap id v1 in
       G.L (G.Float v1) |> G.e
   | String v1 ->
       let v1 = wrap string v1 in
-      G.L (G.String v1) |> G.e
+      G.L (G.String (fb v1)) |> G.e
   | Id v1 ->
-      let v1 = name_of_qualified_ident v1 in
+      let v1 = name_of_qualified_ident ~case_insensitive:true v1 in
       G.N v1 |> G.e
   | IdSpecial v1 -> special v1
   (* unify Id and Var, finally *)
@@ -291,7 +299,7 @@ and expr e : G.expr =
   | New (v0, v1, v2) ->
       let v1 = expr v1 and v2 = list argument v2 in
       let t = H.expr_to_type v1 in
-      G.New (v0, t, fb v2) |> G.e
+      G.New (v0, t, G.empty_id_info (), fb v2) |> G.e
   | NewAnonClass (_tTODO, args, cdef) ->
       let _ent, cdef = class_def cdef in
       let args = list argument args in
@@ -300,8 +308,7 @@ and expr e : G.expr =
   | InstanceOf (t, v1, v2) ->
       let v1 = expr v1 and v2 = expr v2 in
       G.Call
-        ( G.IdSpecial (G.Instanceof, t) |> G.e,
-          fb ([ v1; v2 ] |> Common.map G.arg) )
+        (G.Special (G.Instanceof, t) |> G.e, fb ([ v1; v2 ] |> List.map G.arg))
       |> G.e
   (* v[] = 1 --> v <append>= 1.
    * update: because we must generate an OE_ArrayAppend in other contexts,
@@ -329,7 +336,7 @@ and expr e : G.expr =
           G.Assign
             ( v1,
               t,
-              G.Call (G.IdSpecial (special, t) |> G.e, fb [ G.Arg v1; G.Arg v3 ])
+              G.Call (G.Special (special, t) |> G.e, fb [ G.Arg v1; G.Arg v3 ])
               |> G.e )
           |> G.e)
   | List v1 ->
@@ -344,7 +351,8 @@ and expr e : G.expr =
   | Unpack v1 ->
       let v1 = expr v1 in
       G.Call
-        (G.IdSpecial (G.Spread, fake "...") |> G.e, G.fake_bracket [ G.Arg v1 ])
+        ( G.Special (G.Spread, fake "...") |> G.e,
+          Tok.unsafe_fake_bracket [ G.Arg v1 ] )
       |> G.e
   | Call (v1, v2) ->
       let v1 = expr v1 and v2 = bracket (list argument) v2 in
@@ -355,25 +363,23 @@ and expr e : G.expr =
       G.StmtExpr st |> G.e
   | Infix ((v1, t), v2) ->
       let v1 = fixOp v1 and v2 = expr v2 in
-      G.Call (G.IdSpecial (G.IncrDecr (v1, G.Prefix), t) |> G.e, fb [ G.Arg v2 ])
+      G.Call (G.Special (G.IncrDecr (v1, G.Prefix), t) |> G.e, fb [ G.Arg v2 ])
       |> G.e
   | Postfix ((v1, t), v2) ->
       let v1 = fixOp v1 and v2 = expr v2 in
-      G.Call
-        (G.IdSpecial (G.IncrDecr (v1, G.Postfix), t) |> G.e, fb [ G.Arg v2 ])
+      G.Call (G.Special (G.IncrDecr (v1, G.Postfix), t) |> G.e, fb [ G.Arg v2 ])
       |> G.e
   | Binop (v1, v2, v3) -> (
       let v2 = binaryOp v2 and v1 = expr v1 and v3 = expr v3 in
       match v2 with
       | Left (op, t) ->
-          G.Call (G.IdSpecial (G.Op op, t) |> G.e, fb [ G.Arg v1; G.Arg v3 ])
+          G.Call (G.Special (G.Op op, t) |> G.e, fb [ G.Arg v1; G.Arg v3 ])
           |> G.e
-      | Right x ->
-          G.Call (G.IdSpecial x |> G.e, fb [ G.Arg v1; G.Arg v3 ]) |> G.e)
+      | Right x -> G.Call (G.Special x |> G.e, fb [ G.Arg v1; G.Arg v3 ]) |> G.e
+      )
   | Unop ((v1, t), v2) ->
       let v1 = unaryOp v1 and v2 = expr v2 in
-      G.Call (G.IdSpecial (G.Op (H.conv_op v1), t) |> G.e, fb [ G.Arg v2 ])
-      |> G.e
+      G.Call (G.Special (G.Op v1, t) |> G.e, fb [ G.Arg v2 ]) |> G.e
   | Guil (l, xs, r) -> (
       let xs = list expr xs in
       match xs with
@@ -381,11 +387,11 @@ and expr e : G.expr =
        * generate an InterpolatedConcat because it's actually not an
        * interpolation ($VAR is interpreted as a metavar, not a PHP var)
        *)
-      | [ ({ e = G.L (G.String (str, _)); _ } as e) ]
-        when AST_generic_.is_metavar_name str ->
+      | [ ({ e = G.L (G.String (_, (str, _), _)); _ } as e) ]
+        when AST_generic.is_metavar_name str ->
           e
       | _else_ ->
-          let ys = xs |> Common.map (fun x -> Common.Middle3 x) in
+          let ys = xs |> List.map (fun x -> Either_.Middle3 x) in
           G.interpolated (l, ys, r))
   | ConsArray v1 ->
       let v1 = bracket (list array_value) v1 in
@@ -430,7 +436,7 @@ and expr e : G.expr =
           (* TODO: transform l_uses in UseOuterDecl preceding body *)
           G.Lambda
             {
-              G.fparams = ps;
+              G.fparams = fb ps;
               frettype = rett;
               fbody = G.FBStmt body;
               fkind = (lambdakind, t);
@@ -439,13 +445,13 @@ and expr e : G.expr =
       | _ -> error tok "TODO: Lambda")
   | Match (tok, e, matches) ->
       let e = expr e in
-      let matches = Common.map match_ matches in
+      let matches = List.map match_ matches in
       G.StmtExpr (G.Switch (tok, Some (G.Cond e), matches) |> G.s) |> G.e
 
 and match_ = function
   | MCase (cases, e) ->
       let cases =
-        Common.map
+        List.map
           (fun case ->
             let case = expr case in
             (* TODO extend G.case_of_pat_and_expr to handle multiple cases? *)
@@ -466,13 +472,13 @@ and argument = function
 
 and special (spec, tok) =
   match spec with
-  | This -> G.IdSpecial (G.This, tok) |> G.e
-  | Self -> G.IdSpecial (G.Self, tok) |> G.e
-  | Parent -> G.IdSpecial (G.Parent, tok) |> G.e
+  | This -> G.N (G.IdSpecial ((G.This, tok), G.empty_id_info ())) |> G.e
+  | Self -> G.N (G.IdSpecial ((G.Self, tok), G.empty_id_info ())) |> G.e
+  | Parent -> G.N (G.IdSpecial ((G.Parent, tok), G.empty_id_info ())) |> G.e
   | FuncLike Empty -> G.N (G.Id (("empty", tok), G.empty_id_info ())) |> G.e
-  | FuncLike Eval -> G.IdSpecial (G.Eval, tok) |> G.e
+  | FuncLike Eval -> G.Special (G.Eval, tok) |> G.e
   | FuncLike Exit -> G.N (G.Id (("exit", tok), G.empty_id_info ())) |> G.e
-  | FuncLike Isset -> G.IdSpecial (G.Defined, tok) |> G.e
+  | FuncLike Isset -> G.Special (G.Defined, tok) |> G.e
   | FuncLike Unset -> G.N (G.Id (("unset", tok), G.empty_id_info ())) |> G.e
 
 and foreach_pattern v =
@@ -484,7 +490,7 @@ and array_value v = expr v
 and hint_type = function
   | Hint v1 ->
       let v1 = name v1 in
-      G.TyN (name_of_qualified_ident v1) |> G.t
+      G.TyN (name_of_qualified_ident ~case_insensitive:true v1) |> G.t
   | HintArray t -> G.ty_builtin ("array", t)
   | HintQuestion (t, v1) ->
       let v1 = hint_type v1 in
@@ -494,7 +500,7 @@ and hint_type = function
       G.TyTuple (t1, v1, t2) |> G.t
   | HintCallback (v1, v2) ->
       let v1 = list hint_type v1 and v2 = option hint_type v2 in
-      let params = v1 |> Common.map (fun x -> G.Param (G.param_of_type x)) in
+      let params = v1 |> List.map (fun x -> G.Param (G.param_of_type x)) in
       let fret =
         match v2 with
         | Some t -> t
@@ -527,7 +533,7 @@ and func_def
   let fret = option hint_type f_return_type in
   let _is_refTODO = bool f_ref in
   let modifiers =
-    list modifier m_modifiers |> Common.map (fun m -> G.KeywordAttr m)
+    list modifier m_modifiers |> List.map (fun m -> G.KeywordAttr m)
   in
   (* todo: transform in UseOuterDecl before first body stmt *)
   let _lusesTODO =
@@ -539,9 +545,11 @@ and func_def
   in
   let attrs = list attribute f_attrs in
   let body = stmt f_body in
-  let ent = G.basic_entity id ~attrs:(modifiers @ attrs) in
+  let ent =
+    G.basic_entity id ~attrs:(modifiers @ attrs) ~case_insensitive:true
+  in
   let def =
-    { G.fparams = params; frettype = fret; fbody = G.FBStmt body; fkind }
+    { G.fparams = fb params; frettype = fret; fbody = G.FBStmt body; fkind }
   in
   (ent, def)
 
@@ -553,7 +561,7 @@ and function_kind (kind, t) =
     | Method -> G.Method),
     t )
 
-and parameters x = list parameter x
+and parameters x : G.parameter list = list parameter x
 
 and parameter x =
   match x with
@@ -582,13 +590,15 @@ and parameter_classic { p_type; p_ref; p_name; p_default; p_attrs; p_variadic }
 
 and modifier v = wrap modifierbis v
 
+(* TODO: attributes are probably case-insensitive because they refer
+   to class names. This need to be verified. *)
 and attribute v =
   match v with
   | Id xs ->
-      let name = name_of_qualified_ident xs in
+      let name = name_of_qualified_ident ~case_insensitive:true xs in
       G.NamedAttr (fake "@", name, fb [])
   | Call (Id xs, args) ->
-      let name = name_of_qualified_ident xs in
+      let name = name_of_qualified_ident ~case_insensitive:true xs in
       let args = bracket (list argument) args in
       G.NamedAttr (fake "@", name, args)
   | _ -> raise Impossible
@@ -598,8 +608,8 @@ and constant_def { cst_name; cst_body; cst_tok = tok } =
   let id = ident cst_name in
   let body = expr cst_body in
   let attr = [ G.KeywordAttr (G.Const, tok) ] in
-  let ent = G.basic_entity id ~attrs:attr in
-  (ent, { G.vinit = Some body; vtype = None })
+  let ent = G.basic_entity id ~case_insensitive:false ~attrs:attr in
+  (ent, { G.vinit = Some body; vtype = None; vtok = G.no_sc })
 
 and enum_type _tok { e_base; e_constraint } =
   let t = hint_type e_base in
@@ -632,7 +642,7 @@ and class_def
   let _enum = option (enum_type tok) c_enum_type in
 
   let modifiers =
-    list modifier c_modifiers |> Common.map (fun m -> G.KeywordAttr m)
+    list modifier c_modifiers |> List.map (fun m -> G.KeywordAttr m)
   in
   let attrs = list attribute c_attrs in
 
@@ -641,20 +651,24 @@ and class_def
   let methods = list method_def c_methods in
 
   let fields =
-    (csts |> Common.map (fun (ent, var) -> (ent, G.VarDef var)))
-    @ (vars |> Common.map (fun (ent, var) -> (ent, G.VarDef var)))
-    @ (methods |> Common.map (fun (ent, var) -> (ent, G.FuncDef var)))
+    (csts |> List.map (fun (ent, var) -> (ent, G.VarDef var)))
+    @ (vars |> List.map (fun (ent, var) -> (ent, G.VarDef var)))
+    @ (methods |> List.map (fun (ent, var) -> (ent, G.FuncDef var)))
   in
 
-  let ent = G.basic_entity id ~attrs:(attrs @ modifiers @ class_attrs) in
+  let ent =
+    G.basic_entity id
+      ~attrs:(attrs @ modifiers @ class_attrs)
+      ~case_insensitive:true
+  in
   let def =
     {
       G.ckind = kind;
       cextends = extends |> Option.to_list;
       cimplements = implements;
       cmixins = uses;
-      cparams = [];
-      cbody = (t1, fields |> Common.map (fun def -> G.fld def), t2);
+      cparams = fb [];
+      cbody = (t1, fields |> List.map (fun def -> G.fld def), t2);
     }
   in
   (ent, def)
@@ -681,10 +695,10 @@ and class_var
   let typ = option hint_type ctype in
   let value = option expr cvalue in
   let modifiers =
-    list modifier cmodifiers |> Common.map (fun m -> G.KeywordAttr m)
+    list modifier cmodifiers |> List.map (fun m -> G.KeywordAttr m)
   in
-  let ent = G.basic_entity id ~attrs:modifiers in
-  let def = { G.vtype = typ; vinit = value } in
+  let ent = G.basic_entity id ~case_insensitive:false ~attrs:modifiers in
+  let def = { G.vtype = typ; vinit = value; vtok = G.no_sc } in
   (ent, def)
 
 and method_def v = func_def v
@@ -692,7 +706,7 @@ and method_def v = func_def v
 and type_def { t_name; t_kind } =
   let id = ident t_name in
   let kind = type_def_kind (snd t_name) t_kind in
-  let ent = G.basic_entity id in
+  let ent = G.basic_entity ~case_insensitive:true id in
   (ent, { G.tbody = kind })
 
 and type_def_kind _tok = function

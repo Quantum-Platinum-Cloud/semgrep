@@ -1,86 +1,102 @@
-(*
-   Representation of the location of a piece of code by a pair of tokens.
-
-   This is used so far in intermediate, language-specific ASTs.
-*)
-
-type tok = Parse_info.t
-type t = tok * tok
-
-let fix ((left, right) as loc) =
-  if Parse_info.is_fake left then (right, right)
-  else if Parse_info.is_fake right then (left, left)
-  else loc
-
-let create left right =
-  if Parse_info.is_fake left then (right, right)
-  else if Parse_info.is_fake right then (left, left)
-  else (left, right)
-
-let is_fake (left, right) = Parse_info.is_fake left || Parse_info.is_fake right
-let left_loc_tok (left, right) = if Parse_info.is_fake left then right else left
-
-let right_loc_tok (left, right) =
-  if Parse_info.is_fake right then left else right
+(* Yoann Padioleau
+ *
+ * Copyright (C) 2010 Facebook
+ * Copyright (C) 2023 Semgrep Inc.
+ *
+ * This library is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public License
+ * version 2.1 as published by the Free Software Foundation, with the
+ * special exception on linking described in file license.txt.
+ *
+ * This library is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
+ * license.txt for more details.
+ *)
+open Common
+open Sexplib.Std
 
 (*
-   Form a new location from a leftmost location and a rightmost location.
-   We try to mitigate problems due to fake tokens.
+   There are (too) many places in Semgrep where we define a "location"
+   and "position".
+   A position is usually a place in a file, like a cursor.
+   A location is usually a region in this file.
+
+   Here are example of places where we define a loc (and often pos):
+    - Tok.location (a Pos.t and a string)
+    - Tok_range.t (a pair of Tok.t)
+    - semgrep_output_v1.location (a file and start/end positions)
+    - Spacegrep.Loc.t (using a range of Lexing.position)
+    - Aliengrep.Match.loc (no filename, just start x length)
+    - Tree_sitter_run.Loc.t (no filename either, just start/end positions)
+
+   TODO: we should factorize some of those locations
 *)
-let range a b =
-  let start_tok = left_loc_tok a in
-  let end_tok = right_loc_tok b in
-  if Parse_info.is_fake end_tok then (start_tok, start_tok)
-  else if Parse_info.is_fake start_tok then (end_tok, end_tok)
-  else (start_tok, end_tok)
 
-let unsafe_fake_tok = Parse_info.unsafe_fake_info "fake"
-let unsafe_fake_loc = (unsafe_fake_tok, unsafe_fake_tok)
+(* alias to the most common location type used in Semgrep
 
-(*
-   'tok_pos_left' and 'tok_pos_right' both return the start position of the
-   token. Only their fallback differs when no position is known.
+   The fields are ordered such that deriving a 'compare' function with
+   '@@deriving ord' works as expected (sort by file path first,
+   then by position within the file).
 *)
-let tok_pos_left tok =
-  match Parse_info.token_location_of_info tok with
-  | Ok x -> x.charpos
-  | Error _ -> max_int
+type t = {
+  (* TODO? the content of Pos.t used to be inlined in this location type.
+   * It is cleaner to factorize things in Pos.t, but this introduces
+   * an extra pointer which actually can have real performance implication
+   * in Semgrep on huge monorepos. It might be worth inlining it back
+   * (and also reduce its number of fields).
+   *)
+  pos : Pos.t;
+  (* the content of the "token" *)
+  str : string;
+}
+[@@deriving show { with_path = false }, eq, ord, sexp]
 
-let tok_pos_right tok =
-  match Parse_info.token_location_of_info tok with
-  | Ok x -> x.charpos
-  | Error _ -> min_int
-
-(* Prefer non-error. In case of a tie, prefer left-handside argument. *)
-let min_tok (a : Parse_info.t) (b : Parse_info.t) =
-  if tok_pos_left a <= tok_pos_left b then a else b
-
-(* Prefer non-error. In case of a tie, prefer right-handside argument. *)
-let max_tok (a : Parse_info.t) (b : Parse_info.t) =
-  if tok_pos_right b >= tok_pos_right a then b else a
-
-let update_start new_start_tok (_, end_) : t = (new_start_tok, end_)
-let update_end (start, _) new_end_tok : t = (start, new_end_tok)
-
-(*
-   This is safe but a bit heavy.
-   Hopefully it's not too expensive in practice.
+(* Token locations are supposed to denote the beginning of a token.
+   Suppose we are interested in instead having line, column, and bytepos of
+   the end of a token instead.
+   This is something we can do at relatively low cost by going through and
+   inspecting the contents of the token, plus the start information.
 *)
-let extend (start, end_) tok =
-  (* Eliminate any fake token that might exist in the original location,
-     if possible. *)
-  let start = if Parse_info.is_fake start then end_ else start in
-  let end_ = if Parse_info.is_fake end_ then start else end_ in
-  (* Extend the location to the left, to the right, or both in pathological
-     cases. *)
-  (min_tok start tok, max_tok tok end_)
+let end_pos loc =
+  let line, col, trailing_nl =
+    String.fold_left
+      (fun (line, col, after_nl) c ->
+        match c with
+        | '\n' when after_nl -> (line + 1, 0, true)
+        | '\n' -> (line, col, true)
+        | _ when after_nl -> (line + 1, 1, false)
+        | _ -> (line, col + 1, false))
+      (loc.pos.line, loc.pos.column, false)
+      loc.str
+  in
+  let col =
+    (* THINK: We count a trailing newline as an extra character in the last line,
+     * is that the standard ? *)
+    if trailing_nl then col + 1 else col
+  in
+  (line, col, loc.pos.bytepos + String.length loc.str)
 
-let of_toks get_tok xs =
-  List.fold_left (fun loc x -> extend loc (get_tok x)) unsafe_fake_loc xs
+let first_loc_of_file file = { str = ""; pos = Pos.first_pos_of_file file }
 
-let union loc_a (start, end_) =
-  let loc = extend loc_a start in
-  extend loc end_
+(* TODO? move to Pos.ml and use Pos.t instead *)
+let adjust_loc_wrt_base base_loc loc =
+  (* Note that bytepos and columns are 0-based, whereas lines are 1-based. *)
+  let base_pos = base_loc.pos in
+  let pos = loc.pos in
+  {
+    loc with
+    pos =
+      {
+        bytepos = base_pos.bytepos + pos.bytepos;
+        line = base_pos.line + pos.line - 1;
+        column =
+          (if pos.line =|= 1 then base_pos.column + pos.column else pos.column);
+        file = base_pos.file;
+      };
+  }
 
-let of_locs locs = List.fold_left union unsafe_fake_loc locs
-let of_list get_loc xs = Common.map get_loc xs |> of_locs
+let fix_pos fix loc = { loc with pos = fix loc.pos }
+
+let of_lexing_position (pos : Lexing.position) contents =
+  { pos = Pos.of_lexing_position pos; str = contents }

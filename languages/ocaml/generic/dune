@@ -4,9 +4,8 @@
  (wrapped false)
  (libraries
    commons
-   pfff-h_program-lang
+   lib_parsing
    parser_ocaml.ast
-   tree-sitter-lang.ocaml
    ast_generic
  )
  (preprocess (pps ppx_deriving.show))

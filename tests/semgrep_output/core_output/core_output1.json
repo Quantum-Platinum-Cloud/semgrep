@@ -1,5 +1,5 @@
 {
-  "matches": [
+  "results": [
     {
       "rule_id": "-e/-f",
       "location": {
@@ -48,7 +48,8 @@
               "sid": 1
             }
           }
-        }
+        },
+        "engine_kind": "OSS"
       }
     },
     {
@@ -99,7 +100,8 @@
               "sid": 2
             }
           }
-        }
+        },
+        "engine_kind": "OSS"
       }
     },
     {
@@ -137,7 +139,8 @@
               "md5sum": "95910070194b2a59c2f4defcc8d9e96b"
             }
           }
-        }
+        },
+        "engine_kind": "OSS"
       }
     },
     {
@@ -175,7 +178,8 @@
               "md5sum": "7fe950488534dee15f975d43cbe17c38"
             }
           }
-        }
+        },
+        "engine_kind": "OSS"
       }
     }
   ],
@@ -242,5 +246,7 @@
   "stats": {
     "okfiles": 158,
     "errorfiles": 2
-  }
+  },
+  "engine_requested": "OSS",
+  "rules_by_engine": []
 }

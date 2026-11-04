@@ -1,16 +1,28 @@
+(*
+   Copyright (c) 2022-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (*****************************************************************************)
 (* Prelude *)
 (*****************************************************************************)
-(* This module contains functions (and types) which are very often used.
+(* This module contains functions which are very often used.
  * They are so common (hence the name of this file) that lots of modules
  * just 'open Common' to get in scope those functions.
- * This file acts like a second Pervasive.ml (now called Stdlib.ml).
+ * This file acts like a second stdlib.ml (which was called pervasives.ml before)
  *
  * However, because this module is often open'ed, it should
  * not define too many functions (<100) because we can't impose
  * to other programmers the mental effort to know too many functions.
  * This was actually a big problem with the first version of Common.ml
- * (renamed to Common2.ml since).
+ * (renamed to common2.ml since).
  *)
 
 (*****************************************************************************)
@@ -18,57 +30,52 @@
 (*****************************************************************************)
 
 (* You should not use the polymorphic '='. It is convenient but
- * its use will eventually backfire. You should use instead 'deriving eq'
- * where the equality function can be customized.
- * To enforce this rule, this module redefines '=' to just operate
- * on strings, so ocaml can statically detect when you wrongly use '='
+ * its use will eventually backfire
+ * (see https://blog.janestreet.com/the-perils-of-polymorphic-compare/).
+ * You should use instead 'deriving eq' where the equality function can be
+ * customized. To enforce this rule, this module redefines '=' to just operate
+ * on strings, so ocamlc can statically detect when you wrongly use '='
  * on other types.
+ *
+ * See also the Operators submodule at the end of this file.
  *)
-val ( = ) : string -> string -> bool
 
-(* If you need to use '=', at least use the more precise operators below. *)
-val ( =|= ) : int -> int -> bool
-val ( =$= ) : char -> char -> bool
-val ( =:= ) : bool -> bool -> bool
+include module type of Eq.Operators
 
-(* if you really really need to use the polymorphic '=', at least use
- * the operator below so it's easier to grep for it if one needs to refactor
- * the code to use 'deriving eq' instead.
- *)
-val ( =*= ) : 'a -> 'a -> bool
+(* Physical (shallow) equality, normally available as (==) *)
+val phys_equal : 'a -> 'a -> bool
+
+(* Physical (shallow) inequality, normally available as (!=) *)
+val phys_not_equal : 'a -> 'a -> bool
+
+val equal_ref_option :
+  ('a -> 'b -> bool) -> 'a option ref -> 'b option ref -> bool
 
 (*****************************************************************************)
-(* Printing/debugging *)
+(* Comparison *)
 (*****************************************************************************)
-(* see also Dumper.ml *)
+(* now in Ord.ml *)
 
-(* Same as print_endline: print the string and a newline, then flush stdout.
- * Just shorter. *)
-val pr : string -> unit
+(*****************************************************************************)
+(* Composition/Control *)
+(*****************************************************************************)
 
-(* Print a string and a newline to stderr, then flush stderr. The '2'
- * is used to refect that it prints on stderr (file descriptor '2' in Unix). *)
-val pr2 : string -> unit
+(* see also Fun.id *)
 
-(* Print on stderr any data structure (using Dumper.dump) *)
-val pr2_gen : 'a -> unit
-
-(* Print on stderr but only once (to avoid printing the same error
- * again and again) *)
-val pr2_once : string -> unit
-
-(* forbid pr2_once to do the once "optimisation" *)
-val _already_printed : (string, bool) Hashtbl.t
-val disable_pr2_once : bool ref
-
-(* to be used in pipes as in foo() |> before_return (fun v -> pr2_gen v)*)
-val before_return : ('a -> unit) -> 'a -> 'a
+val compose : ('a -> 'b) -> ('c -> 'a) -> 'c -> 'b
+val flip : ('a -> 'b -> 'c) -> 'b -> 'a -> 'c
+val curry : ('a * 'b -> 'c) -> 'a -> 'b -> 'c
+val uncurry : ('a -> 'b -> 'c) -> 'a * 'b -> 'c
+val do_nothing : unit -> unit
+val const : 'a -> 'b -> 'a
+val applyn : int -> ('a -> 'a) -> 'a -> 'a
+val on : ('b -> 'b -> 'c) -> ('a -> 'b) -> 'a -> 'a -> 'c
 
 (*****************************************************************************)
 (* Exceptions *)
 (*****************************************************************************)
 (* see also Exception.ml functions as well as Time_limit.Timeout
- * in the process_limits library.
+ * and Memory_limit.ExceededMemoryLimit in the process_limits library.
  *)
 
 exception Todo
@@ -79,10 +86,21 @@ exception Impossible
 (* similar to Not_found but to use when something returns too many findings *)
 exception Multi_found
 
-(* You should use this instead of 'exit n' because it allows you
- * to intercept the exn and do something special before exiting.
+(* it's usually far easier to diagnose an error when you know on which
+ * file it occured. An [Invalid_argument("index out of bounds")] is not
+ * as good as [ErrorOnFile("out of bounds in lines_of_file()", 'foo.c')]
  *)
-exception UnixExit of int
+exception ErrorOnFile of string (* error message *) * Fpath.t
+
+(* If the user use some [exit 0] in his code, then no one can intercept this
+ * exit and do something before exiting. There is exn handler for exit 0
+ * so better never use exit 0 but instead use an exception and just at
+ * the very toplevel transform this exn in a unix exit code.
+ *
+ * subtil: same problem than with Timeout. Do not intercept such exception
+ * with some blind try (...) with _ -> ...
+ *)
+exception UnixExit of (int * string)
 
 (* Convert any exception to a string *)
 val exn_to_s : exn -> string
@@ -90,17 +108,30 @@ val exn_to_s : exn -> string
 (* if set then certain functions like unwind_protect will not
  * do a try and finalize and instead just call the function, which
  * helps in ocamldebug and also in getting better backtraces.
- * This is also useful to set in a js_of_ocaml (jsoo) context to
- * again get better backtraces.
  *)
 val debugger : bool ref
 
 (* Emacs-inspired finalize-like function. *)
 val unwind_protect : (unit -> 'a) -> (Exception.t -> unit) -> 'a
 val save_excursion : 'a ref -> 'a -> (unit -> 'b) -> 'b
+val save_excursion_atomic : 'a Atomic.t -> 'a -> (unit -> 'b) -> 'b
 
-(* Java-inspired combinator *)
+(* Java-inspired combinator (DEPRECATED, use protect()) *)
 val finalize : (unit -> 'a) -> (unit -> unit) -> 'a
+val protect : finally:(unit -> unit) -> (unit -> 'a) -> 'a
+(* Same as 'Fun.protect' but it will not raise 'Finally_raised', if 'finally'
+ * raises any exception then that same exception is what 'protect' will raise.
+ * This can easily happen in Semgrep due to the asynchronous
+ * 'Time_limit.Timeout' exception raised when there is a timeout. Having to
+ * deal with 'Finally_raised' just makes things more complicated.
+ *)
+
+(*****************************************************************************)
+(* Debugging *)
+(*****************************************************************************)
+
+(* to be used in pipes as in foo() |> before_return (fun v -> pr2_gen v)*)
+val before_return : ('a -> unit) -> 'a -> 'a
 
 (*****************************************************************************)
 (* Strings and regexps *)
@@ -109,7 +140,9 @@ val finalize : (unit -> 'a) -> (unit -> unit) -> 'a
 (* shortcuts for string_of_int and int_of_string *)
 val i_to_s : int -> string
 val s_to_i : string -> int
-val null_string : string -> bool
+
+(* Shortcut for Printf.sprintf *)
+val spf : ('a, unit, string) format -> 'a
 
 (* Perl-like regexp pattern matching. We need the many matchedxxx()
  * because OCaml does not support polytypic functions (same problem
@@ -121,7 +154,25 @@ val null_string : string -> bool
  *      let after_f, endpart = Common.matched2 s in
  *      ...
  *)
+
 val ( =~ ) : string -> string -> bool
+(** NOTE: Do {b not} use this for matching paths, as it is not portable
+    accrosses operating systems. Use {! (=/~)} instead. *)
+
+val ( =/~ ) : Fpath.t -> string -> bool
+(** [path =/~ pattern] is [true] if the regex [pattern] matches [path] after
+    [path] has been normalized to always use a single ["/"] to separate
+    segments. E.g.,
+
+    {[
+    let p = ".*/bar/.*" in
+    assert ((Fpath.v "foo\\bar\\baz" =/~ p)
+            = (Fpath.v "foo/bar/baz" =/~ p)
+            = (Fpath.v "foo//bar/baz =/~ p"))
+    ]}
+
+    This provides a portable way to test paths against regexs. *)
+
 val matched1 : string -> string
 val matched2 : string -> string * string
 val matched3 : string -> string * string * string
@@ -132,225 +183,41 @@ val matched6 : string -> string * string * string * string * string * string
 val matched7 :
   string -> string * string * string * string * string * string * string
 
-(* Shortcut for Printf.sprintf *)
-val spf : ('a, unit, string) format -> 'a
-val join : string (* sep *) -> string list -> string
-val split : string (* sep regexp *) -> string -> string list
-
-(*****************************************************************************)
-(* File path *)
-(*****************************************************************************)
-(* Deprecated? Should we start to use FPath.ml from dbunzli? *)
-
-(* Some signatures are arguably clearer when using 'filename' instead of
- * 'string' (see write_file below for an example).
- * Ideally 'filename' should be a different type like in Scala with the
- * Path module: https://www.lihaoyi.com/post/HowtoworkwithFilesinScala.html
- *)
-type filename = string [@@deriving show, eq]
-(* the deriving above will define those functions below, which
- * are needed if one use 'deriving eq, show' on other types
- * using internally 'filename'
- * (e.g., 'type foo = Foo of filename [@@deriving show]')
- *
- * val pp_filename: Format.formatter -> filename -> unit
- * val equal_filename: filename -> filename -> bool
- *)
-
-(* TODO: those are not used very often, maybe we should delete them *)
-type dirname = string
-type path = string
-
-val is_directory : filename -> bool
-
-(* for realpath, see efuns_c library  *)
-(*
-   Check that the file exists and produce a valid absolute path for the file.
-*)
-val fullpath : filename -> filename
-val filename_without_leading_path : string -> filename -> filename
-val readable : root:string -> filename -> filename
-
-(* use the command 'find' internally and tries to skip files in
- * version control system (vcs) (e.g., .git, _darcs, etc.).
- * Deprecated?
- *)
-val files_of_dir_or_files_no_vcs_nofilter : string list -> filename list
-
-(* ugly: internal flag for files_of_dir_or_files_no_vcs_nofilter *)
-val follow_symlinks : bool ref
-
-(*****************************************************************************)
-(* IO *)
-(*****************************************************************************)
-
-(* Inputs a line of text in a platform-agnostic way. Should be preferred over
-   `input_line`, especially when dealing with Windows.
-   More info can be found in `Common.ml`.
-   This in-channel should be opened in binary mode.
-*)
-val input_text_line : in_channel -> string
-
-(*
-   Return the lines of a file. Both Windows-style and Unix-style line endings
-   are recognized and removed from the end of the line.
-*)
-val cat : filename -> string list
-val write_file : file:filename -> string -> unit
-
-(* Read the contents of file.
-
-   This implementation works even with Linux files like /dev/fd/63
-   created by bash when using "process substitution"* e.g.
-
-     my-ocaml-program <(echo contents)
-
-   * https://www.gnu.org/software/bash/manual/html_node/Process-Substitution.html
-
-   If max_len is specified, at most that many bytes are read from the file.
-*)
-val read_file : ?max_len:int -> filename -> string
-
-(* Scheme-inspired combinators that automatically close the file
- * once the function callback is done. Here is an example of use:
- *   with_open_outfile "/tmp/foo.txt" (fun (pr, _chan) ->
- *     pr "this goes in foo.txt"
- *   )
- *)
-val with_open_outfile : filename -> ((string -> unit) * out_channel -> 'a) -> 'a
-val with_open_infile : filename -> (in_channel -> 'a) -> 'a
-
-(* creation of /tmp files, a la gcc
- * ex: new_temp_file "cocci" ".c" will give "/tmp/cocci-3252-434465.c"
- *)
-val new_temp_file : string (* prefix *) -> string (* suffix *) -> filename
-
-(* ??? *)
-val _temp_files_created : (string, unit) Hashtbl.t
-val save_tmp_files : bool ref
-val erase_temp_files : unit -> unit
-val erase_this_temp_file : filename -> unit
-
-(*****************************************************************************)
-(* Subprocess *)
-(*****************************************************************************)
-
-(* This allows to capture the output of an external command.
- * It is more convenient to use than Unix.open_process_in.
- * Here is an example of use:
- *  let (lines, _status) = cmd_to_list_and_status "find /home" in
- *  ...
- *)
-val cmd_to_list_and_status :
-  ?verbose:bool -> string -> string list * Unix.process_status
-
-exception CmdError of Unix.process_status * string
-
-(* this may raise CmdError *)
-val cmd_to_list : ?verbose:bool -> string -> string list (* alias *)
-
 (*****************************************************************************)
 (* Lists *)
 (*****************************************************************************)
-
-(* Shortcut for xs =*= [].
- * It is not that shorter, but it avoids to use =*= which helps
- * to reduce the number of places to look for possible problems with =*=.
- *)
-val null : 'a list -> bool
-
-val map : ('a -> 'b) -> 'a list -> 'b list
-(** Same as [List.map] but stack-safe and slightly faster on short lists.
-    Additionally, we guarantee that the mapping function is applied from
-    left to right like for [List.iter].
-*)
-
-val flatten : 'a list list -> 'a list
-(** Same as [List.flatten] but tail recursive. *)
-
-(* opposite of Common.filter *)
-val exclude : ('a -> bool) -> 'a list -> 'a list
-
-(* Sort in a polymorphic way. You should really use 'deriving ord' instead *)
-val sort : 'a list -> 'a list
-val uniq_by : ('a -> 'a -> bool) -> 'a list -> 'a list
-
-val map_filter : ('a -> 'b option) -> 'a list -> 'b list
-(** Same as [List.filter_map] but tail recursive. *)
-
-val find_some : ('a -> 'b option) -> 'a list -> 'b
-val find_some_opt : ('a -> 'b option) -> 'a list -> 'b option
-val filter_some : 'a option list -> 'a list
-
-(* Haskell-inspired list combinators (take/drop/span) *)
-
-(* this may raise Failure "Common.take: not enough" *)
-val take : int -> 'a list -> 'a list
-
-(* this does not raise a Failure and take only the first n elements *)
-val take_safe : int -> 'a list -> 'a list
-
-(* this may raise Failure "drop: not enough" *)
-val drop : int -> 'a list -> 'a list
-val span : ('a -> bool) -> 'a list -> 'a list * 'a list
-
-(* zip a list with an increasing list of numbers.
- * e.g., index_list ["a"; "b"] -> ["a", 0; "b", 1].
- * An alternative is to use functions like List.iteri.
- *)
-val index_list : 'a list -> ('a * int) list
-val index_list_0 : 'a list -> ('a * int) list
-
-(* similar to index_list_0 but start the index at 1 *)
-val index_list_1 : 'a list -> ('a * int) list
+(* now in List_.mli *)
 
 (*****************************************************************************)
 (* Assoc *)
 (*****************************************************************************)
-
-type ('a, 'b) assoc = ('a * 'b) list
-
-(* sorts *)
-val sort_by_val_lowfirst : ('a, 'b) assoc -> ('a * 'b) list
-val sort_by_val_highfirst : ('a, 'b) assoc -> ('a * 'b) list
-val sort_by_key_lowfirst : ('a, 'b) assoc -> ('a * 'b) list
-val sort_by_key_highfirst : ('a, 'b) assoc -> ('a * 'b) list
-
-(* group by *)
-val group_by : ('a -> 'b) -> 'a list -> ('b * 'a list) list
-val group_assoc_bykey_eff : ('a * 'b) list -> ('a * 'b list) list
-val group_by_mapped_key : ('a -> 'b) -> 'a list -> ('b * 'a list) list
-val group_by_multi : ('a -> 'b list) -> 'a list -> ('b * 'a list) list
+(* now in Assoc.mli *)
 
 (*****************************************************************************)
 (* Stack *)
 (*****************************************************************************)
-
-type 'a stack = 'a list
-
-val push : 'a -> 'a stack ref -> unit
+(* now in Stack_.mli *)
 
 (*****************************************************************************)
 (* Hash *)
 (*****************************************************************************)
+(* now in Hashtbl_.mli *)
 
-val hash_of_list : ('a * 'b) list -> ('a, 'b) Hashtbl.t
-val hash_to_list : ('a, 'b) Hashtbl.t -> ('a * 'b) list
-
-type 'a hashset = ('a, bool) Hashtbl.t
-
-val hashset_of_list : 'a list -> 'a hashset
-val hashset_to_list : 'a hashset -> 'a list
-val optlist_to_list : 'a list option -> 'a list
+(*****************************************************************************)
+(* Polymorphic Set and Map *)
+(*****************************************************************************)
+(* now in Set_.mli and Map_.mli *)
 
 (*****************************************************************************)
 (* Option *)
 (*****************************************************************************)
+(* See also List_.mli with many option related functions (e.g., map_filter) *)
 
 (* Since OCaml 4.08 you can define your own "binding operator"
  * (see https://v2.ocaml.org/manual/bindingops.html)
  * 'let*' is one such binding operator and an alias to Option.bind.
  * [bind o f] is [f v] if [o] is [Some v] and [None] if [o] is [None].
+ *
  * Here is an example of use:
  *  let* x1 = xs |> List.find_opt (fun x -> x > 1) in
  *  let* x2 = xs |> List.find_opt (fun x -> x > 2) in
@@ -366,81 +233,67 @@ val optlist_to_list : 'a list option -> 'a list
  *    )
  *)
 val ( let* ) : 'a option -> ('a -> 'b option) -> 'b option
-
-(* TODO: we should delete this function; let* is better *)
-val ( >>= ) : 'a option -> ('a -> 'b option) -> 'b option
 val ( ||| ) : 'a option -> 'a -> 'a
+val combine_opt : ('a -> 'a -> 'a) -> 'a option -> 'a option -> 'a option
+
+(*****************************************************************************)
+(* Result *)
+(*****************************************************************************)
+
+(* similar to let* above but for Result instead of Option *)
+val ( let/ ) :
+  ('a, 'e) Result.t -> ('a -> ('b, 'e) Result.t) -> ('b, 'e) Result.t
 
 (*****************************************************************************)
 (* Either *)
 (*****************************************************************************)
-(* Note that since OCaml 4.12.0, the standard library has an Either module
- * but it is not recognized by default by ppx_deriving so it's simpler
- * for now to define our own either.
- *)
+(* Now in Either_.mli *)
 
-(* Haskell-inspired either type *)
-type ('a, 'b) either = Left of 'a | Right of 'b [@@deriving eq, show]
-
-val partition_either : ('a -> ('b, 'c) either) -> 'a list -> 'b list * 'c list
-
-type ('a, 'b, 'c) either3 = Left3 of 'a | Middle3 of 'b | Right3 of 'c
-[@@deriving eq, show]
-
-val partition_either3 :
-  ('a -> ('b, 'c, 'd) either3) -> 'a list -> 'b list * 'c list * 'd list
-
-(*
-   Same as 'partition_either' but operates on the standard type 'result'
-   (Ok or Error).
+(*****************************************************************************)
+(* IO *)
+(*****************************************************************************)
+(* Inputs a line of text in a platform-agnostic way. Should be preferred over
+   `input_line`, especially when dealing with Windows.
+   More info can be found in `Common.ml`.
+   This in-channel should be opened in binary mode.
 *)
-val partition_result :
-  ('a -> ('ok, 'error) result) -> 'a list -> 'ok list * 'error list
+val input_text_line : in_channel -> string
 
 (*****************************************************************************)
 (* Optimizations *)
 (*****************************************************************************)
 
-val memoized : ?use_cache:bool -> ('a, 'b) Hashtbl.t -> 'a -> (unit -> 'b) -> 'b
-
-val cache_computation :
-  ?use_cache:bool -> filename -> string (* extension *) -> (unit -> 'a) -> 'a
+val memoized :
+  ?use_cache:bool -> ('a, 'b) Base.Hashtbl.t -> 'a -> (unit -> 'b) -> 'b
 
 (*****************************************************************************)
 (* Profiling *)
 (*****************************************************************************)
-(* see also the profiling library and ppx_profiling [@@profiling] annot *)
+(* See also the profiling library and profiling.ppx [@@profiling] annot *)
 
 (*
    Measure how long it takes for a function to run, returning the result
    and the duration.
+   LATER: could be moved to CapCommon.ml
 *)
 val with_time : (unit -> 'a) -> 'a * float
 
-(*
-   Run a function and print how long it took to return or to raise an
-   exception. pr_time prints to stdout, pr2_time prints to stderr.
-*)
-val pr_time : string -> (unit -> 'a) -> 'a
-val pr2_time : string -> (unit -> 'a) -> 'a
+val force_lazy_with_time : 'a Lazy_safe.t -> 'a * float option
+(** Force a lazy value, and if it had to be forced, then return the time it took
+  in seconds. *)
 
 (*****************************************************************************)
-(* Misc *)
+(* Operators *)
 (*****************************************************************************)
 
-(* run by main_boilerplate below at its finalize step before exiting.
- * Can be used for example to display some profiling information
- * (see Profiling.ml as an example)
- *)
-val before_exit : (unit -> unit) list ref
-
-(* do some finalize, signal handling, unix exit conversion, etc *)
-val main_boilerplate : (unit -> unit) -> unit
-
-(* type of maps from string to `a *)
-module SMap : Map.S with type key = String.t
-
-type 'a smap = 'a SMap.t
-
-(* you should set this flag when you run code compiled by js_of_ocaml *)
-val jsoo : bool ref
+(* if you just want to use the operators *)
+module Operators : sig
+  val ( =~ ) : string -> string -> bool
+  val ( = ) : string -> string -> bool
+  val ( =|= ) : int -> int -> bool
+  val ( =$= ) : char -> char -> bool
+  val ( =:= ) : bool -> bool -> bool
+  val ( =*= ) : 'a -> 'a -> bool
+  val ( == ) : Eq.hidden_by_your_nanny
+  val ( != ) : Eq.hidden_by_your_nanny
+end

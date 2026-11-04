@@ -4,7 +4,7 @@
  (wrapped false)
  (libraries
    commons
-   pfff-h_program-lang
+   lib_parsing lib_parsing_tree_sitter
    tree-sitter-lang.typescript
    tree-sitter-lang.tsx
    ; the js AST covers also partially typescript
@@ -12,6 +12,5 @@
    ast_generic ; a few AST_generic_helpers, ugly
  )
  (preprocess (pps ppx_deriving.show
-                  ppx_sexp_conv ; for sexp_of in CST_tree_sitter
 		  ))
 )

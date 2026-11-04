@@ -1,20 +1,33 @@
+(*
+   Copyright (c) 2022-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 open Common
 open Ast_cpp
+open Either_
 module Ast = Ast_cpp
 module Flag = Flag_parsing
-
-let logger = Logging.get_logger [ __MODULE__ ]
+module Log = Log_parser_cpp.Log
 
 (*****************************************************************************)
 (* Wrappers *)
 (*****************************************************************************)
 
-(* TODO: switch to use logger *)
 let warning s v =
-  if !Flag.verbose_parsing then Common2.warning ("PARSING: " ^ s) v else v
+  if Hook.get Flag.verbose_parsing then
+    Log.warn (fun m -> m "PARSING: %s; value = %s" s (Dumper.dump v));
+  v
 
-let error s tok = raise (Parse_info.Other_error (s, tok))
-let fake s = Parse_info.fake_info s
+let error s tok = raise (Parsing_error.Other_error (s, tok))
+let fake s = Tok.fake_tok s
 
 (*****************************************************************************)
 (* Parse helpers functions *)
@@ -104,10 +117,10 @@ let addQualifD qu qu2 = { qu2 with qualifD = addQualif qu qu2.qualifD }
  * and go back.
  * old: before TSized and TPrimitive, when there was a complex TBase
  * there was more checks:
- *  error "signed, unsigned valid only for char and int" (List.hd iit)
- *  error "long or short specified with floatint type" (List.hd iit)
- *  error "the only valid combination is long double" (List.hd iit)
- *  error "long, short valid only for int or float" (List.hd iit)
+ *  error "signed, unsigned valid only for char and int" (Common.hd_exn "unexpected empty list" iit)
+ *  error "long or short specified with floatint type" (Common.hd_exn "unexpected empty list" iit)
+ *  error "the only valid combination is long double" (Common.hd_exn "unexpected empty list" iit)
+ *  error "long, short valid only for int or float" (Common.hd_exn "unexpected empty list" iit)
  *
  * if do short uint i, then gcc say parse error, strange ? it is
  * not a parse error, it is just that we dont allow with typedef
@@ -127,8 +140,8 @@ let type_and_storage_from_decl
         match st with
         | Sto (Auto, ii) -> TAuto ii
         | _ ->
-            (* old: error "no type (could default to 'int')" (List.hd iit) *)
-            TPrimitive (TInt, Parse_info.unsafe_fake_info "int"))
+            (* old: error "no type (could default to 'int')" (Common.hd_exn "unexpected empty list" iit) *)
+            TPrimitive (TInt, Tok.unsafe_fake_tok "int"))
     | None, None, Some t -> t
     | sign_opt, short_long_opt, topt ->
         let sign =
@@ -200,12 +213,10 @@ let type_and_specs_from_decl decl =
   | Sto (_, ii) ->
       error "storage class specified for parameter of function" ii
 
-let fixNameForParam (name, ftyp) =
+let fixNameForParam ii (name, ftyp) =
   match name with
   | None, [], IdIdent id -> (id, ftyp)
-  | _ ->
-      let ii = Lib_parsing_cpp.ii_of_any (Name name) |> List.hd in
-      error "parameter have qualifier" ii
+  | _ -> error "parameter have qualifier" ii
 
 let type_and_storage_for_funcdef_from_decl decl =
   let returnType, storage, _inline = type_and_storage_from_decl decl in
@@ -225,8 +236,7 @@ let type_and_storage_for_funcdef_from_decl decl =
  * with VF a typedef of func cos here we dont see the name of the
  * argument (in the typedef)
  *)
-let (fixOldCDecl : type_ -> type_) =
- fun ty ->
+let fixOldCDecl ii (ty : type_) : type_ =
   match snd ty with
   | TFunction { ft_params = params; _ } -> (
       (* stdC: If the prototype declaration declares a parameter for a
@@ -242,7 +252,7 @@ let (fixOldCDecl : type_ -> type_) =
                * and generic callbacks where specific instances do not
                * need the extra parameter (happens a lot in plan9).
                * Maybe this check is better done in a scheck for C.
-                   let info = Lib_parsing_cpp.ii_of_any (Type ty2) +> List.hd in
+                   let info = Lib_parsing_cpp.ii_of_any (Type ty2) +> Common.hd_exn "unexpected empty list" in
                    pr2 (spf "SEMANTIC: parameter name omitted (but I continue) at %s"
                          (Parse_info.string_of_info info)
                    );
@@ -251,24 +261,23 @@ let (fixOldCDecl : type_ -> type_) =
       | params ->
           params
           |> List.iter (fun param ->
-                 match param with
-                 | P { p_name = None; p_type = _ty2; _ } ->
-                     (* see above
-                        let info = Lib_parsing_cpp.ii_of_any (Type ty2) +> List.hd in
+              match param with
+              | P { p_name = None; p_type = _ty2; _ } ->
+                  (* see above
+                        let info = Lib_parsing_cpp.ii_of_any (Type ty2) +> Common.hd_exn "unexpected empty list" in
                         (* if majuscule, then certainly macro-parameter *)
                         pr2 (spf "SEMANTIC: parameter name omitted (but I continue) at %s"
                             (Parse_info.string_of_info info)
                         );
                      *)
-                     ()
-                 | _ -> ());
+                  ()
+              | _ -> ());
           ty)
   (* todo? can we declare prototype in the decl or structdef,
    *  ... => length <> but good kan meme
    *)
   | _ ->
       (* gcc says parse error but I dont see why *)
-      let ii = Lib_parsing_cpp.ii_of_any (Type ty) |> List.hd in
       error "seems this is not a function" ii
 
 (* TODO: this is ugly ... use record! *)
@@ -289,22 +298,24 @@ let fixFunc ((name, ty, _stoTODO), cp) : func_definition =
         | params ->
             params
             |> List.iter (function
-                 | P { p_name = Some _s; _ } -> ()
-                 (* failwith "internal errror: fixOldCDecl not good" *)
-                 | _ -> ()));
+              | P { p_name = Some _s; _ } -> ()
+              (* failwith "internal errror: fixOldCDecl not good" *)
+              | _ -> ()));
         ftyp
     | _ ->
-        logger#error "weird, not a functionType. Got %s" (Ast_cpp.show_type_ ty);
+        Log.warn (fun m ->
+            m "weird, not a functionType. Got %s" (Ast_cpp.show_type_ ty));
         (* this is possible if someone used a typedef to a function type, or
          * when tree-sitter-cpp did some error recovery and wrongly parsed
          * something as a function when it's really not
          *)
         {
-          ft_params = Parse_info.unsafe_fake_bracket [];
+          ft_params = Tok.unsafe_fake_bracket [];
           ft_ret = ty;
           ft_specs = [];
           ft_const = None;
           ft_throw = [];
+          ft_requires = None;
         }
   in
   ( ent,
@@ -321,8 +332,9 @@ let fixFieldOrMethodDecl (xs, semicolon) : class_member =
       let fbody =
         match v_init with
         | None -> FBDecl semicolon
-        | Some (EqInit (tokeq, InitExpr (C (Int (Some 0, iizero))))) ->
-            FBZero (tokeq, iizero, semicolon)
+        | Some (EqInit (tokeq, InitExpr (C (Int ((_, tk) as pi)))))
+          when Parsed_int.eq_const pi 0 ->
+            FBZero (tokeq, tk, semicolon)
         | _ -> error "can't assign expression to method decl" semicolon
       in
       let def = { f_type = ft; f_body = fbody; f_specs = [] } in
@@ -336,8 +348,8 @@ let fixFieldOrMethodDecl (xs, semicolon) : class_member =
 let mk_e e = e
 let mk_funcall e1 args = Call (e1, args)
 
-let mk_constructor specs id (lp, params, rp) _cmem_initializer_opt_TODO cp =
-  let params = Common.optlist_to_list params in
+let mk_constructor specs id (lp, params, rp) cp =
+  let params = List_.optlist_to_list params in
   let ftyp =
     {
       ft_ret = (nQ, TPrimitive (TVoid, snd id));
@@ -346,6 +358,7 @@ let mk_constructor specs id (lp, params, rp) _cmem_initializer_opt_TODO cp =
       (* TODO *)
       ft_const = None;
       ft_throw = [];
+      ft_requires = None;
     }
   in
   let name = name_of_id id in
@@ -360,6 +373,7 @@ let mk_destructor specs tilde id (lp, _voidopt, rp) exnopt cp =
       ft_specs = [];
       ft_const = None;
       ft_throw = Option.to_list exnopt;
+      ft_requires = None;
     }
   in
   let name = (None, noQscope, IdDestructor (tilde, id)) in

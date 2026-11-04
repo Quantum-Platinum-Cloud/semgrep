@@ -16,7 +16,6 @@
 open Common
 module TH = Token_helpers_cpp
 module TV = Token_views_cpp
-module PI = Parse_info
 open Parser_cpp
 open Token_views_cpp
 open Parsing_hacks_lib
@@ -40,8 +39,9 @@ open Parsing_hacks_lib
 (*****************************************************************************)
 
 let no_space_between i1 i2 =
-  PI.line_of_info i1 =|= PI.line_of_info i2
-  && PI.col_of_info i1 + String.length (PI.str_of_info i1) =|= PI.col_of_info i2
+  Tok.line_of_tok i1 =|= Tok.line_of_tok i2
+  && Tok.col_of_tok i1 + String.length (Tok.content_of_tok i1)
+     =|= Tok.col_of_tok i2
 
 (*****************************************************************************)
 (* Template inference *)
@@ -134,8 +134,9 @@ let find_template_inf_sup xs =
      *)
     | { t = TIdent (_, i1) } :: ({ t = TInf i2 } as tok2) :: xs
       when no_space_between i1 i2
-           && (* safe guard, and good style anyway *)
-           have_a_tsup_quite_close (Common.take_safe templateLOOKAHEAD xs) ->
+           &&
+           (* safe guard, and good style anyway *)
+           have_a_tsup_quite_close (List_.take_safe templateLOOKAHEAD xs) ->
         change_tok tok2 (TInf_Template i2);
         let before_sup, (toksup, toksupi), rest =
           find_tsup_quite_close tok2 xs
@@ -236,26 +237,24 @@ let find_template_commentize groups =
   let rec aux xs =
     xs
     |> List.iter (function
-         | TV.Braces (_, xs, _) -> aux xs
-         | TV.Parens (_, xs, _) -> aux xs
-         | TV.Angle (_, _xs, _) as angle ->
-             (* let's commentize everything *)
-             [ angle ]
-             |> TV.iter_token_multi (fun tok ->
-                    change_tok tok
-                      (TComment_Cpp
-                         (Token_cpp.CplusplusTemplate, TH.info_of_tok tok.t)))
-         | TV.Tok tok -> (
-             (* todo? should also pass the static_cast<...> which normally
-              * expect some TInf_Template after. Right mow I manage
-              * that by having some extra rules in the grammar
-              *)
-             match tok.t with
-             | Ttemplate _ ->
-                 change_tok tok
-                   (TComment_Cpp
-                      (Token_cpp.CplusplusTemplate, TH.info_of_tok tok.t))
-             | _ -> ()))
+      | TV.Braces (_, xs, _) -> aux xs
+      | TV.Parens (_, xs, _) -> aux xs
+      | TV.Angle (_, _xs, _) as angle ->
+          (* let's commentize everything *)
+          [ angle ]
+          |> TV.iter_token_multi (fun tok ->
+              change_tok tok
+                (TComment_Cpp (Token_cpp.CplusplusTemplate, TH.info_of_tok tok.t)))
+      | TV.Tok tok -> (
+          (* todo? should also pass the static_cast<...> which normally
+           * expect some TInf_Template after. Right mow I manage
+           * that by having some extra rules in the grammar
+           *)
+          match tok.t with
+          | Ttemplate _ ->
+              change_tok tok
+                (TComment_Cpp (Token_cpp.CplusplusTemplate, TH.info_of_tok tok.t))
+          | _ -> ()))
   in
   aux groups
 
@@ -276,17 +275,15 @@ let find_qualifier_commentize xs =
     | ({ t = TIdent _ } as t1) :: ({ t = TColCol _ } as t2) :: xs ->
         [ t1; t2 ]
         |> List.iter (fun tok ->
-               change_tok tok
-                 (TComment_Cpp
-                    (Token_cpp.CplusplusQualifier, TH.info_of_tok tok.t)));
+            change_tok tok
+              (TComment_Cpp (Token_cpp.CplusplusQualifier, TH.info_of_tok tok.t)));
         aux xs
     (* need also to pass the top :: *)
     | ({ t = TColCol _ } as t2) :: xs ->
         [ t2 ]
         |> List.iter (fun tok ->
-               change_tok tok
-                 (TComment_Cpp
-                    (Token_cpp.CplusplusQualifier, TH.info_of_tok tok.t)));
+            change_tok tok
+              (TComment_Cpp (Token_cpp.CplusplusQualifier, TH.info_of_tok tok.t)));
         aux xs
     (* recurse *)
     | _ :: xs -> aux xs

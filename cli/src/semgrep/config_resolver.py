@@ -1,9 +1,26 @@
+#
+# Copyright (c) 2020-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
+import concurrent.futures
 import json
 import os
+import re
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
+from dataclasses import field
 from enum import auto
 from enum import Enum
+from io import StringIO
 from pathlib import Path
 from typing import Any
 from typing import Dict
@@ -14,40 +31,49 @@ from typing import Optional
 from typing import Sequence
 from typing import Tuple
 from urllib.parse import urlencode
-from urllib.parse import urlparse
+from uuid import uuid4
 
+import click
 import requests
-import ruamel.yaml
+from ruamel.yaml import YAML
 from ruamel.yaml import YAMLError
 
+import semgrep.semgrep_interfaces.semgrep_output_v1 as out
 from semgrep import __VERSION__
+from semgrep import telemetry
 from semgrep.app import auth
+from semgrep.app.scan_config import fetch_scan_config
 from semgrep.constants import CLI_RULE_ID
 from semgrep.constants import Colors
-from semgrep.constants import DEFAULT_CONFIG_FILE
-from semgrep.constants import DEFAULT_CONFIG_FOLDER
 from semgrep.constants import DEFAULT_SEMGREP_APP_CONFIG_URL
-from semgrep.constants import DEFAULT_SEMGREP_CONFIG_NAME
 from semgrep.constants import ID_KEY
+from semgrep.constants import MISSED_KEY
 from semgrep.constants import PLEASE_FILE_ISSUE_TEXT
 from semgrep.constants import RULES_KEY
-from semgrep.constants import RuleSeverity
 from semgrep.error import InvalidRuleSchemaError
+from semgrep.error import RULE_PARSE_FAILURE_EXIT_CODE
 from semgrep.error import SemgrepError
+from semgrep.error import UnknownLanguageError
 from semgrep.error import UNPARSEABLE_YAML_EXIT_CODE
+from semgrep.error_location import SourceTracker
+from semgrep.error_location import Span
 from semgrep.rule import Rule
 from semgrep.rule import rule_without_metadata
-from semgrep.rule_lang import EmptySpan
 from semgrep.rule_lang import EmptyYamlException
-from semgrep.rule_lang import parse_yaml_preserve_spans
-from semgrep.rule_lang import Span
+from semgrep.rule_lang import parse_json_and_filter_versions
+from semgrep.rule_lang import parse_yaml_and_filter_versions
+from semgrep.rule_lang import prepend_rule_path
+from semgrep.rule_lang import project_depends_on
+from semgrep.rule_lang import RuleValidationMode
+from semgrep.rule_lang import run_jsonschema_validation
+from semgrep.rule_lang import validate_via_rpc_with_fallback
 from semgrep.rule_lang import YamlMap
 from semgrep.rule_lang import YamlTree
 from semgrep.state import get_state
+from semgrep.telemetry import scan_info_to_attrs
 from semgrep.util import is_config_suffix
-from semgrep.util import is_rules
+from semgrep.util import is_semgrep_url
 from semgrep.util import is_url
-from semgrep.util import terminal_wrap
 from semgrep.util import with_color
 from semgrep.verbose_logging import getLogger
 
@@ -56,19 +82,18 @@ logger = getLogger(__name__)
 AUTO_CONFIG_KEY = "auto"
 AUTO_CONFIG_LOCATION = "c/auto"
 
-MISSING_RULE_ID = "no-rule-id"
+CLOUD_PLATFORM_CONFIG_ID = "semgrep-app-rules"
+REGISTRY_CONFIG_ID = "remote-registry"
+NON_REGISTRY_REMOTE_CONFIG_ID = "remote-url"
 
-DEFAULT_CONFIG = {
-    "rules": [
-        {
-            "id": "eqeq-is-bad",
-            "pattern": "$X == $X",
-            "message": "$X == $X is a useless equality check",
-            "languages": ["python"],
-            "severity": RuleSeverity.ERROR.value,
-        },
-    ],
-}
+
+@dataclass
+class ParsedConfig:
+    """Result of parsing a single config string into rules."""
+
+    rules: List[Rule]
+    errors: List[SemgrepError] = field(default_factory=list)
+    missed_rule_count: int = 0
 
 
 class ConfigFile(NamedTuple):
@@ -78,7 +103,11 @@ class ConfigFile(NamedTuple):
 
 
 class ConfigType(Enum):
+    # e.g p/<packname>, supply-chain, ...
     REGISTRY = auto()
+    SEMGREP_CLOUD_PLATFORM = auto()
+    # 3rd party config sites (e.g https://mywebsite.com/rules.yaml)
+    REMOTE = auto()
     LOCAL = auto()
 
 
@@ -86,9 +115,12 @@ class ConfigLoader:
     _origin = ConfigType.LOCAL
     _config_path = ""
     _project_url = None
-    _extra_headers: Dict[str, str] = {}
 
-    def __init__(self, config_str: str, project_url: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        config_str: str,
+        project_url: Optional[str] = None,
+    ) -> None:
         """
         Mutates Metrics state!
         Takes a user's inputted config_str and transforms it into the appropriate
@@ -97,36 +129,61 @@ class ConfigLoader:
         """
         state = get_state()
         self._project_url = project_url
-        self._origin = ConfigType.REGISTRY
+        self._origin = ConfigType.REMOTE
+        self._supports_fallback_config = False
+
         if config_str == "r2c":
+            # Hardcoded Registry rule pack
             state.metrics.add_feature("config", "r2c")
+            state.metrics.is_using_registry = True
             self._config_path = "https://semgrep.dev/c/p/r2c"
+            self._origin = ConfigType.REGISTRY
         elif is_url(config_str):
+            # This could still be either a 3rd party REMOTE rule pack or a url
+            # to semgrep.dev
             state.metrics.add_feature("config", "url")
             self._config_path = config_str
-        elif is_policy_id(config_str):
-            state.metrics.add_feature("config", "policy")
-            self._config_path = url_for_policy(config_str)
-        elif is_supply_chain(config_str):
-            state.metrics.add_feature("config", "sca")
-            self._config_path = url_for_supply_chain()
+        elif is_product_names(config_str):
+            self._origin = ConfigType.SEMGREP_CLOUD_PLATFORM
+            add_metrics_for_products(config_str)
+            self._config_path = config_str
+            self._supports_fallback_config = True
         elif is_registry_id(config_str):
             state.metrics.add_feature("config", f"registry:prefix-{config_str[0]}")
+            state.metrics.is_using_registry = True
             self._config_path = registry_id_to_url(config_str)
-        elif is_saved_snippet(config_str):
-            state.metrics.add_feature("config", f"registry:snippet-id")
-            self._config_path = saved_snippet_to_url(config_str)
         elif config_str == AUTO_CONFIG_KEY:
             state.metrics.add_feature("config", "auto")
+            state.metrics.is_using_registry = True
             self._config_path = f"{state.env.semgrep_url}/{AUTO_CONFIG_LOCATION}"
         else:
             state.metrics.add_feature("config", "local")
             self._origin = ConfigType.LOCAL
             self._config_path = str(Path(config_str).expanduser())
 
-        if self.is_registry_url():
+        # We still have to modify metrics metadata in case the config was a
+        # registry URL
+        if is_semgrep_url(config_str, state.env.semgrep_url):
             state.metrics.is_using_registry = True
             state.metrics.add_registry_url(self._config_path)
+            self._origin = ConfigType.REGISTRY
+
+    @classmethod
+    def includes_remote_config(cls, configs: Optional[Sequence[str]]) -> bool:
+        """
+        Returns True if any of the configs are remote
+        """
+        if not configs:
+            return False
+
+        return any(
+            config == AUTO_CONFIG_KEY
+            or config == "r2c"
+            or is_product_names(config)
+            or is_registry_id(config)
+            or is_url(config)
+            for config in configs
+        )
 
     def load_config(self) -> List[ConfigFile]:
         """
@@ -135,41 +192,73 @@ class ConfigLoader:
         it may be a path to a folders of configs, each of
         which produces a file
         """
-        if self._origin == ConfigType.REGISTRY:
+        if self._origin == ConfigType.REGISTRY or self._origin == ConfigType.REMOTE:
             return [self._download_config()]
+        elif self._origin == ConfigType.SEMGREP_CLOUD_PLATFORM:
+            return [self._fetch_semgrep_cloud_platform_scan_config()]
         else:
             return self._load_config_from_local_path()
-
-    def _nice_semgrep_url(self, url: str) -> str:
-        """
-        Alters semgrep.dev urls to let user
-        click through to the nice display page instead
-        of raw YAML.
-        Replaces '/c/' in semgrep urls with '/'.
-        """
-        parsed = urlparse(url)
-        if "semgrep.dev" in parsed.netloc and parsed.path.startswith("/c"):
-            return url.replace("/c/", "/")
-        return url
 
     def _download_config(self) -> ConfigFile:
         """
         Download a configuration from semgrep.dev
         """
-        config_url = self._config_path
-        logger.debug(f"trying to download from {self._nice_semgrep_url(config_url)}")
         try:
-            config = ConfigFile(
-                None,
-                self._make_config_request(),
-                config_url,
-            )
-            logger.debug(f"finished downloading from {config_url}")
-            return config
-        except Exception as e:
-            raise SemgrepError(
-                terminal_wrap(f"Failed to download config from {config_url}: {str(e)}")
-            )
+            return self._download_config_from_url(self._config_path)
+        except Exception:
+            if self._supports_fallback_config:
+                try:
+                    fallback_url = re.sub(
+                        r"^[^?]*",  # replace everything but query params
+                        f"{get_state().env.fail_open_url}/config",
+                        self._config_path,
+                    )
+                    return self._download_config_from_url(fallback_url)
+                except Exception:
+                    pass
+
+            raise  # error from first fetch
+
+    def _download_config_from_url(self, url: str) -> ConfigFile:
+        app_session = get_state().app_session
+        logger.debug("Downloading config from %s", url)
+        error = f"Failed to download configuration from {url}"
+        try:
+            resp = app_session.get(url, headers={"Accept": "application/json"})
+            if resp.status_code == requests.codes.ok:
+                try:
+                    # can be either rule_config or rules depending on the endpoint we hit
+                    json_config = resp.json()
+                    rule_config = (
+                        json_config
+                        if "rules" in json_config
+                        else json_config["rule_config"]
+                    )
+
+                    # TODO don't dump and re-load json
+                    # The backend wants to return native json, but we support a json string here too
+                    config_str = (
+                        rule_config
+                        if isinstance(rule_config, str)
+                        else json.dumps(rule_config)
+                    )
+
+                    return ConfigFile(None, config_str, url)
+                except Exception as ex:
+                    # catch JSONDecodeError, AssertionError, etc. is this needed?
+                    logger.debug("Failed to decode JSON: %s", repr(ex))
+                    return ConfigFile(
+                        None, resp.content.decode("utf-8", errors="replace"), url
+                    )
+                finally:
+                    logger.debug(f"Downloaded config from %s", url)
+
+            error += f" HTTP {resp.status_code}."
+        except requests.exceptions.RetryError as ex:
+            error += f" Failed after multiple attempts ({ex.args[0].reason})"
+
+        logger.debug(error)  # since the raised exception may be caught and suppressed
+        raise SemgrepError(error)
 
     def _load_config_from_local_path(self) -> List[ConfigFile]:
         """
@@ -196,26 +285,138 @@ class ConfigLoader:
         logger.debug(f"Done loading local config from {loc}")
         return config
 
-    def _make_config_request(self) -> str:
-        app_session = get_state().app_session
-        resp = app_session.get(
-            self._config_path,
-            headers={"Accept": "application/json", **self._extra_headers},
-        )
-        if resp.status_code == requests.codes.ok:
-            try:
-                rule_config = resp.json()["rule_config"]
-                assert isinstance(rule_config, str)
-                return rule_config
-            except Exception:  # catch JSONDecodeError, AssertionError, etc.
-                return resp.content.decode("utf-8", errors="replace")
+    def _project_metadata_for_standalone_scan(
+        self, require_repo_name: bool
+    ) -> out.ProjectMetadata:
+        repo_name = os.environ.get("SEMGREP_REPO_NAME")
+        repo_display_name = os.environ.get("SEMGREP_REPO_DISPLAY_NAME")
+        project_id = os.environ.get("SEMGREP_PROJECT_ID")
+        if repo_display_name:
+            if project_id:
+                raise SemgrepError(
+                    "The environment variables SEMGREP_PROJECT_ID and SEMGREP_REPO_DISPLAY_NAME cannot both be set at the same time."
+                )
         else:
-            raise SemgrepError(
-                f"bad status code: {resp.status_code} returned by config url: {self._config_path}"
-            )
+            repo_display_name = repo_name
 
-    def is_registry_url(self) -> bool:
-        return self._origin == ConfigType.REGISTRY
+        if repo_name is None:
+            if require_repo_name:
+                raise SemgrepError(
+                    f"Need to set env var SEMGREP_REPO_NAME to use `--config {self._config_path}`"
+                )
+            else:
+                repo_name = "unknown"
+
+        return out.ProjectMetadata(
+            scan_environment="semgrep-scan",
+            repository=repo_name,
+            repo_display_name=repo_display_name,
+            repo_url=None,
+            branch=None,
+            commit=None,
+            commit_title=None,
+            commit_author_email=None,
+            commit_author_name=None,
+            commit_author_username=None,
+            commit_author_image_url=None,
+            ci_job_url=None,
+            on="unknown",
+            pull_request_author_username=None,
+            pull_request_author_image_url=None,
+            pull_request_id=None,
+            pull_request_title=None,
+            is_full_scan=True,  # always true for standalone scan
+            project_id=project_id,
+        )
+
+    def _fetch_semgrep_cloud_platform_scan_config(self) -> ConfigFile:
+        """
+        Download a configuration from semgrep.dev using async config generation.
+        """
+        products = [
+            out.Product.from_json(PRODUCT_NAMES[p])
+            for p in self._config_path.split(",")
+        ]
+
+        # Require SEMGREP_REPO_NAME env var if SAST or Secrets are requested
+        require_repo_name = any(
+            p.value in [out.SAST(), out.Secrets()] for p in products
+        )
+
+        request = out.CreateScanRequestV2(
+            scan_metadata=out.ScanMetadata(
+                cli_version=out.Version(__VERSION__),
+                # Each config fetch is a separate job; retries reuse this request.
+                unique_id=out.Uuid(str(uuid4())),
+                requested_products=products,
+                dry_run=True,  # semgrep scan never submits findings, so always a dry run
+            ),
+            project_metadata=self._project_metadata_for_standalone_scan(
+                require_repo_name
+            ),
+        )
+
+        try:
+            return self._download_semgrep_cloud_platform_scan_config(request)
+        except Exception:
+            if self._supports_fallback_config:
+                try:
+                    return self._download_semgrep_cloud_platform_fallback_scan_config()
+                except Exception:
+                    pass
+
+            raise  # error from first fetch
+
+    def _download_semgrep_cloud_platform_scan_config(
+        self, request: out.CreateScanRequestV2
+    ) -> ConfigFile:
+        state = get_state()
+        url = f"{state.env.semgrep_url}/api/cli/v2/scans"
+        logger.debug("Downloading config from %s", url)
+        error = f"Failed to download configuration from {url}"
+        try:
+            scan_response = fetch_scan_config(request)
+            get_state().telemetry.add_resource_attrs(
+                scan_info_to_attrs(scan_response.info)
+            )
+            return ConfigFile(None, scan_response.config.rules.to_json_string(), url)
+
+        except requests.exceptions.RetryError as ex:
+            error += f" Failed after multiple attempts ({ex.args[0].reason})"
+
+            logger.debug(
+                error
+            )  # since the raised exception may be caught and suppressed
+
+            raise SemgrepError(error)
+
+    def _download_semgrep_cloud_platform_fallback_scan_config(self) -> ConfigFile:
+        """
+        This function decides what fallback url to call if the semgrep cloud platform
+        scan config endpoint fails
+
+        ! This will manually rebuild the url until we have a better solution
+        """
+        fallback_url = None
+
+        if is_code(self._config_path):
+            fallback_url = url_for_code()
+        elif is_supply_chain(self._config_path):
+            fallback_url = url_for_supply_chain()
+        elif is_secrets(self._config_path):
+            fallback_url = url_for_secrets()
+        elif is_policy_id(self._config_path):
+            fallback_url = url_for_policy()
+        else:
+            raise
+
+        fallback_url = re.sub(
+            r"^[^?]*",  # replace everything but query params
+            f"{get_state().env.fail_open_url}/config",
+            fallback_url,
+        )
+
+        return self._download_config_from_url(fallback_url)
 
 
 def read_config_at_path(loc: Path, base_path: Optional[Path] = None) -> ConfigFile:
@@ -232,141 +433,286 @@ def read_config_at_path(loc: Path, base_path: Optional[Path] = None) -> ConfigFi
 def read_config_folder(loc: Path, relative: bool = False) -> List[ConfigFile]:
     configs = []
     for l in loc.rglob("*"):
-        # Allow manually specified paths with ".", but don't auto-expand them
-        correct_suffix = is_config_suffix(l)
-        if not _is_hidden_config(l.relative_to(loc)) and correct_suffix:
-            if l.is_file():
-                configs.append(read_config_at_path(l, loc if relative else None))
+        if is_config_suffix(l) and l.is_file():
+            configs.append(read_config_at_path(l, loc if relative else None))
     return configs
 
 
+@telemetry.trace()
 def parse_config_files(
     loaded_config_infos: List[ConfigFile],
-) -> Dict[str, YamlTree]:
+    force_jsonschema: bool = False,
+    validation_mode: RuleValidationMode = RuleValidationMode.FULL,
+) -> Tuple[Dict[str, List[Rule]], List[SemgrepError], int]:
     """
-    Parse a list of config files into rules
+    Parse a list of config files into rules.
     This assumes that config_id is set for local rules
-    but is None for registry rules
+    but is None for registry rules.
+    Returns (config_id -> rules, errors, missed_rule_count).
     """
-    config = {}
-    for (config_id, contents, config_path) in loaded_config_infos:
-        try:
+    config: Dict[str, List[Rule]] = {}
+    errors: List[SemgrepError] = []
+    missed_rule_count = 0
+    future_to_config_id_and_path: Dict[
+        concurrent.futures.Future[ParsedConfig],
+        Tuple[str, str],
+    ] = {}
+
+    ctx = click.get_current_context(silent=True)
+    configured_semgrep_url = None
+    if ctx is not None:
+        with ctx.scope():
+            configured_semgrep_url = get_state().env.semgrep_url
+
+    def context_aware_parse_config_string(
+        *args: Any,
+        **kwargs: Any,
+    ) -> ParsedConfig:
+        """
+        Wrapper to propagate Click context to ThreadPoolExecutor threads
+
+        Click context is not available in the ThreadPoolExecutor threads,
+        so we need to propagate it manually.
+
+        See https://pocoo-click.readthedocs.io/en/latest/advanced/#global-context-access
+        """
+        if ctx is not None:
+            with ctx.scope():
+                return parse_config_string(*args, **kwargs)
+        else:
+            return parse_config_string(*args, **kwargs)
+
+    # !WARNING(sal): ThreadPoolExecutor landmine!
+    # Click's context is thread-local. If you use ThreadPoolExecutor,
+    # any Click-dependent operations will fail or behave unexpectedly
+    # in the worker threads unless the context is explicitly propagated
+    # using `with ctx.scope():` as shown in `context_aware_parse_config_string`.
+    #
+    # TODO(sal): Abstract the use of threadpool with a context-aware wrapper
+    # to prevent this issue from recurring.
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        for config_id, contents, config_path in loaded_config_infos:
             if not config_id:  # registry rules don't have config ids
-                config_id = "remote-url"
+                # Note: we must disambiguate registry sourced remote rules from
+                # non-registry sourced ones for security purposes. Namely, we
+                # want to avoid running postprocessors from untrusted remote
+                # sources (unless a local flag disabiling the relevant check is
+                # used).
+                config_id = (
+                    REGISTRY_CONFIG_ID
+                    if is_semgrep_url(config_path, configured_semgrep_url)
+                    else NON_REGISTRY_REMOTE_CONFIG_ID
+                )
                 filename = f"{config_path[:20]}..."
             else:
                 filename = config_path
-            config.update(parse_config_string(config_id, contents, filename))
-        except InvalidRuleSchemaError as e:
-            if config_id == "remote-url":
-                notice = f"\nRules downloaded from {config_path} failed to parse.\nThis is likely because rules have been added that use functionality introduced in later versions of semgrep.\nPlease upgrade to latest version of semgrep (see https://semgrep.dev/docs/upgrading/) and try again.\n"
-                notice_color = with_color(Colors.red, notice, bold=True)
-                logger.error(notice_color)
-                raise e
-            else:
-                raise e
-    return config
+            validation_future = executor.submit(
+                context_aware_parse_config_string,
+                config_id,
+                contents,
+                filename,
+                validation_mode=validation_mode,
+                force_jsonschema=force_jsonschema,
+            )
+            future_to_config_id_and_path[validation_future] = config_id, config_path
+        for future in concurrent.futures.as_completed(
+            future_to_config_id_and_path
+            # Timeout temporarily removed as part of SAF-2099.  Once completed,
+            # reintroduce and possibly readjust.
+            # , timeout=5 * 60
+        ):
+            config_id, config_path = future_to_config_id_and_path[future]
+            try:
+                result = future.result()
+                config[config_id] = result.rules
+                errors.extend(result.errors)
+                missed_rule_count += result.missed_rule_count
+            except InvalidRuleSchemaError as e:
+                if (
+                    config_id == REGISTRY_CONFIG_ID
+                    or config_id == NON_REGISTRY_REMOTE_CONFIG_ID
+                ):
+                    notice = f"\nRules downloaded from {config_path} failed to parse.\nThis is likely because rules have been added that use functionality introduced in later versions of semgrep.\nPlease upgrade to latest version of semgrep (see https://semgrep.dev/docs/upgrading/) and try again.\n"
+                    notice_color = with_color(Colors.red, notice, bold=True)
+                    logger.error(notice_color)
+                    raise e
+                else:
+                    raise e
+    return config, errors, missed_rule_count
 
 
-class ConfigPath:
-    def __init__(self, config_str: str, project_url: Optional[str] = None) -> None:
-        self._config_str = config_str
-        self._project_url = project_url
-
-    def resolve_config(self) -> Dict[str, YamlTree]:
-        """resolves if config arg is a registry entry, a url, or a file, folder, or loads from defaults if None"""
-        start_t = time.time()
-
-        config = parse_config_files(
-            ConfigLoader(self._config_str, self._project_url).load_config()
+@telemetry.trace()
+def resolve_config(
+    config_str: str,
+    project_url: Optional[str] = None,
+    force_jsonschema: bool = False,
+    validation_mode: RuleValidationMode = RuleValidationMode.FULL,
+) -> Tuple[Dict[str, List[Rule]], List[SemgrepError], int]:
+    """resolves if config arg is a registry entry, a url, or a file, folder, or loads from defaults if None"""
+    start_t = time.time()
+    config_loader = ConfigLoader(config_str, project_url)
+    config, errors, missed_rule_count = parse_config_files(
+        config_loader.load_config(),
+        force_jsonschema=force_jsonschema,
+        validation_mode=validation_mode,
+    )
+    if config:
+        logger.debug(
+            f"loaded {len(config)} configs in {time.time() - start_t} with {len(errors)} errors and {missed_rule_count} missed rules"
         )
+    return config, errors, missed_rule_count
 
-        if config:
-            logger.debug(f"loaded {len(config)} configs in {time.time() - start_t}")
-        return config
 
-    def __str__(self) -> str:
-        # TODO return the resolved config_path
-        return self._config_str
+def _apply_secrets_security_check(rule: Rule, config_id: str) -> None:
+    """SECURITY: Set metadata for non-registry secrets rules so that
+    postprocessors are not run. The default requirement is that the rule
+    be served from the pro origin. Without this, local rules could use
+    postprocessors which may exfiltrate data from source code."""
+    if (
+        isinstance(rule.product.value, out.Secrets)
+        # In some instances we might append config_id with `_{i}` where
+        # i is an integer
+        and not config_id.startswith(REGISTRY_CONFIG_ID)
+        and not config_id.startswith(CLOUD_PLATFORM_CONFIG_ID)
+    ):
+        rule.metadata.get("semgrep.dev", {}).get("rule", {})["origin"] = "local"
 
 
 class Config:
-    def __init__(self, valid_configs: Mapping[str, Sequence[Rule]]) -> None:
+    def __init__(
+        self,
+        valid_configs: Mapping[str, Sequence[Rule]],
+        *,
+        # TODO: Use an array of semgrep_output_v1.Product instead of booleans flags for secrets, code, and supply chain
+        with_code_rules: bool = False,
+        with_supply_chain: bool = False,
+        with_secrets: bool = False,
+        missed_rule_count: int = 0,
+    ) -> None:
         """
         Handles parsing and validating of config files
         and exposes ability to get all rules in parsed config files
         """
         self.valid = valid_configs
+        self.with_code_rules = with_code_rules
+        self.with_supply_chain = with_supply_chain
+        self.with_secrets = with_secrets
+        self.missed_rule_count = missed_rule_count
 
     @classmethod
+    @telemetry.trace()
     def from_pattern_lang(
         cls, pattern: str, lang: str, replacement: Optional[str] = None
-    ) -> Tuple["Config", Sequence[SemgrepError]]:
+    ) -> Tuple["Config", List[SemgrepError]]:
         config_dict = manual_config(pattern, lang, replacement)
-        valid, errors = cls._validate(config_dict)
-        return cls(valid), errors
+        # manual_config returns Dict[str, YamlTree]; do inline Rule construction
+        # for this synthetic rule (no schema validation needed)
+        rules: List[Rule] = []
+        errors: List[SemgrepError] = []
+        for _config_id, yaml_tree in config_dict.items():
+            for rule_yaml in yaml_tree.value[RULES_KEY].value:
+                try:
+                    rules.append(Rule.from_yamltree(rule_yaml))
+                except InvalidRuleSchemaError as ex:
+                    errors.append(ex)
+        return cls({"manual": rules}), errors
 
     @classmethod
-    def from_rules_yaml(cls, config: str) -> Tuple["Config", Sequence[SemgrepError]]:
-        config_dict: Dict[str, YamlTree] = {}
-        errors: List[SemgrepError] = []
+    @telemetry.trace()
+    def from_rules_string(
+        cls,
+        raw_rules: str,
+        force_jsonschema: bool = False,
+        validation_mode: RuleValidationMode = RuleValidationMode.FULL,
+    ) -> Tuple["Config", List[SemgrepError]]:
+        if not raw_rules:
+            return cls({}), [
+                SemgrepError(
+                    "Empty rule string cannot be loaded",
+                    code=RULE_PARSE_FAILURE_EXIT_CODE,
+                )
+            ]
 
         try:
-            resolved_config_key = "semgrep-app-rules"
-            config_dict.update(
-                parse_config_string(resolved_config_key, config, filename=None)
+            result = parse_config_string(
+                CLOUD_PLATFORM_CONFIG_ID,
+                raw_rules,
+                "rules.json",
+                force_jsonschema=force_jsonschema,
+                validation_mode=validation_mode,
             )
+            return cls({CLOUD_PLATFORM_CONFIG_ID: result.rules}), result.errors
         except SemgrepError as e:
-            errors.append(e)
-
-        valid, parse_errors = cls._validate(config_dict)
-        errors.extend(parse_errors)
-        return cls(valid), errors
+            return cls({}), [e]
 
     @classmethod
+    @telemetry.trace()
     def from_config_list(
-        cls, configs: Sequence[str], project_url: Optional[str]
-    ) -> Tuple["Config", Sequence[SemgrepError]]:
+        cls,
+        configs: Sequence[str],
+        project_url: Optional[str],
+        force_jsonschema: bool = False,
+        validation_mode: RuleValidationMode = RuleValidationMode.FULL,
+    ) -> Tuple["Config", List[SemgrepError]]:
         """
         Takes in list of files/directories and returns Config object as well as
         list of errors parsing said config files
 
         If empty list is passed, tries to read config file at default locations
         """
-        config_dict: Dict[str, YamlTree] = {}
+        config_dict: Dict[str, List[Rule]] = {}
         errors: List[SemgrepError] = []
-
-        if not configs:
-            try:
-                config_dict.update(load_default_config())
-            except SemgrepError as e:
-                errors.append(e)
+        missed_rule_count = 0
+        with_supply_chain = False
+        with_code_rules = False
+        with_secrets = False
 
         for i, config in enumerate(configs):
             try:
-                # Patch config_id to fix https://github.com/returntocorp/semgrep/issues/1912
-                resolved_config = ConfigPath(config, project_url).resolve_config()
+                # Patch config_id to fix
+                # https://github.com/semgrep/semgrep/issues/1912
+                resolved_config, config_errors, missed = resolve_config(
+                    config,
+                    project_url,
+                    force_jsonschema=force_jsonschema,
+                    validation_mode=validation_mode,
+                )
+                errors.extend(config_errors)
+                missed_rule_count += missed
                 if not resolved_config:
                     logger.verbose(f"Could not resolve config for {config}. Skipping.")
                     continue
 
-                for (
-                    resolved_config_key,
-                    resolved_config_yaml_tree,
-                ) in resolved_config.items():
-                    patched_resolved_config: Dict[str, YamlTree] = {}
-                    patched_resolved_config[
-                        f"{resolved_config_key}_{i}"
-                    ] = resolved_config_yaml_tree
+                with_code_rules = with_code_rules or not is_supply_chain(config)
+                with_supply_chain = with_supply_chain or is_supply_chain(config)
+                with_secrets = with_secrets or is_secrets(config)
 
-                    config_dict.update(patched_resolved_config)
+                for resolved_config_key, rules in resolved_config.items():
+                    patched_key = f"{resolved_config_key}_{i}"
+                    for rule in rules:
+                        _apply_secrets_security_check(rule, resolved_config_key)
+                    config_dict[patched_key] = rules
+            except UnknownLanguageError:
+                # UnknownLanguageError must propagate so the CLI exits with
+                # INVALID_LANGUAGE_EXIT_CODE (8). Other SemgrepError subtypes
+                # are appended to `errors` and trigger a generic
+                # MISSING_CONFIG_EXIT_CODE (7) via sanity_check_resolved_config.
+                raise
             except SemgrepError as e:
                 errors.append(e)
 
-        valid, parse_errors = cls._validate(config_dict)
-        errors.extend(parse_errors)
-        return cls(valid), errors
+        return (
+            cls(
+                config_dict,
+                with_code_rules=with_code_rules,
+                with_supply_chain=with_supply_chain,
+                with_secrets=with_secrets,
+                missed_rule_count=missed_rule_count,
+            ),
+            errors,
+        )
 
+    @telemetry.trace()
     def get_rules(self, no_rewrite_rule_ids: bool) -> List[Rule]:
         """
         Return list of rules
@@ -379,94 +725,35 @@ class Config:
             # re-write the configs to have the hierarchical rule ids
             self._rename_rule_ids(configs)
 
-        # deduplicate rules, ignoring metadata, which is not displayed
-        # in the result
+        # Deduplicate rules, ignoring metadata, which is not displayed
+        # in the result.
+        # Deduplication occurs from left to right so as to have the same
+        # behavior as osemgrep i.e. the first occurrence of each rule
+        # if preserved and subsequent occurrences are discarded.
         return list(
-            OrderedDict(
-                (rule_without_metadata(rule), rule)
-                for rules in configs.values()
-                for rule in rules
-            ).values()
+            reversed(
+                list(
+                    OrderedDict(
+                        (rule_without_metadata(rule), rule)
+                        for rules in reversed(configs.values())
+                        for rule in reversed(rules)
+                    ).values()
+                )
+            )
         )
-
-    @staticmethod
-    def _safe_relative_to(a: Path, b: Path) -> Path:
-        try:
-            return a.relative_to(b)
-        except ValueError:
-            # paths had no common prefix; not possible to relativize
-            return a
-
-    @staticmethod
-    def _convert_config_id_to_prefix(config_id: str) -> str:
-        at_path = Path(config_id)
-        try:
-            at_path = Config._safe_relative_to(at_path, Path.cwd())
-        except FileNotFoundError:
-            pass
-
-        prefix = ".".join(at_path.parts[:-1]).lstrip("./").lstrip(".")
-        if len(prefix):
-            prefix += "."
-        return prefix
 
     @staticmethod
     def _rename_rule_ids(valid_configs: Mapping[str, Sequence[Rule]]) -> None:
         for config_id, rules in valid_configs.items():
             for rule in rules:
-                rule.rename_id(
-                    f"{Config._convert_config_id_to_prefix(config_id)}{rule.id or MISSING_RULE_ID}"
-                )
-
-    @staticmethod
-    def _validate(
-        config_dict: Mapping[str, YamlTree]
-    ) -> Tuple[Mapping[str, Sequence[Rule]], Sequence[SemgrepError]]:
-        """
-        Take configs and separate into valid and list of errors parsing the invalid ones
-        """
-        errors: List[SemgrepError] = []
-        valid: Dict[str, Any] = {}
-        for config_id, config_yaml_tree in config_dict.items():
-            config = config_yaml_tree.value
-            if not isinstance(config, YamlMap):
-                errors.append(SemgrepError(f"{config_id} was not a mapping"))
-                continue
-
-            rules = config.get(RULES_KEY)
-            if rules is None:
-                errors.append(
-                    InvalidRuleSchemaError(
-                        short_msg="missing keys",
-                        long_msg=f"{config_id} is missing `{RULES_KEY}` as top-level key",
-                        spans=[config_yaml_tree.span.truncate(lines=5)],
-                    )
-                )
-                continue
-            valid_rules = []
-            for rule_dict in rules.value:
-
-                try:
-                    rule = validate_single_rule(config_id, rule_dict)
-                except InvalidRuleSchemaError as ex:
-                    errors.append(ex)
-                else:
-                    valid_rules.append(rule)
-
-            if valid_rules:
-                valid[config_id] = valid_rules
-        return valid, errors
+                rule.rename_id(prepend_rule_path(config_id, rule.id))
 
 
-def validate_single_rule(
-    config_id: str, rule_yaml: YamlTree[YamlMap]
-) -> Optional[Rule]:
+def validate_single_rule(rule_yaml: YamlTree[YamlMap]) -> Rule:
     """
     Validate that a rule dictionary contains all necessary keys
     and can be correctly parsed.
     """
-    rule: YamlMap = rule_yaml.value
-
     # Defaults to search mode if mode is not specified
     return Rule.from_yamltree(rule_yaml)
 
@@ -488,7 +775,7 @@ def manual_config(
         "pattern": pattern_tree,
         "message": pattern,
         "languages": [lang],
-        "severity": RuleSeverity.ERROR.value,
+        "severity": out.Error().to_json(),
     }
 
     if replacement:
@@ -510,7 +797,12 @@ def adjust_for_docker() -> None:
             # check if there's at least one file in /src
             next(env.src_directory.iterdir())
         except (NotADirectoryError, StopIteration):
-            raise SemgrepError(
+            # This used to raise a SemgrepError but it was resulting
+            # in a silent 'exit 2'. Raising a generic Exception
+            # avoids the silence.
+            # TODO: fix the problem at the root: the SemgrepError exception
+            #  shouldn't be silent.
+            raise Exception(
                 f"Detected Docker environment without a code volume, please include '-v \"${{PWD}}:{env.src_directory}\"'"
             )
         else:
@@ -521,136 +813,172 @@ def indent(msg: str) -> str:
     return "\n".join(["\t" + line for line in msg.splitlines()])
 
 
-def import_callback(base: str, path: str) -> Tuple[str, bytes]:
+def _create_rules(
+    data: Dict[str, Any],
+    config_id: str,
+) -> Tuple[List[Rule], List[SemgrepError]]:
+    """Extract and construct Rule objects from a parsed config dict.
+
+    Schema validation usually rejects malformed rules before we get here, but
+    in NONE validation mode no pre-validation runs and `Rule.__init__` may
+    encounter shapes it wasn't designed for (e.g. `paths:` declared as a
+    list). We catch broadly so any per-rule failure surfaces as a rule error
+    instead of crashing the worker. Trade-off: this also swallows programming
+    bugs in `Rule.__init__`; the alternative is to let NONE-mode scans crash
+    on user-supplied malformed YAML.
     """
-    Instructions to jsonnet for how to resolve
-    import expressions (`local $NAME = $PATH`).
-    The base is the directory of the file and the
-    path is $PATH in the local expression. We will
-    later pass this function to jsonnet, which will
-    use it when resolving imports. By implementing
-    this callback, we support yaml files (jsonnet
-    can otherwise only build against json files)
-    and config specifiers like `p/python`.
-    """
-    final_path = os.path.join(base, path)
-    logger.debug(f"import_callback for {path}, base = {base}, final = {final_path}")
-
-    # On the fly conversion from yaml to json.
-    # We can now do 'local x = import "foo.yml";'
-    # TODO: Make this check less jank
-    if final_path and (
-        final_path.split(".")[-1] == "yml" or final_path.split(".")[-1] == "yaml"
-    ):
-        logger.debug(f"loading yaml file {final_path}, converting to JSON on the fly")
-        yaml = ruamel.yaml.YAML(typ="safe")
-        with open(final_path) as fpi:
-            data = yaml.load(fpi)
-        contents = json.dumps(data)
-        filename = final_path
-        return filename, contents.encode()
-
-    # This could be handled by ConfigLoader below (and its _load_config_from_local_path() helper)
-    # but this would not handle the 'base' argument yet, so better to be explicit about
-    # jsonnet handling here.
-    if final_path and (
-        final_path.split(".")[-1] == "jsonnet"
-        or final_path.split(".")[-1] == "libsonnet"
-    ):
-        logger.debug(f"loading jsonnet file {final_path}")
-        contents = Path(final_path).read_text()
-        return final_path, contents.encode()
-
-    logger.debug(f"defaulting to the config resolver for {path}")
-    # Registry-aware import!
-    # Can now do 'local x = import "p/python";'!!
-    # TODO? should we pass also base?
-    config_infos = ConfigLoader(path, None).load_config()
-    if len(config_infos) == 0:
-        raise SemgrepError(f"No valid configs imported")
-    elif len(config_infos) > 1:
-        raise SemgrepError(f"Currently configs cannot be imported from a directory")
-    else:
-        (_config_id, contents, config_path) = config_infos[0]
-        return config_path, contents.encode()
+    errors: List[SemgrepError] = []
+    rules: List[Rule] = []
+    raw_rules = data.get(RULES_KEY)
+    if raw_rules is None:
+        raise InvalidRuleSchemaError(
+            short_msg="missing keys",
+            long_msg=f"{config_id} is missing `{RULES_KEY}` as top-level key",
+            spans=[],
+        )
+    for raw_rule in raw_rules:
+        try:
+            rules.append(Rule.from_json(raw_rule))
+        except SemgrepError:
+            # SemgrepError subclasses (UnknownLanguageError,
+            # InvalidRuleSchemaError, etc.) carry user-facing diagnostics
+            # and specific exit codes; let `from_config_list` route them.
+            raise
+        except Exception:
+            # Last-resort safety net: Rule.__init__ does ad-hoc structural
+            # access and can raise AttributeError/TypeError/etc. on shapes
+            # validation would normally reject. Without pre-validation
+            # (NONE mode) those would crash the worker.
+            logger.debug(f"Rule.from_json failed in {config_id}", exc_info=True)
+            errors.append(
+                SemgrepError(
+                    f"Malformed rule in {config_id}",
+                    code=RULE_PARSE_FAILURE_EXIT_CODE,
+                )
+            )
+    return rules, errors
 
 
+@telemetry.trace()
 def parse_config_string(
-    config_id: str, contents: str, filename: Optional[str]
-) -> Dict[str, YamlTree]:
+    config_id: str,
+    contents: str,
+    filename: Optional[str],
+    force_jsonschema: bool = False,
+    validation_mode: RuleValidationMode = RuleValidationMode.FULL,
+) -> ParsedConfig:
+    """Parse config contents (JSON or YAML), validate, and create Rule objects.
+
+    Pipeline: parse → version filter → drop SCA-only rules → validate core-
+    bound rules → build Rule objects. Validation runs either via semgrep-
+    core's RPC (preferred) or Python's jsonschema (fallback or when forced).
+    SCA-only rules (r2c-internal-project-depends-on with no pattern keys)
+    are excluded from validation because they don't conform to the semgrep-
+    core rule schema.
+
+    When validation_mode is NONE, both the SCA-only filter and the schema
+    validation step are skipped here; validation is left to the scan
+    subprocess that consumes the same rules.
+    """
     if not contents:
         raise SemgrepError(
             f"Empty configuration file {filename}", code=UNPARSEABLE_YAML_EXIT_CODE
         )
 
-    # TODO: Make this check less jank
-    if filename and filename.split(".")[-1] == "jsonnet":
-        logger.error(
-            "Support for Jsonnet rules is experimental and currently meant for internal use only. The syntax may change or be removed at any point."
-        )
+    errors: List[SemgrepError] = []
 
-        # Importing jsonnet here so that people who aren't using
-        # jsonnet rules don't need to deal with jsonnet as a
-        # dependency, especially while this is internal.
-        try:
-            import _jsonnet  # type: ignore
-        except ImportError:
-            logger.error(
-                "Running jsonnet rules requires the python jsonnet library. Please run `pip install jsonnet` and try again."
-            )
-
-        contents = _jsonnet.evaluate_snippet(
-            filename, contents, import_callback=import_callback
-        )
-
-    # Should we guard this code and checks whether filename ends with .json?
+    # 1. PARSE + VERSION FILTER (always — Python needs parsed rules for Rule()).
+    #
+    # We check if it's JSON or not because JSON parsing on the Python side is
+    # much faster than YAML parsing.
+    is_json = re.match(r"\s*\{", contents) is not None
+    # Needed so we can reconstruct error messages with accurate line numbers.
+    # Only populated for YAML since we use the jsonschema validator even if we
+    # start with yaml, since that's much faster
+    yaml_tree: Optional[YamlTree] = None
     try:
-        # we pretend it came from YAML so we can keep later code simple
-        data = YamlTree.wrap(json.loads(contents), EmptySpan)
-        return {config_id: data}
-    except json.decoder.JSONDecodeError:
-        pass
-
-    try:
-        data = parse_yaml_preserve_spans(contents, filename)
+        if is_json:
+            logger.debug(f"Parsing {filename} as JSON")
+            data, ver_errors = parse_json_and_filter_versions(contents, filename)
+            errors.extend(ver_errors)
+        else:
+            logger.debug(f"Parsing {filename} as YAML")
+            yaml_tree, parse_errors = parse_yaml_and_filter_versions(contents, filename)
+            errors.extend(parse_errors)
+            # Guard against YAML that parses to a non-mapping (e.g. a bare
+            # string or list). Downstream code assumes a mapping at the top.
+            if not isinstance(yaml_tree.value, YamlMap):
+                raise SemgrepError(f"{config_id} was not a mapping")
+            data = yaml_tree.unroll_dict()
     except EmptyYamlException:
         raise SemgrepError(
             f"Empty configuration file {filename}", code=UNPARSEABLE_YAML_EXIT_CODE
+        )
+    except json.decoder.JSONDecodeError as je:
+        raise SemgrepError(
+            f"Invalid JSON file {config_id}:\n{indent(str(je))}",
+            code=UNPARSEABLE_YAML_EXIT_CODE,
         )
     except YAMLError as se:
         raise SemgrepError(
             f"Invalid YAML file {config_id}:\n{indent(str(se))}",
             code=UNPARSEABLE_YAML_EXIT_CODE,
         )
-    return {config_id: data}
 
+    if validation_mode is RuleValidationMode.NONE:
+        logger.debug(f"Skipping rule pre-validation for {filename}")
+    else:
+        # 2. FILTER: drop every rule with `r2c-internal-project-depends-on`.
+        #    Two reasons, one correctness, one performance:
+        #      - SCA-only rules (no patterns) don't conform to the semgrep-core
+        #        rule schema; they're handled by the Python Supply Chain
+        #        pipeline and must not reach validation.
+        #      - Reachability-style rules (patterns + project-depends-on) WILL
+        #        be filtered down by `filter_dependency_aware_rules` in
+        #        run_scan.run_rules to only those whose deps actually resolve
+        #        for this project. The survivors are then re-parsed by
+        #        `Core_scan.rules_of_config` when `core_runner` invokes
+        #        semgrep-core. Validating the full set here doubles the bytes
+        #        sent through `RPC CallValidate` for no additional coverage.
+        #    Trade-off: this loses fail-fast for syntax errors in
+        #    dependency-aware rules; those are now reported by the in-scan
+        #    parse via `error_recovery:true` (warning, not abort), matching
+        #    the existing behavior for SCA-only rules.
+        all_rule_dicts = data.get(RULES_KEY, [])
+        core_rule_dicts = [r for r in all_rule_dicts if not project_depends_on(r)]
+        core_rules_data = {RULES_KEY: core_rule_dicts}
+        if is_json:
+            contents = json.dumps(core_rules_data, ensure_ascii=False)
+        else:
+            stream = StringIO()
+            YAML().dump(core_rules_data, stream)
+            contents = stream.getvalue()
 
-def _is_hidden_config(loc: Path) -> bool:
-    """
-    Want to keep rules/.semgrep.yml but not path/.github/foo.yml
-    Also want to keep src/.semgrep/bad_pattern.yml but not ./.pre-commit-config.yaml
-    """
-    return any(
-        part != os.curdir
-        and part != os.pardir
-        and part.startswith(".")
-        and DEFAULT_SEMGREP_CONFIG_NAME not in part
-        for part in loc.parts
-    )
+        # 3. VALIDATE: decide path up-front. RPC gets the (possibly filtered)
+        #    contents with a format-matching suffix; jsonschema fallback builds
+        #    the YAML span bridge from yaml_tree. CORE_ONLY is a hard constraint
+        #    — when set, we must not run jsonschema even if force_jsonschema is
+        #    also set.
+        source_hash = SourceTracker.add_source(contents)
+        if force_jsonschema and validation_mode is RuleValidationMode.FULL:
+            run_jsonschema_validation(core_rules_data, yaml_tree, source_hash, filename)
+        else:
+            validate_via_rpc_with_fallback(
+                contents,
+                is_json,
+                core_rules_data,
+                yaml_tree,
+                source_hash,
+                filename,
+                validation_mode,
+            )
 
+    # 4. CREATE RULES
+    rules, rule_errors = _create_rules(data, config_id)
+    errors.extend(rule_errors)
 
-def load_default_config() -> Dict[str, YamlTree]:
-    """
-    Load config from DEFAULT_CONFIG_FILE or DEFAULT_CONFIG_FOLDER
-    """
-    default_file = Path(DEFAULT_CONFIG_FILE)
-    default_folder = Path(DEFAULT_CONFIG_FOLDER)
-    config_infos = []
-    if default_file.exists():
-        config_infos = [read_config_at_path(default_file)]
-    elif default_folder.exists():
-        config_infos = read_config_folder(default_folder, relative=True)
-    return parse_config_files(config_infos)
+    missed_rule_count = int(data.get(MISSED_KEY, 0))
+    return ParsedConfig(rules=rules, errors=errors, missed_rule_count=missed_rule_count)
 
 
 def is_registry_id(config_str: str) -> bool:
@@ -660,22 +988,15 @@ def is_registry_id(config_str: str) -> bool:
     return config_str[:2] in {"r/", "p/", "s/"}
 
 
-def is_saved_snippet(config_str: str) -> bool:
-    """
-    config_str is saved snippet which has format username:snippetname
-    """
-    return len(config_str.split(":")) == 2
-
-
 def registry_id_to_url(registry_id: str) -> str:
     """
     Convert from registry_id to semgrep.dev url
     """
     env = get_state().env
-    return f"{env.semgrep_url}/{registry_id}"
+    return f"{env.semgrep_url}/c/{registry_id}"
 
 
-def url_for_policy(config_str: str) -> str:
+def url_for_policy() -> str:
     """
     Return url to download a policy for a given repo_name
 
@@ -698,6 +1019,7 @@ def url_for_policy(config_str: str) -> str:
     # The app considers anything that will not POST back to it to be a dry_run
     params = {
         "sca": False,
+        "is_secrets_scan": False,
         "dry_run": True,
         "full_scan": True,
         "repo_name": repo_name,
@@ -705,67 +1027,83 @@ def url_for_policy(config_str: str) -> str:
     }
     params_str = urlencode(params)
     return f"{env.semgrep_url}/{DEFAULT_SEMGREP_APP_CONFIG_URL}?{params_str}"
+
+
+PRODUCT_NAMES = {
+    "code": "sast",
+    "policy": "sast",  # although policy isn't a product, it's effectively an alias for code
+    "secrets": "secrets",
+    "supply-chain": "sca",
+}
+
+
+def is_product_names(config_str: str) -> bool:
+    allowed = set(PRODUCT_NAMES.keys())
+    names = set(config_str.split(","))
+    return names <= allowed
+
+
+def add_metrics_for_products(config_str: str) -> None:
+    state = get_state()
+    for product_name in config_str.split(","):
+        if is_policy_id(product_name):
+            state.metrics.add_feature("config", "policy")
+        else:
+            state.metrics.add_feature("config", PRODUCT_NAMES[product_name])
 
 
 def is_policy_id(config_str: str) -> bool:
     return config_str == "policy"
 
 
-def url_for_supply_chain() -> str:
+def legacy_url_for_scan(extra_params: Optional[dict] = None) -> str:
+    """
+    Generates a legacy scan url (api/agent/deployments/scans/config) to
+    fetch a scan configuration.
+    """
     env = get_state().env
-    repo_name = os.environ.get("SEMGREP_REPO_NAME")
 
-    # The app considers anything that will not POST back to it to be a dry_run
+    # Common parameters for all scans
+    # - The app considers anything that will not POST back to it to be a dry_run
     params = {
-        "sca": True,
         "dry_run": True,
         "full_scan": True,
-        "repo_name": repo_name,
         "semgrep_version": __VERSION__,
     }
+
+    if extra_params:
+        params.update(extra_params)
+
+    if "SEMGREP_REPO_NAME" in os.environ:
+        params["repo_name"] = os.environ.get("SEMGREP_REPO_NAME")
+
     params_str = urlencode(params)
     return f"{env.semgrep_url}/{DEFAULT_SEMGREP_APP_CONFIG_URL}?{params_str}"
+
+
+def url_for_code() -> str:
+    return legacy_url_for_scan()
+
+
+def url_for_supply_chain() -> str:
+    return legacy_url_for_scan({"sca": True})
+
+
+def url_for_secrets() -> str:
+    return legacy_url_for_scan({"is_secrets_scan": True})
+
+
+def is_code(config_str: str) -> bool:
+    return config_str == "code"
 
 
 def is_supply_chain(config_str: str) -> bool:
     return config_str == "supply-chain"
 
 
-def saved_snippet_to_url(snippet_id: str) -> str:
-    """
-    Convert from username:snippetname to semgrep.dev url
-    """
-    return registry_id_to_url(f"s/{snippet_id}")
+def is_secrets(config_str: str) -> bool:
+    return config_str == "secrets"
 
 
 def is_pack_id(config_str: str) -> bool:
     return config_str[:2] == "p/"
-
-
-def get_config(
-    pattern: Optional[str],
-    lang: Optional[str],
-    config_strs: Sequence[str],
-    *,
-    project_url: Optional[str],
-    replacement: Optional[str] = None,
-) -> Tuple[Config, Sequence[SemgrepError]]:
-    if pattern:
-        if not lang:
-            raise SemgrepError("language must be specified when a pattern is passed")
-        config, errors = Config.from_pattern_lang(pattern, lang, replacement)
-    elif len(config_strs) == 1 and is_rules(config_strs[0]):
-        config, errors = Config.from_rules_yaml(config_strs[0])
-    elif replacement:
-        raise SemgrepError(
-            "command-line replacement flag can only be used with command-line pattern; when using a config file add the fix: key instead"
-        )
-    else:
-        config, errors = Config.from_config_list(config_strs, project_url)
-
-    if not config:
-        raise SemgrepError(
-            f"No config given and {DEFAULT_CONFIG_FILE} was not found. Try running with --help to debug or if you want to download a default config, try running with --config r2c"
-        )
-
-    return config, errors

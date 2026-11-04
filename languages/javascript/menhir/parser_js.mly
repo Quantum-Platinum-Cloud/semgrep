@@ -15,11 +15,10 @@
  * license.txt for more details.
  *)
 open Common
-
-open AST_generic_
+open Either_
+open AST_generic
 open Ast_js
-module PI = Parse_info
-module H = AST_generic_
+module G = AST_generic
 
 (*************************************************************************)
 (* Prelude *)
@@ -58,12 +57,17 @@ module H = AST_generic_
 (*************************************************************************)
 (* Helpers *)
 (*************************************************************************)
-let fb = PI.fake_bracket
-let unsafe_fb = PI.unsafe_fake_bracket
+let fb = Tok.fake_bracket
+let unsafe_fb = Tok.unsafe_fake_bracket
 
 let sndopt = function
   | None -> None
   | Some (_, x) -> Some x
+
+let attr_opt kw x =
+  match x with
+  | None -> []
+  | Some x -> [attr (kw, x)]
 
 (* ugly *)
 let anon_semgrep_lambda = "!anon_semgrep_lambda!"
@@ -74,33 +78,33 @@ let fix_sgrep_module_item xs =
   * function decl (because 'function_decl' accepts id_opt, see its comment).
   * This is why we intercept this case by returning instead an Expr pattern.
   *)
-  | [DefStmt ({name = (s, _); _}, FuncDef def)]
+  | [DefStmt ({name = {str = s; _}; _}, FuncDef def)]
     when s = anon_semgrep_lambda ->
       Expr (Fun (def, None))
   | [ExprStmt (e, sc) as x] ->
-      if PI.is_fake sc
+      if Tok.is_fake sc
       then Expr e
       else Stmt x
   | [x] -> Stmt x
   | xs -> Stmts xs
 
 let mk_Fun ?(id=None) ?(attrs=[]) ?(props=[])
-  f_kind (_generics,(_,f_params,_),f_rettype) (lc,xs,rc) =
+  f_kind (_generics,f_params,f_rettype) (lc,xs,rc) =
   let f_attrs = (props |> List.map attr) @ attrs in
   Fun ({ f_kind; f_params; f_body = Block (lc, xs, rc); f_rettype; f_attrs }, id)
 
-let mk_FuncDef props f_kind (_generics,(_,f_params,_),f_rettype) (lc,xs,rc) =
+let mk_FuncDef props f_kind (_generics,f_params,f_rettype) (lc,xs,rc) =
   let f_attrs = props |> List.map attr in
   FuncDef { f_kind; f_params; f_body = Block (lc, xs, rc); f_rettype; f_attrs }
 
 let mk_Class ?(props=[]) tok idopt _generics (c_extends, c_implements) c_body =
   let c_attrs = props |> List.map attr in
-  Class ({c_kind = H.Class, tok; c_extends; c_implements; c_attrs; c_body},
+  Class ({c_kind = G.Class, tok; c_extends; c_implements; c_attrs; c_body},
          idopt)
 
 let mk_ClassDef ?(attrs=[]) ?(props=[]) tok _generics (c_extends, c_implements) c_body =
   let c_attrs = (props |> List.map attr) @ attrs in
-  ClassDef ({c_kind = H.Class, tok; c_extends; c_implements; c_attrs; c_body})
+  ClassDef ({c_kind = G.Class, tok; c_extends; c_implements; c_attrs; c_body})
 
 let mk_Field ?(fld_type=None) ?(props=[]) fld_name eopt =
   let fld_attrs = props |> List.map attr in
@@ -117,7 +121,7 @@ let mk_def ?(attrs=None) (idopt, defkind) =
   (* TODO: fun default_opt -> ... *)
   let name =
     match idopt with
-    | None -> Flag_parsing.sgrep_guard (anon_semgrep_lambda, PI.unsafe_fake_info "")
+    | None -> Flag_parsing.sgrep_guard (fake_id anon_semgrep_lambda (Tok.unsafe_fake_tok ""))
     | Some id -> id
   in
   match attrs with
@@ -132,7 +136,7 @@ let mk_pattern binding_pattern type_opt init_opt =
   let pat =
     match type_opt with
     | None -> binding_pattern
-    | Some type_ -> Cast(binding_pattern, PI.unsafe_fake_info ":", type_)
+    | Some type_ -> Cast(binding_pattern, Tok.unsafe_fake_tok ":", type_)
   in
   match init_opt with
   | None -> pat
@@ -140,10 +144,10 @@ let mk_pattern binding_pattern type_opt init_opt =
 
 (* Javascript has implicit returns for arrows with expression body *)
 let mk_block_return e =
-  unsafe_fb [Return (PI.unsafe_fake_info "return", Some e, PI.unsafe_sc)]
+  unsafe_fb [Return (Tok.unsafe_fake_tok "return", Some e, Tok.unsafe_sc)]
 
 let special spec tok xs =
-  Apply (IdSpecial (spec, tok), fb tok xs)
+  Apply (IdSpecial (spec, tok), fb tok [], fb tok xs)
 
 let bop op a b c = special (ArithOp op) b [a;c]
 let uop op tok x = special op tok [x]
@@ -169,34 +173,34 @@ let mk_Encaps opt (t1, xs, _t2) =
 (* Tokens *)
 (*************************************************************************)
 
-%token <Parse_info.t> TUnknown  (* unrecognized token *)
-%token <Parse_info.t> EOF
+%token <Tok.t> TUnknown  (* unrecognized token *)
+%token <Tok.t> EOF
 
 (*-----------------------------------------*)
 (* The space/comment tokens *)
 (*-----------------------------------------*)
 (* coupling: Token_helpers.is_comment *)
-%token <Parse_info.t> TCommentSpace TCommentNewline   TComment
+%token <Tok.t> TCommentSpace TCommentNewline   TComment
 
 (*-----------------------------------------*)
 (* The normal tokens *)
 (*-----------------------------------------*)
 
 (* tokens with a value *)
-%token<int option * Parse_info.t> T_INT
-%token<float option * Parse_info.t> T_FLOAT
-%token<string * Parse_info.t> T_ID
+%token<int option * Tok.t> T_INT
+%token<float option * Tok.t> T_FLOAT
+%token<string * Tok.t> T_ID
 
-%token<string * Parse_info.t> T_STRING
-%token<string * Parse_info.t> T_ENCAPSED_STRING
-%token<(Parse_info.t * (string * Parse_info.t) * Parse_info.t) * (string * Parse_info.t) option> T_REGEX
+%token<string * Tok.t> T_STRING
+%token<string * Tok.t> T_ENCAPSED_STRING
+%token<(Tok.t * (string * Tok.t) * Tok.t) * (string * Tok.t) option> T_REGEX
 
 (*-----------------------------------------*)
 (* Keyword tokens *)
 (*-----------------------------------------*)
 (* coupling: if you add an element here, expand also ident_keyword_bis
  * and also maybe the special hack for regexp in lexer_js.mll *)
-%token <Parse_info.t>
+%token <Tok.t>
  T_FUNCTION T_CONST T_VAR T_LET
  T_IF T_ELSE
  T_WHILE T_FOR T_DO T_CONTINUE T_BREAK
@@ -219,7 +223,7 @@ let mk_Encaps opt (t1, xs, _t2) =
 (*-----------------------------------------*)
 
 (* syntax *)
-%token <Parse_info.t>
+%token <Tok.t>
  T_LCURLY "{" T_RCURLY "}"
  T_LPAREN "(" T_RPAREN ")"
  T_LBRACKET "[" T_RBRACKET "]"
@@ -238,7 +242,7 @@ let mk_Encaps opt (t1, xs, _t2) =
 
 
 (* operators *)
-%token <Parse_info.t>
+%token <Tok.t>
  T_OR T_AND
  T_BIT_OR T_BIT_XOR T_BIT_AND
  T_PLUS T_MINUS
@@ -257,30 +261,30 @@ let mk_Encaps opt (t1, xs, _t2) =
 (*-----------------------------------------*)
 (* XHP tokens *)
 (*-----------------------------------------*)
-%token <string * Parse_info.t> T_XHP_OPEN_TAG
+%token <string * Tok.t> T_XHP_OPEN_TAG
 (* The 'option' is for closing tags like </> *)
-%token <string option * Parse_info.t> T_XHP_CLOSE_TAG
+%token <string option * Tok.t> T_XHP_CLOSE_TAG
 
 (* ending part of the opening tag *)
-%token <Parse_info.t> T_XHP_GT T_XHP_SLASH_GT
+%token <Tok.t> T_XHP_GT T_XHP_SLASH_GT
 
-%token <string * Parse_info.t> T_XHP_ATTR T_XHP_TEXT
+%token <string * Tok.t> T_XHP_ATTR T_XHP_TEXT
 (* '<>', see https://reactjs.org/docs/fragments.html#short-syntax *)
-%token <Parse_info.t> T_XHP_SHORT_FRAGMENT
+%token <Tok.t> T_XHP_SHORT_FRAGMENT
 
 (*-----------------------------------------*)
 (* Extra tokens: *)
 (*-----------------------------------------*)
 
 (* Automatically Inserted Semicolon (ASI), see parse_js.ml *)
-%token <Parse_info.t> T_VIRTUAL_SEMICOLON
+%token <Tok.t> T_VIRTUAL_SEMICOLON
 (* fresh_token: the opening '(' of the parameters preceding an '->' *)
-%token <Parse_info.t> T_LPAREN_ARROW
+%token <Tok.t> T_LPAREN_ARROW
 
 (* fresh_token: the opening '(' of the parameters of a method in semgrep *)
-%token <Parse_info.t> T_LPAREN_METHOD_SEMGREP
+%token <Tok.t> T_LPAREN_METHOD_SEMGREP
 (* fresh_token: the first '{' in a semgrep pattern for objects *)
-%token <Parse_info.t> T_LCURLY_SEMGREP
+%token <Tok.t> T_LCURLY_SEMGREP
 
 (*************************************************************************)
 (* Priorities *)
@@ -333,11 +337,11 @@ let mk_Encaps opt (t1, xs, _t2) =
 (* just for better type error *)
 %type <Ast_js.stmt list> stmt item module_item
 %type <Ast_js.definition list> decl
-%type <Parse_info.t> sc
+%type <Tok.t> sc
 %type <Ast_js.expr> element binding_elision_element binding_element
 %type <Ast_js.property list> class_element
 %type <Ast_js.property> binding_property
-%type <Parse_info.t * Ast_js.expr> initializeur
+%type <Tok.t * Ast_js.expr> initializeur
 
 %%
 (*************************************************************************)
@@ -417,35 +421,44 @@ sgrep_spatch_pattern:
      { Expr (Obj ($1, $2, $4)) }
 
   | (* decorators, no body *)
-    decorator+ T_ID
+    decorator+ T_STATIC? T_ASYNC? T_ID
     T_LPAREN formal_parameter_list_opt ")" annotation?
     EOF
    {
+     let static = attr_opt Static $2 in
+     let async = attr_opt Async $3 in
      (* We don't need to pass the attrs into `mk_def` because they're already
         in the FuncDef.
       *)
-     Partial (PartialDef (mk_def (Some $2,
+     Partial (PartialDef (mk_def (Some (to_real_id $4),
       FuncDef
-       { f_kind = (Method, $3)
-       ; f_params = $4
-       ; f_body = Block (fb $3 [])
-       ; f_rettype = $6
-       ; f_attrs = $1
+       { f_kind = (Method, $5)
+       ; f_params = $5, $6, $7
+       ; f_body = Block (fb $5 [])
+       ; f_rettype = $8
+       ; f_attrs = $1 @ static @ async
        }
      )))
    }
 
-  | decorator+ T_ID annotation? EOF
-     { Property (Field {fld_name = PN $2; fld_attrs=$1; fld_type = $3; fld_body = None }) }
+  | decorator+ T_STATIC? T_ASYNC? T_ID annotation? EOF
+     {
+
+     let static = attr_opt Static $2 in
+     let async = attr_opt Async $3 in
+
+      Property (Field {fld_name = PN (to_real_id $4); fld_attrs=$1 @ static @ async; fld_type = $5; fld_body = None }) }
 
   | (* decorators, with body *)
-    decorator+ T_ID
+    decorator+ T_STATIC? T_ASYNC? T_ID
     T_LPAREN formal_parameter_list_opt ")" annotation?
     "{" function_body "}" EOF
    {
-     let sig_ = (None, ($3, $4, $5), $6) in
-     let fun_ = mk_Fun ~attrs:$1 (Method, $3) sig_ ($7, $8, $9) in
-     Property (mk_Field (PN $2) (Some fun_))
+     let sig_ = (None, ($5, $6, $7), $8) in
+     let static = attr_opt Static $2 in
+     let async = attr_opt Async $3 in
+     let fun_ = mk_Fun ~attrs:($1 @ static @ async) (Method, $5) sig_ ($9, $10, $11) in
+     Property (mk_Field (PN (to_real_id $4)) (Some fun_))
    }
 
 
@@ -458,7 +471,7 @@ sgrep_spatch_pattern:
    {
      let sig_ = (None, ($2, $3, $4), $5) in
      let fun_ = mk_Fun (Method, $2) sig_ ($6, $7, $8) in
-     Property (mk_Field (PN $1) (Some fun_));
+     Property (mk_Field (PN (to_real_id $1)) (Some fun_));
    }
 
  | assignment_expr_no_stmt  EOF  { Expr $1 }
@@ -517,14 +530,14 @@ import_clause:
  |                    import_names    { $1 }
 
 import_default: binding_id
-  { (fun t path -> [Import (t, [((default_entity, snd $1), Some $1)], path)]) }
+  { (fun t path -> [Import (t, [(real_id default_entity $1.tok, Some $1)], path)]) }
 
 import_names:
  | "*" T_AS binding_id
      { (fun t path -> [ModuleAlias (t, $3, path)]) }
  | named_imports
      { (fun t path ->
-          let imports = $1 |> Common.map_filter (fun x ->
+          let imports = $1 |> List.filter_map (fun x ->
             match x with
             | Some (n1, n2opt) -> Some (n1, n2opt)
             | None -> None)
@@ -548,8 +561,8 @@ import_specifier:
  | binding_id                 { Some ($1, None) }
  | id T_AS binding_id         { Some ($1, Some ($3)) }
  (* not in ECMA, not sure what it means *)
- | T_DEFAULT T_AS binding_id  { Some (("default",$1), Some ($3)) }
- | T_DEFAULT                  { Some (("default",$1), None) }
+ | T_DEFAULT T_AS binding_id  { Some (real_id "default" $1, Some ($3)) }
+ | T_DEFAULT                  { Some (real_id "default" $1, None) }
  (* sgrep-ext: this is to allow people to write patterns like
   * import {..., Foo, ...} from 'Bar', but internally we just skip
   * those ... and will return an Import {Foo} from 'Bar'
@@ -880,7 +893,7 @@ method_get_set_star:
 interface_decl: T_INTERFACE binding_id generics? optl(interface_extends)
   object_type
    { let (t1, _xsTODO, t2) = $5 in
-      Some $2, ClassDef { c_kind = H.Interface, $1;
+      Some $2, ClassDef { c_kind = G.Interface, $1;
       c_extends = $4; c_implements = []; c_attrs = [];
       c_body = (t1, [], t2) } }
 
@@ -915,8 +928,8 @@ decorators:
  | decorator+   { $1 }
 
 decorator_name:
- | T_ID { [$1] }
- | decorator_name "." T_ID { $1 @ [$3] }
+ | T_ID { [to_real_id $1] }
+ | decorator_name "." T_ID { $1 @ [to_real_id $3] }
 
 decorator: "@" decorator_name arguments?  { NamedAttr ($1, $2, $3) }
 
@@ -967,8 +980,8 @@ primary_type2:
  | predefined_type      { TyName ([$1]) }
  | type_reference       { $1 }
  | object_type
-    { let (t1, _xsTODO, t2) = $1 in
-      TyRecordAnon ((t1, (), t2)) }
+    { let (t1, xs, t2) = $1 in
+      TyRecordAnon ((t1, List.map (fun x -> Field x) xs, t2)) }
  | "[" listc(type_) "]" { let members = List.map (fun x -> TyTupMember x) $2 in
                           TyTuple ($1, members, $3) }
  (* not in Typescript grammar *)
@@ -978,13 +991,13 @@ primary_type2:
                                 G.E (G.L (G.String $1))]) *)  }
 
 predefined_type:
- | T_ANY_TYPE      { "any", $1 }
- | T_NUMBER_TYPE   { "number", $1 }
- | T_BOOLEAN_TYPE  { "boolean", $1 }
- | T_STRING_TYPE   { "string", $1 }
- | T_VOID          { "void", $1 }
+ | T_ANY_TYPE      { real_id "any" $1 }
+ | T_NUMBER_TYPE   { real_id "number" $1 }
+ | T_BOOLEAN_TYPE  { real_id "boolean" $1 }
+ | T_STRING_TYPE   { real_id "string" $1 }
+ | T_VOID          { real_id "void" $1 }
  (* not in Typescript grammar, but often part of union type *)
- | T_NULL          { "null", $1 }
+ | T_NULL          { real_id "null" $1 }
 
 %inline
 type_reference: type_reference_aux
@@ -1001,12 +1014,12 @@ type_reference_aux:
 
 (* was called type_reference in Flow *)
 type_name:
- | T_ID { [$1] }
- | module_name "." T_ID { $1 @ [$3] }
+ | T_ID { [to_real_id $1] }
+ | module_name "." T_ID { $1 @ [to_real_id $3] }
 
 module_name:
- | T_ID { [$1] }
- | module_name "." T_ID { $1 @ [$3] }
+ | T_ID { [to_real_id $1] }
+ | module_name "." T_ID { $1 @ [to_real_id $3] }
 
 union_type: primary_or_union_type T_BIT_OR primary_type
     { TyOr ($1, $2, $3) }
@@ -1026,20 +1039,20 @@ type_member:
     { { fld_name = $1; fld_attrs = [attr (Optional, $2)]; fld_type = Some $3;
         fld_body = None } }
  | "[" T_ID ":" T_STRING_TYPE "]" complex_annotation sc_or_comma
-    { let fld_name = PN ("IndexMethod??TODO?", $1) in
+    { let fld_name = PN (fake_id "IndexMethod??TODO?" (snd $2)) in
       { fld_name; fld_attrs = []; fld_type = Some $6; fld_body = None}
     }
  | "[" T_ID ":" T_NUMBER_TYPE "]" complex_annotation sc_or_comma
-    { let fld_name = PN ("IndexMethod??TODO?", $1) in
+    { let fld_name = PN (fake_id "IndexMethod??TODO?" (snd $2)) in
       { fld_name; fld_attrs = []; fld_type = Some $6; fld_body = None}
     }
 
 (* no [xxx] here *)
 property_name_typescript:
  | id    { PN $1 }
- | string_literal  { PN $1 }
- | numeric_literal_as_string { PN $1 }
- | ident_keyword   { PN $1 }
+ | string_literal  { PN (to_real_id $1) }
+ | numeric_literal_as_string { PN (to_real_id $1) }
+ | ident_keyword   { PN (to_real_id $1) }
 
 
 param_type_list:
@@ -1072,8 +1085,8 @@ type_parameter: T_ID { $1 }
 (*----------------------------*)
 
 type_arguments:
- | T_LESS_THAN listc(type_argument) T_GREATER_THAN {  }
- | mismatched_type_arguments { }
+ | T_LESS_THAN listc(type_argument) T_GREATER_THAN { $2 }
+ | mismatched_type_arguments { [] }
 
 type_argument: type_ { $1 }
 
@@ -1145,7 +1158,7 @@ stmt:
  (* sgrep-ext:
   * TODO add an sc? then remove the other ugly "..." and less conflicts?
   *)
- | "..." { [ExprStmt (Ellipsis $1, PI.sc $1)] }
+ | "..." { [ExprStmt (Ellipsis $1, Tok.sc $1)] }
 
 %inline
 stmt1: stmt { unsafe_stmt1 $1 }
@@ -1191,8 +1204,8 @@ iteration_stmt:
 
 initializer_no_in: "=" assignment_expr_no_in { $2 }
 
-continue_stmt: T_CONTINUE id? sc { Continue ($1, $2, $3) }
-break_stmt:    T_BREAK    id? sc { Break ($1, $2, $3) }
+continue_stmt: T_CONTINUE id? sc { Continue ($1, Option.map (fun id -> (id.str, id.tok)) $2, $3) }
+break_stmt:    T_BREAK    id? sc { Break ($1, Option.map (fun id -> (id.str, id.tok)) $2, $3) }
 
 return_stmt: T_RETURN expr? sc { Return ($1, $2, $3) }
 
@@ -1200,7 +1213,7 @@ with_stmt: T_WITH "(" expr ")" stmt1 { With ($1, $3, $5) }
 
 switch_stmt: T_SWITCH "(" expr ")" case_block { Switch ($1, $3, $5) }
 
-labelled_stmt: id ":" stmt1 { Label ($1, $3) }
+labelled_stmt: id ":" stmt1 { Label (($1.str, $1.tok), $3) }
 
 
 throw_stmt: T_THROW expr sc { Throw ($1, $2, $3) }
@@ -1269,7 +1282,7 @@ left_hand_side_expr: left_hand_side_expr_(d1) { $1 }
 conditional_expr(x):
  | post_in_expr(x) { $1 }
  | post_in_expr(x) "?" assignment_expr ":" assignment_expr
-    { Conditional ($1, $3, $5) }
+    { Conditional ($1, $2, $3, $4, $5) }
 
 left_hand_side_expr_(x):
  | new_expr(x)  { $1 }
@@ -1329,21 +1342,21 @@ pre_in_expr(x):
  | pre_in_expr(x) T_PLUS pre_in_expr(d1)    { bop Plus $1 $2 $3 }
  | pre_in_expr(x) T_MINUS pre_in_expr(d1)   { bop Minus $1 $2 $3 }
  | pre_in_expr(x) T_LSHIFT pre_in_expr(d1)  { bop LSL $1 $2 $3 }
- | pre_in_expr(x) T_RSHIFT pre_in_expr(d1)  { bop LSR $1 $2 $3 }
- | pre_in_expr(x) T_RSHIFT3 pre_in_expr(d1) { bop ASR $1 $2 $3 }
+ | pre_in_expr(x) T_RSHIFT pre_in_expr(d1)  { bop ASR $1 $2 $3 }
+ | pre_in_expr(x) T_RSHIFT3 pre_in_expr(d1) { bop LSR $1 $2 $3 }
 
  (* es7: *)
  | pre_in_expr(x) T_EXPONENT pre_in_expr(d1) { bop Pow $1 $2 $3 }
 
 
 call_expr(x):
- | member_expr(x) arguments          { Apply ($1, $2) }
- | call_expr(x) arguments            { Apply ($1, $2) }
+ | member_expr(x) arguments          { let (l, x, r) = $2 in Apply ($1, fb l [], (l, x, r)) }
+ | call_expr(x) arguments            { let (l, x, r) = $2 in Apply ($1, fb l [], (l, x, r)) }
  | call_expr(x) "[" expr "]"         { ArrAccess ($1, ($2, $3,$4))}
  | call_expr(x) access method_name      { ObjAccess ($1, $2, PN $3) }
  (* es6: *)
  | call_expr(x) template_literal     { mk_Encaps (Some $1) $2 }
- | T_SUPER arguments                 { Apply (mk_Super($1), $2) }
+ | T_SUPER arguments                 { let (l, x, r) = $2 in Apply (mk_Super($1), fb l [], (l, x, r)) }
  (* sgrep-ext: note that we used to require just a "...", without the "."
   * before, which was more lightweight, but introduced ambiguity with
   * ASI for patterns like:
@@ -1373,7 +1386,7 @@ member_expr(x):
  | T_SUPER "[" expr "]"              { ArrAccess(mk_Super($1),($2,$3,$4))}
  | T_SUPER access field_name            { ObjAccess(mk_Super($1), $2, PN $3) }
  | T_NEW "." id {
-     if fst $3 = "target"
+     if $3.str = "target"
      then special NewTarget $1 []
      else raise (Parsing.Parse_error)
   }
@@ -1411,7 +1424,7 @@ primary_expr_no_braces:
  | array_literal                { $1 }
 
  (* simple! ECMA mixes this rule with arrow parameters (bad) *)
- | "(" expr ")" { $2 }
+ | "(" expr ")" { ParenExpr ($1, $2, $3) }
  | "(" id ":" type_ ")" { TypedMetavar ($2, $3, $4) }
 
  (* xhp: do not put in 'expr', otherwise can't have xhp in function arg *)
@@ -1439,9 +1452,9 @@ numeric_literal:
   | T_FLOAT { $1 }
 numeric_literal_as_string: numeric_literal
     { let t = snd $1 in
-      let s = Parse_info.str_of_info t in
+      let s = Tok.content_of_tok t in
       let s' =
-        match Common2.float_of_string_opt s with
+        match Float.of_string_opt s with
         | None -> s
         | Some n -> string_of_float n
       in
@@ -1463,8 +1476,8 @@ assignment_operator:
  | T_PLUS_ASSIGN    { $1, Some Plus  }
  | T_MINUS_ASSIGN   { $1, Some Minus }
  | T_LSHIFT_ASSIGN  { $1, Some LSL }
- | T_RSHIFT_ASSIGN  { $1, Some LSR }
- | T_RSHIFT3_ASSIGN { $1, Some ASR  }
+ | T_RSHIFT_ASSIGN  { $1, Some ASR }
+ | T_RSHIFT3_ASSIGN { $1, Some LSR  }
  | T_BIT_AND_ASSIGN { $1, Some BitAnd }
  | T_BIT_XOR_ASSIGN { $1, Some BitXor }
  | T_BIT_OR_ASSIGN  { $1, Some BitOr }
@@ -1529,9 +1542,11 @@ argument:
 (* less: we should split $1 in 2 tokens, like we do in tree-sitter-js *)
 xhp_html:
  | T_XHP_OPEN_TAG xhp_attribute* T_XHP_GT xhp_child* T_XHP_CLOSE_TAG
-     { { xml_kind = XmlClassic (snd $1, $1, $3, snd $5); xml_attrs=$2; xml_body=$4 } }
+     { let id1 = to_real_id $1 in
+       { xml_kind = XmlClassic (snd $1, id1, $3, snd $5); xml_attrs=$2; xml_body=$4 } }
  | T_XHP_OPEN_TAG xhp_attribute* T_XHP_SLASH_GT
-     { { xml_kind = XmlSingleton (snd $1, $1, $3); xml_attrs = $2; xml_body = [] } }
+     { let id1 = to_real_id $1 in
+       { xml_kind = XmlSingleton (snd $1, id1, $3); xml_attrs = $2; xml_body = [] } }
  (* reactjs-ext: https://reactjs.org/docs/fragments.html#short-syntax *)
  | T_XHP_SHORT_FRAGMENT xhp_child* T_XHP_CLOSE_TAG
      { { xml_kind = XmlFragment ($1, snd $3); xml_attrs = []; xml_body = $2 } }
@@ -1545,12 +1560,12 @@ xhp_child:
 
 xhp_attribute:
  | T_XHP_ATTR "=" xhp_attribute_value
-    { XmlAttr ($1, $2, $3) }
+    { XmlAttr (to_real_id $1, $2, $3) }
  | "{" "..." assignment_expr "}"
     { XmlAttrExpr ($1, special Spread $2 [$3],$4)}
  (* reactjs-ext: see https://www.reactenlightenment.com/react-jsx/5.7.html *)
  | T_XHP_ATTR
-    { XmlAttr ($1, PI.fake_info (snd $1) "=", L (Bool(true, snd $1))) }
+    { XmlAttr (to_real_id $1, Tok.fake_tok (snd $1) "=", L (Bool(true, snd $1))) }
  | "..."
     { XmlEllipsis $1 }
 
@@ -1559,7 +1574,7 @@ xhp_attribute_value:
  | "{" expr sc? "}"   { $2 }
  | "..."              { Ellipsis $1 }
  (* sgrep-ext: only metavariable actually *)
- | T_XHP_ATTR { Flag_parsing.sgrep_guard (idexp $1) }
+ | T_XHP_ATTR { Flag_parsing.sgrep_guard (idexp (to_real_id $1)) }
 
 (*----------------------------*)
 (* interpolated strings *)
@@ -1616,7 +1631,7 @@ assignment_expr_no_in:
 conditional_expr_no_in:
  | post_in_expr_no_in { $1 }
  | post_in_expr_no_in "?" assignment_expr_no_in ":" assignment_expr_no_in
-     { Conditional ($1, $3, $5) }
+     { Conditional ($1, $2, $3, $4, $5) }
 
 post_in_expr_no_in:
  | pre_in_expr(d1) { $1 }
@@ -1667,8 +1682,8 @@ primary_no_stmt: TUnknown TComment { raise Impossible }
 (*************************************************************************)
 (* used for entities, parameters, labels, etc. *)
 id:
- | T_ID  %prec below_COLON               { $1 }
- | ident_semi_keyword { PI.str_of_info $1, $1 }
+ | T_ID  %prec below_COLON               { to_real_id $1 }
+ | ident_semi_keyword { real_id (Tok.content_of_tok $1) $1 }
 
 (* add here keywords which are not considered reserved by ECMA *)
 ident_semi_keyword:
@@ -1689,7 +1704,7 @@ ident_semi_keyword:
 (* alt: use the _last_non_whitespace_like_token trick and look if
  * previous token was a period to return a T_ID
  *)
-ident_keyword: ident_keyword_bis { PI.str_of_info $1, $1 }
+ident_keyword: ident_keyword_bis { Tok.content_of_tok $1, $1 }
 
 ident_keyword_bis:
  | T_FUNCTION { $1 }
@@ -1713,17 +1728,17 @@ ident_keyword_bis:
 
 field_name:
  | id            { $1 }
- | ident_keyword { $1 }
+ | ident_keyword { to_real_id $1 }
 
 method_name:
  | id            { $1 }
- | ident_keyword { $1 }
+ | ident_keyword { to_real_id $1 }
 
 property_name:
  | id              { PN $1 }
- | string_literal  { PN $1 }
- | numeric_literal_as_string { PN $1 }
- | ident_keyword   { PN $1 }
+ | string_literal  { PN (to_real_id $1) }
+ | numeric_literal_as_string { PN (to_real_id $1) }
+ | ident_keyword   { PN (to_real_id $1) }
  (* es6: *)
  | "[" assignment_expr "]" { PN_Computed ($2) }
 

@@ -66,11 +66,7 @@
 (* Tokens *)
 (*****************************************************************************)
 
-(* Contains among other things the position of the token through
- * the Parse_info.token_location embedded inside it, as well as the
- * transformation field that makes possible spatch on C/C++/cpp code.
- *)
-type tok = Parse_info.t [@@deriving show]
+type tok = Tok.t [@@deriving show]
 
 (* a shortcut to annotate some information with token/position information *)
 type 'a wrap = 'a * tok [@@deriving show]
@@ -114,15 +110,25 @@ and ident_or_op =
   (* TODO: not recursive, so should be enforced by making
    * using 'ident_or_op * template_arguments option' in 'name' above. *)
   | IdTemplated of ident_or_op * template_arguments
+  (* This is for dereferencing pointer-to-member expressions, such as
+     foo::*e
+  *)
+  | IdDeref of tok * expr
 
 and template_arguments = template_argument list angle
 
 (* C++ allows integers for template arguments! (=~ dependent types) *)
-and template_argument = (type_, expr) Common.either
+and template_argument = (type_, expr) Either_.t
 
 and qualifier =
   | QClassname of ident (* a_class_name or a_namespace_name *)
   | QTemplateId of ident * template_arguments
+  | QTemplateTokId of (* template *) tok * ident * template_arguments
+  (* something of the form
+     decltype(e)::<rest>
+     I can't really find documentation on it.
+  *)
+  | QDecltype of tok (* 'decltype' *) * expr bracket
 
 (* special cases *)
 and a_class_name = name (* only IdIdent or IdTemplateId *)
@@ -165,7 +171,7 @@ and typeC =
    * Indeed, 'long long' is not the same than just 'long'.
    * The type_ below is either a TPrimitive or TypeName of IdIdent.
    *)
-  | TSized of sized_type wrap list * type_ option (*  *)
+  | TSized of sized_type wrap list * type_ option (* *)
   | TPointer of tok (*'*'*) * type_ * pointer_modifier list
   (* c++ext: *)
   | TReference of tok (*'&'*) * type_
@@ -193,7 +199,7 @@ and typeC =
    * ident) type ident;' because when you want to do a macro(char[256],
    * x), then it will generate invalid code, but with a '#define
    * macro(type, ident) __typeof(type) ident;' it will work. *)
-  | TypeOf of tok * (type_, expr) Common.either paren
+  | TypeOf of tok * (type_, expr) Either_.t paren
   (* c++0x: *)
   | TAuto of tok
   (* forunparser: *)
@@ -229,6 +235,7 @@ and expr =
    *)
   | N of name
   | C of constant
+  | UserDefined of constant * ident
   | IdSpecial of special wrap
   (* I used to have FunCallSimple but not that useful, and we want scope info
    * for FunCallSimple too because can have fn(...) where fn is actually
@@ -238,20 +245,22 @@ and expr =
   | CondExpr of expr * tok * expr option * tok * expr
   (* should be considered as statements, bad C language *)
   | Sequence of expr * tok (* , *) * expr
-  | Assign of a_lhs * assignOp * expr
+  | Assign of a_lhs * assignOp * (expr, initialiser) Either_.t
   | Prefix of fixOp wrap * expr
   | Postfix of expr * fixOp wrap
   (* contains GetRef and Deref!! less: lift up? *)
   | Unary of unaryOp wrap * expr
   | Binary of expr * binaryOp wrap * expr
-  | ArrayAccess of expr * expr bracket
+  (* since c++23, subscript can take in multiple arguments *)
+  (* https://medium.com/@simontoth/daily-bit-e-of-c-c-23-multi-dimensional-subscript-operator-3883054b1157 *)
+  (* cannot be empty *)
+  | ArrayAccess of expr * initialiser list bracket
   (* name is usually just an ident_or_op. In rare cases it can be
    * a template_method name. *)
   | DotAccess of expr * dotOp wrap * name
   (* pfffonly, but we should add it to ts too.
    * c++ext: note that second paramater is an expr, not a name *)
   | DotStarAccess of expr * dotOp wrap (* with suffix '*' *) * expr
-  | SizeOf of tok * (expr, type_ paren) Common.either
     (* TODO: SizeOfDots of tok * tok * ident paren ??? *)
   | Cast of type_ paren * expr
   (* gccext: *)
@@ -261,7 +270,7 @@ and expr =
   (* c++ext: parens with TPrimitive and braces with TypeName *)
   | ConstructedObject of type_ * obj_init
   (* ?? *)
-  | TypeId of tok * (type_, expr) Common.either paren
+  | TypeId of tok * (type_, expr) Either_.t paren
   | CplusplusCast of cast_operator wrap * type_ angle * expr paren
   | New of
       tok (*::*) option
@@ -279,10 +288,21 @@ and expr =
   | ParamPackExpansion of expr * tok (* '...' *)
   (* forunparser: *)
   | ParenExpr of expr paren
+  | FoldExpr of fold_expr paren
+  (* These are different things. See:
+     https://en.cppreference.com/w/cpp/language/constraints#Requires_clauses
+  *)
+  | RequiresExpr of tok * parameter list paren * requirement list paren
+  | RequiresClause of expr
+  | CoAwait of tok * expr
+  (* since c11+ *)
+  (* https://en.cppreference.com/w/c/language/generic *)
+  | Generic of tok (* 'generic' *) * (expr * (type_ * expr) list) bracket
   (* sgrep-ext: *)
   | Ellipsis of tok
   | DeepEllipsis of expr bracket
   | TypedMetavar of ident * type_
+  | DotAccessEllipsis of expr * tok (* '...' *)
   | ExprTodo of todo_category * expr list
 
 and special =
@@ -290,12 +310,17 @@ and special =
   | This
   (* cppext: tsonly, always in a Call, with Id as single arg *)
   | Defined
+  | AlignOf
+  | SizeOf
+  | OffsetOf
 
 (* cppext: normally should just have type argument = expr *)
 and argument =
   | Arg of expr
   (* cppext: *)
   | ArgType of type_
+  (* for macro arguments *)
+  | ArgBlock of compound
   (* cppext: for really unparsable stuff ... we just bailout *)
   | ArgAction of action_macro
   (* c++0x? *)
@@ -311,16 +336,20 @@ and action_macro = ActMisc of tok list
  * String had isWchar param, but not worth it.
  *)
 and constant =
-  | Int of int option wrap
+  | Int of Parsed_int.t
   (* the wrap can contain the f/F/l/L suffix *)
   | Float of float option wrap
   | Char of string wrap (* normally it is equivalent to Int *)
   (* the wrap can contain the L/u/U/u8 prefix *)
-  | String of string wrap
-  | MultiString of string wrap list (* can contain MacroString *)
+  | String of string wrap (* TODO: bracket *)
+  | MultiString of string_component list
+  (* can contain MacroString *)
+  (* TODO: bracket *)
   (* c++ext: *)
   | Bool of bool wrap
   | Nullptr of tok
+
+and string_component = StrIdent of string wrap | StrLit of string wrap
 
 (* c++ext: *)
 and cast_operator = Static_cast | Dynamic_cast | Const_cast | Reinterpret_cast
@@ -342,6 +371,16 @@ and dotOp =
   (* . *)
   | Arrow (* -> *)
 
+and fold_expr =
+  | LeftFold of (* ... *) tok * operator wrap * expr
+  | RightFold of expr * operator wrap * (* ... *) tok
+  | BinaryFold of expr * (operator wrap * (* ... *) tok * operator wrap) * expr
+
+and requirement =
+  | ExprReq of expr option * sc
+  | TypeNameReq of (* typename *) tok * name
+  | CompoundReq of expr paren * (* noexcept *) tok option * type_ option * sc
+
 (* ------------------------------------------------------------------------- *)
 (* Overloaded operators *)
 (* ------------------------------------------------------------------------- *)
@@ -352,9 +391,12 @@ and operator =
   | PtrOpOp of ptrOp
   | AccessOp of accessop
   | AllocOp of allocOp
+  | DotStarOp (* .* *)
+  | CoAwaitOp
   | UnaryTildeOp
   | UnaryNotOp
   | CommaOp
+  | DQuoteOp (* "" *)
 
 (* less: migrate to AST_generic_.op? *)
 and binaryOp = Arith of arithOp | Logical of logicalOp
@@ -371,7 +413,17 @@ and arithOp =
   | Or
   | Xor
 
-and logicalOp = Inf | Sup | InfEq | SupEq | Eq | NotEq | AndLog | OrLog
+and logicalOp =
+  | Inf
+  | Sup
+  | InfEq
+  | SupEq
+  | Eq
+  | NotEq
+  | (* <=> *) Spaceship
+  | AndLog
+  | OrLog
+
 and assignOp = SimpleAssign of tok | OpAssign of arithOp wrap
 
 (* less: migrate to AST_generic_.incr_decr? *)
@@ -407,6 +459,7 @@ and stmt =
   | If of
       tok
       * tok (* 'constexpr' *) option
+      (* The `decl` below is the "initializer" of the if. *)
       * condition_clause paren
       * stmt
       * (tok * stmt) option
@@ -423,6 +476,7 @@ and stmt =
   | Jump of jump * sc
   (* labeled *)
   | Label of a_label * tok (* : *) * stmt
+  | LabelDecl of a_label * tok (* : *) * decl
   (* TODO: only inside Switch in theory *)
   | Case of tok * expr * tok (* : *) * case_body
   (* gccext: *)
@@ -430,28 +484,55 @@ and stmt =
   | Default of tok * tok (* : *) * case_body
   (* c++ext: *)
   | Try of tok * compound * handler list
+  (* co_return and co_yield *)
+  | CoStmt of co_operator wrap * expr option
+  | AsmStmt of tok * assembler bracket * sc
+  (* Microsoft-specific:
+     https://learn.microsoft.com/en-us/cpp/cpp/try-finally-statement?view=msvc-170
+  *)
+  | MsTry of tok (* "__try__" *) * compound * ms_try_handler
+  | MsLeave of tok (* "__leave" *)
   (* old: c++ext: gccext: there was a DeclStmt and NestedFunc before, but they
    * are now handled by stmt_or_decl *)
   | StmtTodo of todo_category * stmt list
 
+and ms_try_handler =
+  | MsExcept of tok (* "__except" *) * expr paren * compound
+  | MsFinally of tok (* "__finally" *) * compound
+
+(* c++ext: *)
+and co_operator = Co_return | Co_yield
 and expr_stmt = expr option * sc
 
-and condition_clause =
+and condition_initializer =
+  | InitVarsDecl of vars_decl
+  | InitExprStmt of expr_stmt
+  | InitUsing of using
+
+and condition_subject =
   | CondClassic of expr
   (* c++ext: *)
-  | CondDecl of vars_decl * expr
-  | CondStmt of expr_stmt * expr
   (* TODO? can have also StructuredBinding? switch to onedecl? *)
   | CondOneDecl of var_decl (* vinit always Some *)
 
+and condition_clause = condition_initializer option * condition_subject
+
 and for_header =
   | ForClassic of a_expr_or_vars * expr option * expr option
-  (* c++0x? TODO: var_decl can be DStructrured_binding with vinit = None  *)
-  | ForRange of var_decl (* vinit = None *) * tok (*':'*) * initialiser
+  | ForRange of
+      condition_initializer option (* since C++20 *)
+      * declaration_binding
+      * tok (*':'*)
+      * initialiser
   (* sgrep-ext: *)
   | ForEllipsis of tok (* ... *)
 
-and a_expr_or_vars = (expr_stmt, vars_decl) Common.either
+(** A variable declaration's single name or full structured binding. *)
+and declaration_binding =
+  | BindingName of type_ * entity
+  | BindingStructured of type_ * (ident * ident list) bracket
+
+and a_expr_or_vars = (expr_stmt, vars_decl) Either_.t
 and a_label = string wrap
 
 and jump =
@@ -475,6 +556,24 @@ and case_body = stmt_or_decl list
 (* c++ext: *)
 and handler = tok (* 'catch' *) * exception_declaration paren * compound
 and exception_declaration = ExnDecl of parameter
+
+(*****************************************************************************)
+(* Assembler *)
+(*****************************************************************************)
+(* GCC has "extended asm" syntax, which allows you to interface with the
+   assembler.
+   https://gcc.gnu.org/onlinedocs/gcc/Extended-Asm.html
+*)
+and assembler = {
+  (* Should only be a literal string or ConcatString *)
+  a_template : expr;
+  a_outputs : expr asm_operand list;
+  a_inputs : expr asm_operand list;
+  a_clobbers : expr list;
+  a_gotos : ident list;
+}
+
+and 'a asm_operand = ident bracket option * ident * 'a bracket
 
 (*****************************************************************************)
 (* Stmt or Decl *)
@@ -529,15 +628,17 @@ and decl =
   | DeclList of vars_decl
   | Func of func_definition
   (* c++ext: *)
-  | TemplateDecl of tok * template_parameters * decl
+  | TemplateDecl of
+      tok * template_parameters * (* requires *) expr option * decl
   | TemplateInstanciation of tok (* 'template' *) * var_decl (*vinit=None*) * sc
   (* c++ext: using namespace *)
   | UsingDecl of using
   (* pfff-only: but should be added to ts too *)
   | NamespaceAlias of
       tok (*'namespace'*) * ident * tok (*=*) * a_namespace_name * sc
-  (* the list can be empty *)
-  | Namespace of tok * ident option * declarations
+  (* the namespace can be unnamed *)
+  | Namespace of tok * name option * declarations
+  | NamespaceAttributed of tok * attribute * name option * declarations
   (* the list can be empty *)
   | ExternDecl of tok * string wrap (* usually "C" *) * decl
   | ExternList of tok * string wrap * declarations
@@ -545,6 +646,10 @@ and decl =
   | Asm of tok * tok option (*volatile*) * asmbody paren * sc
   (* c++0x?: tsonly: at toplevel or in class *)
   | StaticAssert of tok * argument list paren (* last args are strings *)
+  (* since c++20 *)
+  | Concept of tok (*'concept'*) * ident * tok (*'='*) * expr * sc
+  | Friend of tok (* 'friend' *) * decl (* Func or DeclList *)
+  | ConstexprFriend of tok (* 'constexpr' *) * tok (* 'friend' *) * decl
   (* gccext: allow redundant ';' *)
   | EmptyDef of sc
   | NotParsedCorrectly of tok list
@@ -615,7 +720,14 @@ and initialiser =
 
 (* ex: [2].y = x,  or .y[2]  or .y.x. They can be nested *)
 and designator =
-  | DesignatorField of tok (* . *) * ident
+  (* This token is an option, because an alternate (but equivalent) form
+     (deprecated since GCC 2.5) looks like
+     { y: yvalue }
+      instead of
+     { .y = yvalue }
+     https://gcc.gnu.org/onlinedocs/gcc/Designated-Inits.html
+  *)
+  | DesignatorField of tok (* . *) option * ident
   | DesignatorIndex of expr bracket
   | DesignatorRange of (expr * tok (*...*) * expr) bracket
 
@@ -655,6 +767,7 @@ and functionType = {
   (* c++ext: *)
   ft_const : tok option; (* only for methods, TODO put in attribute? *)
   ft_throw : exn_spec list;
+  ft_requires : expr option;
 }
 
 and parameter =
@@ -684,7 +797,7 @@ and exn_spec =
   | Noexcept of tok * a_const_expr option paren option
 
 and function_body =
-  | FBDef of compound
+  | FBDef of function_definition_body
   (* TODO? FBDefCtor of field_initializer * compound *)
   (* TODO: prototype, but can also be hidden in a DeclList! *)
   | FBDecl of sc
@@ -694,6 +807,14 @@ and function_body =
   | FBDefault of tok (* '=' *) * tok (* 'default' *) * sc
   (* c++11: deleted functions *)
   | FBDelete of tok (* '=' *) * tok (* 'delete' *) * sc
+  (* c++11: function try block
+     https://en.cppreference.com/w/cpp/language/function-try-block
+  *)
+  | FBTry of tok * function_definition_body * handler list
+
+and function_definition_body =
+  | Normal of compound
+  | Constr of (name * obj_init) list * compound
 
 and lambda_definition = lambda_capture list bracket * function_definition
 
@@ -710,7 +831,7 @@ and enum_definition = {
   enum_kind : tok; (* 'enum'  TODO also enum class/struct *)
   enum_name : name option;
   (* TODO: enum_base: *)
-  enum_body : enum_elem list brace;
+  enum_body : enum_elem sequencable list brace;
 }
 
 and enum_elem = { e_name : ident; e_val : (tok (*=*) * a_const_expr) option }
@@ -746,7 +867,6 @@ and base_clause = {
 and class_member =
   (* could put outside and take class_member list *)
   | Access of access_spec wrap * tok (*:*)
-  | Friend of tok (* 'friend' *) * decl (* Func or DeclList *)
   | QualifiedIdInClass of name (* ?? *) * sc
   (* valid declarations in class_member:
    * DeclList/Func(for methods)/TemplateDecl/UsingDecl/EmptyDef/...
@@ -802,6 +922,7 @@ and modifier =
   | MsCall of string wrap (* msext: e.g., __cdecl, __stdcall *)
   (* c++ext: just for constructor *)
   | Explicit of tok (* 'explicit' *) * expr paren option
+  | AlignAs of tok (* 'alignas' *) * argument bracket
 
 (* used in inheritance spec (base_clause) and class_member *)
 and access_spec = Public | Private | Protected
@@ -816,6 +937,15 @@ and type_qualifier =
   (* c++ext? *)
   | Mutable
   | Constexpr
+  | Constinit
+  | Consteval
+  | NoReturn
+  | Nonnull
+  | StaticArray
+  | MsCallQualifier of string wrap
+  | AlignAsQualifier of argument bracket
+  (* https://stackoverflow.com/questions/5323478/how-to-use-extension-and-typeof-in-a-minified-example-in-c *)
+  | Extension
 
 and storage =
   (* only in C, in C++ auto is for TAuto *)
@@ -825,6 +955,8 @@ and storage =
   | Extern
   (* c++0x? *)
   | StoInline
+  (* since C++11 *)
+  | ThreadLocal
 (* Friend ???? Mutable? *)
 
 (* only in declarator (not in abstract declarator) *)
@@ -854,6 +986,9 @@ and using_kind =
    * 'typedef void ( * PFD)(double);'
    * tsonly: type_ is usually just a name *)
   | UsingAlias of ident * tok (*'='*) * type_
+  (* since c++20
+     https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2019/p1099r5.html *)
+  | UsingEnum of tok (*'enum'*) * a_ident_name
 
 (*****************************************************************************)
 (* Cpp *)
@@ -902,6 +1037,7 @@ and a_cppExpr = expr
 
 (* ------------------------------------------------------------------------- *)
 (* cppext: #ifdefs *)
+(* coupling: this is the same as in Ast_c! *)
 (* ------------------------------------------------------------------------- *)
 and 'a sequencable =
   | X of 'a
@@ -1013,6 +1149,13 @@ let expr_to_arg e = Arg e
 (* often used for fake return type for constructor *)
 let tvoid ii = (nQ, TPrimitive (TVoid, ii))
 
+(* TODO: reuse Tok API? *)
+let get_original_token_location = function
+  | Tok.OriginTok pi -> pi
+  | Tok.ExpandedTok (pi, _) -> pi
+  | Tok.FakeTok (_, _) -> raise (Tok.NoTokenLocation "FakeTok")
+  | Tok.Ab -> raise (Tok.NoTokenLocation "Ab")
+
 (* When want add some info in AST that does not correspond to
  * an existing C element.
  * old: when don't want 'synchronize' on it in unparse_c.ml
@@ -1020,22 +1163,15 @@ let tvoid ii = (nQ, TPrimitive (TVoid, ii))
  * used by parsing hacks
  *)
 let make_expanded ii =
-  let noVirtPos =
-    ({ Parse_info.str = ""; charpos = 0; line = 0; column = 0; file = "" }, -1)
-  in
-  let a, b = noVirtPos in
-  {
-    ii with
-    Parse_info.token =
-      Parse_info.ExpandedTok
-        (Parse_info.get_original_token_location ii.Parse_info.token, a, b);
-  }
+  let loc = get_original_token_location ii in
+  let virt_loc = (loc, -1) in
+  Tok.ExpandedTok (loc, virt_loc)
 
-let make_param ?(p_name = None) ?(p_specs = []) ?(p_val = None) t =
+let make_param ?p_name ?(p_specs = []) ?p_val t =
   { p_name; p_type = t; p_specs; p_val }
 
 (* used by parsing hacks *)
-let rewrap_pinfo pi ii = { ii with Parse_info.token = pi }
+let rewrap_pinfo pi _ii = pi
 
 (* used while migrating the use of 'string' to 'name' in check_variables *)
 let (string_of_name_tmp : name -> string) =
@@ -1056,6 +1192,7 @@ let (ii_of_id_name : name -> tok list) =
     | IdConverter (_tok, _ft) -> failwith "ii_of_id_name: IdConverter"
     | IdDestructor (tok, (_s, ii)) -> [ tok; ii ]
     | IdTemplated (x, _args) -> ident_or_op x
+    | IdDeref _ -> failwith "ii_of_id_name: IdDeref"
   in
   ident_or_op id
 
@@ -1074,6 +1211,8 @@ let (ii_of_name : name -> tok) =
     | IdConverter (tok, _ft) -> tok
     | IdDestructor (tok, (_s, _ii)) -> tok
     | IdTemplated (x, _args) -> ident_or_op x
+    (* TODO? *)
+    | IdDeref _ -> failwith "ii_of_name: IdDeref"
   in
   ident_or_op id
 

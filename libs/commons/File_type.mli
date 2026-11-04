@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2022-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 type file_type =
   | PL of pl_type
   | Obj of string
@@ -8,6 +20,7 @@ type file_type =
   | Media of media_type
   | Archive of string
   | Other of string
+[@@deriving yojson]
 
 and pl_type =
   | OCaml of string
@@ -26,6 +39,7 @@ and pl_type =
   | Csharp
   | ObjectiveC of string
   | Swift
+  | Julia
   | Perl
   | Python
   | Ruby
@@ -34,19 +48,34 @@ and pl_type =
   | Erlang
   | Go
   | Rust
+  | Move
   | Beta
   | Pascal
-  | Web of webpl_type
   | Haxe
-  | Opa
-  | Flash
   | Bytecode of string
   | Asm
-  | Thrift
+  | Web of webpl_type
+  | IDL of idl_type
   | MiscPL of string
+  | Elixir
+  | Dart
+[@@deriving yojson]
 
-and config_type = Makefile | Json | Jsonnet | Yaml | HCL
-and lisp_type = CommonLisp | Elisp | Scheme | Clojure
+and config_type =
+  | Makefile
+  | Dockerfile
+  | Json
+  | Jsonnet
+  | Properties
+  | Ignore of string
+  | RC of string
+  | Yaml
+  | Terraform
+  | Sexp
+  | Toml
+[@@deriving yojson]
+
+and lisp_type = CommonLisp | Elisp | Scheme | Clojure [@@deriving yojson]
 
 and webpl_type =
   | Php of string
@@ -56,21 +85,27 @@ and webpl_type =
   | Coffee
   | Vue
   | Css
+  | Scss
   | Html
   | Xml
+  | Opa
+  | Flash
   | Sql
+[@@deriving yojson]
+
+and idl_type = Thrift | ATD | Protobuf [@@deriving yojson]
 
 and media_type = Sound of string | Picture of string | Video of string
+[@@deriving yojson]
 
-val file_type_of_file : Common.filename -> file_type
-val is_textual_file : Common.filename -> bool
-val is_syncweb_obj_file : Common.filename -> bool
-val is_json_filename : Common.filename -> bool
+(* main entry point *)
+val file_type_of_file : Fpath.t -> file_type
 
-val files_of_dirs_or_files :
-  (file_type -> bool) -> Common.filename list -> Common.filename list
+(* is_xxx helpers *)
+val is_textual_file : Fpath.t -> bool
+val is_json_filename : Fpath.t -> bool
+val is_syncweb_obj_file : Fpath.t -> bool
+val files_of_dirs_or_files : (file_type -> bool) -> Fpath.t list -> Fpath.t list
 
 (* specialisations *)
-val webpl_type_of_file : Common.filename -> webpl_type option
-
-(* val string_of_pl: pl_kind -> string *)
+val webpl_type_of_file : Fpath.t -> webpl_type option

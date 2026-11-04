@@ -28,10 +28,10 @@
 (* Tokens (leaves) *)
 (*****************************************************************************)
 
-(* same than in AST_jsonnet.ml
+(* Same types than in AST_jsonnet.ml
  * TODO: handle origin of file to track imports
  *)
-type tok = Parse_info.t [@@deriving show]
+type tok = Tok.t [@@deriving show]
 type 'a wrap = 'a * tok [@@deriving show]
 type 'a bracket = tok * 'a * tok [@@deriving show]
 type todo_kind = string wrap [@@deriving show]
@@ -46,16 +46,15 @@ type ident = string wrap [@@deriving show]
 (* Expr *)
 (*****************************************************************************)
 
-(* We could use a record for expressions like we do in AST_generic.
+(* Core expressions: No Array slices, no complex Array or Object comprehension,
+ * no DotAccess (use generalized ArrayAccess), no Assert, no ParenExpr,
+ * no Import (expanded during desugaring).
+ *
+ * alt: we could use a record for expressions like we do in AST_generic.
  * Such a record could become useful for example to store the types of
  * each expressions for Check_jsonnet.ml, but probably we can
  * make such a typechecker in a compositional way without having to modify
  * record fields.
- *
- * no Array slices, no complex Array or Object comprehension,
- * no DotAccess (use generalized ArrayAccess), no Assert, no ParenExpr,
- * no Import (expanded during desugaring).
- * TODO? add Import that resolves lazily during Eval?
  *)
 type expr =
   | L of AST_jsonnet.literal
@@ -77,6 +76,7 @@ type expr =
   | Lambda of function_definition
   (* builtins *)
   | Error of tok (* 'error' *) * expr
+  (* TODO: what are constructs not yet handled? list them *)
   | ExprTodo of todo_kind * AST_jsonnet.expr
 
 (* ------------------------------------------------------------------------- *)
@@ -165,7 +165,3 @@ and for_comp = tok (* 'for' *) * ident * tok (* 'in' *) * expr
 (*****************************************************************************)
 
 type program = expr [@@deriving show]
-
-(*****************************************************************************)
-(* Helpers *)
-(*****************************************************************************)

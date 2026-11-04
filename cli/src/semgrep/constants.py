@@ -1,21 +1,33 @@
+#
+# Copyright (c) 2020-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import re
 from enum import auto
 from enum import Enum
-from typing import Type
 
+import semgrep.semgrep_interfaces.semgrep_output_v1 as out
 
 RULES_KEY = "rules"
+MISSED_KEY = "missed"  # The number of Pro rules missed out on
 ID_KEY = "id"
 CLI_RULE_ID = "-"
-PLEASE_FILE_ISSUE_TEXT = "An error occurred while invoking the Semgrep engine. Please help us fix this by creating an issue at https://github.com/returntocorp/semgrep"
+PLEASE_FILE_ISSUE_TEXT = "An error occurred while invoking the Semgrep engine. Please help us fix this by creating an issue at https://github.com/semgrep/semgrep"
 
-DEFAULT_SEMGREP_CONFIG_NAME = "semgrep"
-DEFAULT_CONFIG_FILE = f".{DEFAULT_SEMGREP_CONFIG_NAME}.yml"
-DEFAULT_CONFIG_FOLDER = f".{DEFAULT_SEMGREP_CONFIG_NAME}"
 DEFAULT_SEMGREP_APP_CONFIG_URL = "api/agent/deployments/scans/config"
 
-DEFAULT_TIMEOUT = 30  # seconds
-DEFAULT_MAX_MEMORY_DEEP_CI = 5000  # MiB
+# coupling: keep defaults up-to-date with Scan_CLI.ml and User_settings.ml
+DEFAULT_TIMEOUT = 5  # seconds,
+DEFAULT_PRO_TIMEOUT_CI = 10800  # seconds
+DEFAULT_MAX_MEMORY_PRO_CI = 8 * 1024  # MiB
 
 SETTINGS_FILENAME = "settings.yml"
 
@@ -27,6 +39,22 @@ FIXTEST_SUFFIX = ".fixed"
 RETURNTOCORP_LEVER_URL = "https://api.lever.co/v0/postings/returntocorp?mode=json"
 
 UNSUPPORTED_EXT_IGNORE_LANGS = {"generic", "regex"}
+
+
+# Coupling: If a new policy is added in configuring/Memory_policy, it needs to
+# be reflected here.
+class MemoryPolicy(Enum):
+    AGGRESSIVE = auto()
+    BALANCED = auto()
+    NO_DISK_CACHE = auto()
+
+    @property
+    def cli_value(self) -> str:
+        return self.name.lower()
+
+    @classmethod
+    def all_policies(cls) -> str:
+        return ", ".join(p.cli_value for p in cls)
 
 
 class OutputFormat(Enum):
@@ -43,22 +71,12 @@ class OutputFormat(Enum):
         return self in [OutputFormat.JSON, OutputFormat.SARIF]
 
 
-# Ensure consistency with 'severity' in 'rule_schema_v1.yaml'
-class RuleSeverity(Enum):
-    INFO = "INFO"
-    WARNING = "WARNING"
-    ERROR = "ERROR"
-    INVENTORY = "INVENTORY"
-    EXPERIMENT = "EXPERIMENT"
-
-    @classmethod
-    def _missing_(cls: Type[Enum], value: object) -> Enum:
-        if not isinstance(value, str):
-            raise TypeError(f"invalid rule severity type: {type(value)}")
-        for member in cls:
-            if member.value.lower() == value:
-                return member
-        raise ValueError(f"invalid rule severity value: {value}")
+class RuleScanSource(Enum):
+    unannotated = auto()
+    unchanged = auto()
+    new_version = auto()
+    new_rule = auto()
+    previous_scan = auto()
 
 
 RULE_ID_RE_STR = r"(?:[:=][\s]?(?P<ids>([^,\s](?:[,\s]+)?)+))?"
@@ -102,16 +120,29 @@ NOSEM_PREVIOUS_LINE_RE = re.compile(
 
 COMMA_SEPARATED_LIST_RE = re.compile(r"[,\s]")
 
-MAX_LINES_FLAG_NAME = "--max-lines-per-finding"
 DEFAULT_MAX_LINES_PER_FINDING = 10
 BREAK_LINE_WIDTH = 80
 BREAK_LINE_CHAR = "-"
 BREAK_LINE = BREAK_LINE_CHAR * BREAK_LINE_WIDTH
 
-MAX_CHARS_FLAG_NAME = "--max-chars-per-line"
 DEFAULT_MAX_CHARS_PER_LINE = 160
 ELLIPSIS_STRING = " ... "
+
+# Must be kept in sync w/ osemgrep
+# coupling: src/targeting/Find_targets.ml default_conf.max_target_bytes
 DEFAULT_MAX_TARGET_SIZE = 1000000  # 1 MB
+
+# Number of entries (rules, targets) beyond we're not logging anymore
+# coupling: with Output.ml
+DEFAULT_MAX_LOG_LIST_ENTRIES = 100
+TOO_MUCH_DATA = "<SKIPPED DATA (too many entries; use --max-log-list-entries)>"
+
+# Maximum total characters of match context (the source lines around a match)
+# to include in output. Prevents minified JS from producing enormous output.
+# 0 means unlimited.
+# coupling: with Output.ml
+DEFAULT_MAX_MATCH_CONTEXT_SIZE = 0
+TOO_MUCH_CONTEXT = "... [truncated; adjust with --max-match-context-size]"
 
 
 class Colors(Enum):
@@ -120,11 +151,21 @@ class Colors(Enum):
     white = 7
     black = 256
     cyan = "cyan"  # for filenames
+    gray = "bright_black"  # for commands
     green = "green"  # for autofix
     yellow = "yellow"  # TODO: benchmark timing output?
     red = "red"  # for errors
     bright_blue = "bright_blue"  # TODO: line numbers?
-
+    magenta = "magenta"
     # these colors ignore user's terminal theme
     forced_black = 16  # #000
     forced_white = 231  # #FFF
+
+
+# Maps from product names used in our ATD files to product names
+# used in as command line options that users are more familiar with.
+USER_FRIENDLY_PRODUCT_NAMES = {
+    out.Product(out.SAST()): "code",
+    out.Product(out.SCA()): "supply-chain",
+    out.Product(out.Secrets()): "secrets",
+}

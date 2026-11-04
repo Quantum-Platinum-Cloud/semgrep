@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2022-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (*****************************************************************************)
 (* types *)
 (*****************************************************************************)
@@ -10,17 +22,24 @@ type language = C | Cplusplus
 
 let macros_h =
   ref
-    (Filename.concat (*Config_pfff.path_pfff_home*) ""
-       "/data/cpp_stdlib/macros.h")
+    (Fpath.v
+       (match Sys.win32 with
+       (* Windows doesn't like paths that start with / *)
+       (* So provide a default path that may exist in windows *)
+       | true -> "C:/Program Files/LLVM/include/c++/v1/macros.h"
+       | false -> "/data/cpp_stdlib/macros.h"))
 
 let cmdline_flags_macrofile () =
-  [ ("-macros", Arg.Set_string macros_h, " <file> list of macros to expand") ]
+  [
+    ( "-macros",
+      Arg.String (fun s -> macros_h := Fpath.v s),
+      " <file> list of macros to expand" );
+  ]
 
 (*****************************************************************************)
 (* verbose *)
 (*****************************************************************************)
 
-let verbose_pp_ast = ref false
 let filter_msg = ref false
 let filter_classic_passed = ref false
 let filter_define_error = ref true
@@ -29,10 +48,12 @@ let filter_define_error = ref true
 (* debugging *)
 (*****************************************************************************)
 
+(* TODO: switch to Log_parser_cpp, or design new Log srcs for each of those
+ * category
+ *)
 let debug_typedef = ref true
 let debug_pp = ref true
 let debug_cplusplus = ref true
-let debug_pp_ast = ref false
 
 let cmdline_flags_debugging () =
   [
@@ -47,11 +68,3 @@ let cmdline_flags_debugging () =
           debug_cplusplus := true),
       " " );
   ]
-
-(*****************************************************************************)
-(* Disable parsing features *)
-(*****************************************************************************)
-
-let strict_lexer = ref false
-let if0_passing = ref true
-let ifdef_to_if = ref false

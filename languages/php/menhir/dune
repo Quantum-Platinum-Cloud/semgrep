@@ -3,8 +3,10 @@
  (name parser_php_menhir)
  (wrapped false)
  (libraries
+   base
+   collections
    commons
-   pfff-h_program-lang
+   lib_parsing
    parser_php.ast
  )
  (preprocess (pps ppx_deriving.show))

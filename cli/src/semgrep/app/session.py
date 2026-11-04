@@ -1,5 +1,18 @@
+#
+# Copyright (c) 2022-2024 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import os
 import subprocess
+from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from typing import Any
 from typing import Optional
@@ -11,6 +24,8 @@ from attrs import define
 from attrs import field
 
 from semgrep import __VERSION__
+from semgrep import telemetry
+from semgrep.util import is_semgrep_url
 
 
 @define
@@ -117,7 +132,8 @@ class AppSession(requests.Session):
     The following features are added over the base Session class:
     - A default retrying policy is added to each request
     - A User-Agent is automatically added to each request
-    - A default timeout of 30 seconds is added to each request
+    - Request IDs are automatically added to each request
+    - A default timeout of 70 seconds is added to each request
     - If a token is available, it is added to the request as an Authorization header
 
     Normal usage:
@@ -139,15 +155,25 @@ class AppSession(requests.Session):
         super().__init__(*args, **kwargs)
         self.user_agent = UserAgent()
         self.token: Optional[str] = None
+        if os.getenv("SEMGREP_COOKIES_PATH"):
+            cookies = MozillaCookieJar(os.environ["SEMGREP_COOKIES_PATH"])
+            cookies.load()
+            self.cookies = cookies  # type: ignore
 
-        # retry after 4, 8, 16 seconds
+        # retry after 16, 32, 64 seconds (extended from a 4x backoff factor to
+        # help while we migrate to a fully async API).
+        #
+        # coupling: semgrep-app: scan.py.deduplicate_multiple_requests_same_uuid:
+        # the threshold for `current_attempt_number` is coupled with the total
+        # number of requests (initial + 3 retries) we make here, so increasing
+        # the number of retries here without adjusting the limit there will
+        # cause `GatewayTimeout`s to be returned.
         retry_adapter = requests.adapters.HTTPAdapter(
             max_retries=urllib3.Retry(
                 total=3,
-                backoff_factor=4,
-                other=0,
+                backoff_factor=16,
                 allowed_methods=["GET", "POST"],
-                status_forcelist=(413, 429, 500, 502, 503),
+                status_forcelist=(413, 429, 500, 502, 503, 504),
             ),
         )
 
@@ -164,17 +190,34 @@ class AppSession(requests.Session):
         metrics = get_state().metrics
         metrics.add_token(self.token)
 
+    @property
+    def is_authenticated(self) -> bool:
+        return self.token is not None
+
+    @telemetry.trace()
     def request(self, *args: Any, **kwargs: Any) -> requests.Response:
-        kwargs.setdefault("timeout", 60)
+        kwargs.setdefault(
+            "timeout", 70
+        )  # most backend endpoints are 60s, ideally we have the backend time out before the client
         kwargs.setdefault("headers", {})
+
+        from semgrep.state import get_state  # avoid circular imports
+
+        state = get_state()
+        method, url = args
+
         kwargs["headers"].setdefault("User-Agent", str(self.user_agent))
-        if self.token:
+        kwargs["headers"].setdefault("X-Semgrep-Scan-ID", str(state.local_scan_id))
+
+        # saf-2051: attach semgrep token if we are able to deterimine URL
+        # is 1st party
+        #
+        # TODO: this logic is copied from `config_resolver.py`, we should
+        # refactor such that the logic is shared
+        if self.token and is_semgrep_url(url, state.env.semgrep_url):
             kwargs["headers"].setdefault("Authorization", f"Bearer {self.token}")
 
-        from semgrep.state import get_state
-
-        error_handler = get_state().error_handler
-        method, url = args
+        error_handler = state.error_handler
         error_handler.push_request(method, url, **kwargs)
         try:
             response = super().request(*args, **kwargs)

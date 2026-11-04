@@ -54,7 +54,7 @@ let (mk_visitor : visitor_in -> visitor_out) =
   let rec v_info x =
     let k x =
       match x with
-      | { Parse_info.token = _v_pinfox; transfo = _v_transfo } ->
+      | _ ->
           (*
     let arg = Parse_info.v_pinfo v_pinfox in
     let arg = v_unit v_comments in
@@ -73,7 +73,9 @@ let (mk_visitor : visitor_in -> visitor_out) =
    fun of_a (v1, v2, v3) ->
     let v1 = v_info v1 and v2 = of_a v2 and v3 = v_info v3 in
     ()
-  and v_name v = v_wrap v_string v
+  and v_name (v : a_ident) =
+    let _ = v_string v.str and _ = v_info v.tok in
+    ()
   and v_ident x = v_name x
   and v_filename v = v_wrap v_string v
   and v_special = function
@@ -209,6 +211,12 @@ let (mk_visitor : visitor_in -> visitor_out) =
       | Obj v1 ->
           let v1 = v_obj_ v1 in
           ()
+      | Instantiation (v1, v2) ->
+          let v1 = v_expr v1 and v2 = v_bracket (v_list v_type_) v2 in
+          ()
+      | Satisfies (v1, v2, v3) ->
+          let v1 = v_expr v1 and v2 = v_tok v2 and v3 = v_type_ v3 in
+          ()
       | Ellipsis v1 ->
           let v1 = v_tok v1 in
           ()
@@ -230,8 +238,10 @@ let (mk_visitor : visitor_in -> visitor_out) =
       | Fun (v1, v2) ->
           let v1 = v_function_definition v1 and v2 = v_option v_name v2 in
           ()
-      | Apply (v1, v2) ->
-          let v1 = v_expr v1 and v2 = v_bracket (v_list v_expr) v2 in
+      | Apply (v1, v2, v3) ->
+          let v1 = v_expr v1
+          and v2 = v_bracket (v_list v_type_) v2
+          and v3 = v_bracket (v_list v_expr) v3 in
           ()
       | New (t, v1, v2) ->
           let t = v_tok t in
@@ -240,9 +250,17 @@ let (mk_visitor : visitor_in -> visitor_out) =
       | Arr v1 ->
           let v1 = v_bracket (v_list v_expr) v1 in
           ()
-      | Conditional (v1, v2, v3) ->
-          let v1 = v_expr v1 and v2 = v_expr v2 and v3 = v_expr v3 in
+      | Conditional (v1, t1, v2, t2, v3) ->
+          let v1 = v_expr v1
+          and t1 = v_tok t1
+          and v2 = v_expr v2
+          and t2 = v_tok t2
+          and v3 = v_expr v3 in
           ()
+      | ParenExpr (v1, v2, v3) ->
+          v_tok v1;
+          v_expr v2;
+          v_tok v3
     in
     vin.kexpr (k, all_functions) x
   and v_stmt x =
@@ -349,7 +367,6 @@ let (mk_visitor : visitor_in -> visitor_out) =
         let v1 = v_stmt v1 in
         ()
   and v_dot_operator _ = ()
-  and v_resolved_name _ = ()
   and v_def (ent, defkind) =
     v_entity ent;
     v_definition_kind defkind
@@ -386,7 +403,7 @@ let (mk_visitor : visitor_in -> visitor_out) =
       } =
     v_wrap v_function_kind f_kind;
     let arg = v_list v_attribute v_f_props in
-    let arg = v_list v_parameter_binding v_f_params in
+    let arg = v_bracket (v_list v_parameter_binding) v_f_params in
     let arg = v_stmt v_f_body in
     v_option v_type_ f_rettype;
     ()
@@ -430,8 +447,8 @@ let (mk_visitor : visitor_in -> visitor_out) =
   and v_keyword_attribute _ = ()
   and v_class_kind _ = ()
   and v_parent = function
-    | Common.Left e -> v_expr e
-    | Common.Right t -> v_type_ t
+    | Either.Left e -> v_expr e
+    | Either.Right t -> v_type_ t
   and v_obj_ v = v_bracket (v_list v_property) v
   and v_class_definition
       {
@@ -504,7 +521,7 @@ let (mk_visitor : visitor_in -> visitor_out) =
         ()
     | ImportFile (t, v1) ->
         let t = v_tok t in
-        let v1 = v_name v1 in
+        let v1 = v_filename v1 in
         ()
     | ModuleAlias (t, v1, v2) ->
         let t = v_tok t in

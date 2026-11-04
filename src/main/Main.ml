@@ -1,5 +1,5 @@
 (*
- * The author disclaims copyright to this source code.  In place of
+ * The author disclaims copyright to this source file.  In place of
  * a legal notice, here is a blessing:
  *
  *    May you do good and not evil.
@@ -8,52 +8,120 @@
  *)
 
 (*****************************************************************************)
-(* Purpose *)
+(* Prelude *)
 (*****************************************************************************)
-(* A semantic grep.
+(* A SEMantic GREP.
  * See https://semgrep.dev/ for more information.
  *
- * Right now there is:
- *  - good support for: Python, Java, C#, Go, Ruby,
- *    Javascript (and JSX), Typescript (and TSX), JSON
- *  - partial support for: C, C++, PHP, OCaml, Kotlin, Scala, Rust, Lua,
- *    YAML, HTML, Vue, Bash, Docker
- *  - almost support for: R
+ * This is the entry point of the semgrep-core program used internally
+ * by pysemgrep, the entry point of osemgrep, and currently also the entry point
+ * of semgrep for windows. See also the ../../cli/bin/semgrep python wrapper
+ * script which is currently the real entry point of semgrep.
+ * LATER: when osemgrep is fully done we can just get rid of semgrep-core,
+ * osemgrep, the wrapper script, and have a single binary called 'semgrep'.
  *
- * opti: git grep foo | xargs semgrep -e 'foo(...)'
- *
- * related:
- *  - Structural Search and Replace (SSR) in Jetbrains IDE
+ * Related work using code patterns (from oldest to newest):
+ *  - Structural Search and Replace (SSR) in Jetbrains IDEs
  *    http://www.jetbrains.com/idea/documentation/ssr.html
  *    http://tv.jetbrains.net/videocontent/intellij-idea-static-analysis-custom-rules-with-structural-search-replace
- *  - gogrep: https://github.com/mvdan/gogrep/
- *  - ruleguard: https://github.com/quasilyte/go-ruleguard
- *    (use gogrep internally)
- *  - phpgrep: https://github.com/quasilyte/phpgrep
- *    https://github.com/VKCOM/noverify/blob/master/docs/dynamic-rules.md
+ *  - Coccinelle (the precursor of Semgrep) for C
+ *    https://coccinelle.gitlabpages.inria.fr/website/
+ *  - Sgrep (Syntactical GREP, another precursor of Semgrep) for PHP
+ *    https://github.com/facebook/pfff/wiki/Sgrep
+ *  - gogrep and ruleguard for Go
+ *    https://github.com/mvdan/gogrep/
+ *    https://github.com/quasilyte/go-ruleguard
+ *  - phpgrep for PHP
+ *    https://github.com/quasilyte/phpgrep
  *    https://speakerdeck.com/quasilyte/phpgrep-syntax-aware-code-search
+ *    https://github.com/VKCOM/noverify/blob/master/docs/dynamic-rules.md
+ *  - cgrep for C
+ *    http://awgn.github.io/cgrep/
+ *  - Comby for many languages
+ *    https://comby.dev/
+ *  - Weggli for C/C++ (inspired by Semgrep)
+ *    https://github.com/weggli-rs/weggli
+ *  - ASTgrep (inspired by Semgrep)
+ *    https://ast-grep.github.io/
+ *
+ * related AST search tools:
+ *  - "ASTLOG: A Language for Examining Abstract Syntax Trees"
+ *     https://www.usenix.org/legacy/publications/library/proceedings/dsl97/full_papers/crew/crew.pdf
  *  - rubocop pattern
- *    https://github.com/marcandre/rubocop/blob/master/manual/node_pattern.md
- *  - astpath, using XPATH on ASTs https://github.com/hchasestevens/astpath
- *  - ack http://beyondgrep.com/
- *  - cgrep http://awgn.github.io/cgrep/
+ *    https://docs.rubocop.org/rubocop-ast/node_pattern.html
+ *  - astpath, using XPATH on ASTs
+ *    https://github.com/hchasestevens/astpath
+ *
+ * related code search and indexing tools:
+ *  - "Tutorial on the C Information Abstraction System"
+ *     https://www2.eecs.berkeley.edu/Pubs/TechRpts/1987/CSD-87-327.pdf
+ *  - "JQuery: Finding your way through thangled code"
+ *     https://www.cs.ubc.ca/labs/spl/projects/jquery/papers.htm
+ *  - Codequery (from Pfff too)
+ *    https://github.com/facebookarchive/pfff/wiki/CodeQuery
+ *  - CodeQL (known previously as Semmle and before CodeQuest)
+ *    https://codeql.github.com/
+ *  - Kythe (sucessor of Grok by Steve Yegge at Google)
+ *    https://kythe.io/
+ *  - LSP the Language Server protocol
+ *    https://langserver.org/
+ *  - SCIP and LSIF by sourcegraph
+ *    https://github.com/sourcegraph/scip
+ *  - Glean
+ *    https://glean.software/
+ *  - many more (e.g., PQL)
+ *
+ * related grep-like tools:
+ *  - ack
+ *    http://beyondgrep.com/
+ *  - ripgrep
+ *    https://github.com/BurntSushi/ripgrep
  *  - hound https://codeascraft.com/2015/01/27/announcing-hound-a-lightning-fast-code-search-tool/
  *  - many grep-based linters (in Zulip, autodesk, bento, etc.)
- *
- * See also codequery for more structural queries.
- * See also old information at https://github.com/facebook/pfff/wiki/Sgrep.
  *)
 
 (*****************************************************************************)
 (* Entry point *)
 (*****************************************************************************)
-(* This is the entry point for semgrep-core stand-alone program.
- *
- * Most of the code in this file has been moved to core_cli/Core_CLI.ml,
- * which contains the main command line parsing logic. The code
- * was moved to Cli_lib, a library, so it can be used both for
- * the stand-alone semgrep-core binary as well as the semgrep_bridge.so
- * shared library.
- *)
 
-let () = Core_CLI.main Sys.argv
+(* Setup obackward for nice segfaults. This must run as early as possible so
+ * that even crashes during the rest of the initialization get a backtrace.
+ * Note that obackward must stay out of library code (e.g., commons) so that
+ * other binaries linking those libraries do not pull in its C++ stubs,
+ * which previously caused linking errors.
+ *)
+let () =
+  match Backward.register () with
+  | Error e ->
+      prerr_string e;
+      prerr_newline ();
+      flush stderr
+  | Ok () -> ()
+
+(* We currently use the same binary for semgrep-core and osemgrep. See 'make
+ * core' and './dune' install section. We use the argv[0] trick below to decide
+ * whether the user wants the semgrep-core or osemgrep behavior. *)
+let () =
+  Pyro_caml_instruments.maybe_with_memprof_sampler @@ fun () ->
+  let argv = Sys.argv in
+  let argv0 =
+    (* remove the possible ".exe" extension for Windows and ".bc" *)
+    Fpath.v argv.(0) |> Fpath.base |> Fpath.rem_ext |> Fpath.to_string
+  in
+  match argv0 with
+  (* osemgrep!! *)
+  | "osemgrep" ->
+      let exit_code = CLI.main argv in
+      if not (Exit_code.Equal.ok exit_code) then
+        Logs.info (fun m ->
+            m "Error: %s\nExiting with error status %i: %s\n%!"
+              exit_code.description exit_code.code
+              (String.concat " " (Array.to_list argv)));
+      Stdlib.exit exit_code.code
+  (* legacy semgrep-core *)
+  | _else_ ->
+      (* Added as part of the upgrade to OCaml 5. Under our typical workloads, this
+       * appears to yield similar performance to the default value of space_overhead
+       * under OCaml 4. *)
+      Gc.set { (Gc.get ()) with space_overhead = 40 };
+      Core_CLI.main argv

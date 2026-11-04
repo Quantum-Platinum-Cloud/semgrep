@@ -7,10 +7,11 @@
  (name pfff_lang_GENERIC_analyze)
  (wrapped false)
  (libraries
-   dyp
-
+   base
+   collections
    commons
    ast_generic
+   parallelism
    semgrep.core ; Lang
    semgrep.il
  )
@@ -18,6 +19,8 @@
     (pps
       ppx_profiling
       ppx_deriving.show
+      commons.ppx
+      telemetry.ppx
     )
  )
 )

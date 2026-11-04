@@ -3,9 +3,10 @@
  (name parser_ocaml_menhir)
  (wrapped false)
  (libraries
-
+   base
+   collections
    commons
-   pfff-h_program-lang
+   lib_parsing
    parser_ocaml.ast
  )
  (preprocess (pps ppx_deriving.show))

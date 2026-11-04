@@ -14,11 +14,9 @@
  * license.txt for more details.
  *)
 open Common
-
 open Parser_go
-module PI = Parse_info
 module Flag = Flag_parsing
-open AST_generic_ (* for LASOP *)
+open AST_generic (* for LASOP *)
 
 (*****************************************************************************)
 (* Prelude *)
@@ -35,8 +33,8 @@ open AST_generic_ (* for LASOP *)
 
 (* shortcuts *)
 let tok = Lexing.lexeme
-let tokinfo = Parse_info.tokinfo
-let error = Parse_info.lexical_error
+let tokinfo = Tok.tok_of_lexbuf
+let error = Parsing_error.lexical_error
 
 }
 
@@ -208,7 +206,7 @@ rule token = parse
       let buf = Buffer.create 127 in
       Buffer.add_string buf "/*";
       comment buf lexbuf;
-      TComment(info |> PI.rewrap_str (Buffer.contents buf))
+      TComment(info |> Tok.rewrap_str (Buffer.contents buf))
     }
 
   (* don't keep the trailing \n; it will be in another token *)
@@ -336,7 +334,7 @@ rule token = parse
   (* sgrep-ext: *)
   | '$' identifier
     { let s = tok lexbuf in
-      if not !Flag_parsing.sgrep_mode
+      if not (Hook.get Flag_parsing.sgrep_mode)
       then error ("identifier with dollar: "  ^ s) lexbuf;
       LNAME (s, tokinfo lexbuf)
     }
@@ -352,10 +350,10 @@ rule token = parse
   (* literals *)
   (* this is also part of int_lit, but we specialize it here to use the
    * right int_of_string *)
-  | "0" (octal_digits as n) { LINT (int_of_string_opt( "0o" ^ n), tokinfo lexbuf) }
+  | "0" (octal_digits as n) { LINT (Parsed_int.parse ( "0o" ^ n, tokinfo lexbuf)) }
 
   | int_lit as n
-      { LINT (int_of_string_opt n, tokinfo lexbuf) }
+      { LINT (Parsed_int.parse (n, tokinfo lexbuf)) }
 
   | float_lit as n
       { LFLOAT (float_of_string_opt n, tokinfo lexbuf) }

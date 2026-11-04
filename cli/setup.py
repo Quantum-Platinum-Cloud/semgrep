@@ -1,23 +1,66 @@
+#
+# Copyright (c) 2020-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 # type: ignore
-import os
 import platform
-import shutil
-import stat
+import subprocess
 import sys
 
 import setuptools
 
-SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_ROOT = os.path.dirname(SOURCE_DIR)
-BIN_DIR = "bin"
-PACKAGE_BIN_DIR = os.path.join(SOURCE_DIR, "src", "semgrep", BIN_DIR)
-SEMGREP_CORE_BIN = "semgrep-core"
-SEMGREP_CORE_BIN_ENV = "SEMGREP_CORE_BIN"
-SEMGREP_SKIP_BIN = "SEMGREP_SKIP_BIN" in os.environ
-SEMGREP_FORCE_INSTALL = "SEMGREP_FORCE_INSTALL" in os.environ
 IS_WINDOWS = platform.system() == "Windows"
+# See ../scripts/build-wheels.sh, which is called from our GHA workflows.
+# This script assumes the presence of a semgrep-core binary copied under
+# cli/src/semgrep/bin by the caller (the GHA workflow).
 WHEEL_CMD = "bdist_wheel"
 
+
+# coupling: this function is duplicated in src/semgrep/commands/install.py.
+# Deduplication would require setup.py to import from the semgrep package, which
+# is not ideal
+def linux_detect_libc():
+    try:
+        result = subprocess.run(
+            ["ldd", "--version"],
+            capture_output=True,
+            text=True,
+        )
+        # musl's ldd prints to stderr, glibc's ldd to stdout
+        out = result.stdout + result.stderr
+        if "musl" in out:
+            return "musl"
+    except Exception:
+        pass
+    return "glibc"
+
+
+# To prevent potential compatibility issues when mixing glibc and libmusl,
+# PyPI does not accept the default linux_x86_64 and linux_aarch64 platform
+# tags. We build semgrep on glibc and musl, so we must make sure we tag
+# each build as either glibc (manylinux) or musl (musllinux) compatible
+#
+# NOTE: semgrep-core is dynamically linked to the user's libc; the libc version
+# in these tags MUST match the libc version we use to build the binary, see:
+# musllinux: https://peps.python.org/pep-0656/
+# manylinux: https://peps.python.org/pep-0600/
+plat_libc_to_tag = {
+    ("linux_aarch64", "musl"): "musllinux_1_2_aarch64",
+    ("linux_x86_64", "musl"): "musllinux_1_2_x86_64",
+    ("linux_aarch64", "glibc"): "manylinux_2_34_aarch64",
+    ("linux_x86_64", "glibc"): "manylinux_2_34_x86_64",
+}
+
+
+cmdclass = {}
 
 if WHEEL_CMD in sys.argv:
     try:
@@ -32,140 +75,46 @@ if WHEEL_CMD in sys.argv:
 
         def get_tag(self):
             _, _, plat = bdist_wheel.get_tag(self)
-            python = "cp37.cp38.cp39.py37.py38.py39"
+
+            # For more information about python compatibility tags, check out:
+            # https://packaging.python.org/en/latest/specifications/platform-compatibility-tags/
+
+            # We support Python 3.10+
+            # coupling: if you drop support for some python, you'll probably
+            # have to update 'python_requires' at the end of this file
+            # and a few workflows as show for example in this PR:
+            # https://github.com/semgrep/semgrep-proprietary/pull/2606/files
+            # coupling: semgrep.libsonnet default_python_version
+            python = "cp310.cp311.cp312.cp313.cp314.py310.py311.py312.py313.py314"
+
+            # We don't require a specific Python ABI
             abi = "none"
-            if "macosx" in plat:
-                plat = "macosx_11_0_arm64" if "arm" in plat else "macosx_10_14_x86_64"
-            else:
-                plat = "any"
+
+            # we translate the default linux_<arch> platform tag to either
+            # musllinux_<ver>_<arch> or manylinux_<ver>_arch depending on which
+            # system we are on; see plat_libc_to_tag at the top of this file.
+            if plat.startswith("linux"):
+                lib = linux_detect_libc()
+                plat = plat_libc_to_tag[(plat, lib)]
+
+            # The macOS Python binary is sometimes a universal binary, which leads to a
+            # platform name of "macosx_xx_x_universal2" in the wheel tag. Unfortunately,
+            # our binary is not built as universal, so we must detect the architecture of
+            # the actual machine this is running on and clarify that we are only building
+            # for that one.
+            elif plat.startswith("macos") and "universal" in plat:
+                machine = platform.machine()
+                if machine == "x86_64":
+                    plat = "macosx_10_14_x86_64"
+                elif machine == "arm64":
+                    plat = "macosx_11_0_arm64"
+                else:
+                    raise Exception(f"Unrecognized macOS machine {machine!r}")
+
             return python, abi, plat
 
-    cmdclass = {WHEEL_CMD: BdistWheel}
-else:
-    cmdclass = {}
-
-if IS_WINDOWS and not SEMGREP_FORCE_INSTALL:
-    raise Exception(
-        "Semgrep does not support Windows yet, please try again with WSL "
-        "or visit the following for more information: "
-        "https://github.com/returntocorp/semgrep/issues/1330"
-    )
-
-try:
-    with open(os.path.join(REPO_ROOT, "README.md")) as f:
-        long_description = f.read()
-except FileNotFoundError:
-    long_description = "**SETUP: README NOT FOUND**"
-
-
-def find_executable(env_name, exec_name):
-    # First, check for an environment override
-    env_value = os.getenv(env_name)
-    if env_value:
-        return env_value
-
-    # Second, fallback to any system executable
-    which_name = shutil.which(exec_name)
-    if which_name is not None:
-        return which_name
-
-    raise Exception(
-        f"Could not find '{exec_name}' executable, tried '{env_name}' and system '{exec_name}'"
-    )
-
-
-#
-# The default behavior is to copy the semgrep-core binary
-# into some other folder known to the semgrep wrapper. If somebody knows why,
-# please explain why we do this.
-#
-# It makes testing of semgrep-core error-prone since recompiling
-# semgrep-core won't perform this copy. If we can't get rid of this, can
-# we use a symlink instead?
-#
-# The environment variable SEMGREP_SKIP_BIN bypasses this copy. What is it for?
-#
-if not SEMGREP_SKIP_BIN:
-    binaries = [
-        (SEMGREP_CORE_BIN_ENV, SEMGREP_CORE_BIN),
-    ]
-
-    for binary_env, binary_name in binaries:
-        src = find_executable(binary_env, binary_name)
-        dst = os.path.join(PACKAGE_BIN_DIR, binary_name)
-        # The semgrep-core executable doesn't have the write
-        # permission (because of something dune does?), and copyfile
-        # doesn't remove the destination file if it already exists
-        # but tries to truncate it, resulting in an error.
-        # So we remove the destination file first if it exists.
-        try:
-            os.remove(dst)
-        except OSError:
-            pass
-        shutil.copyfile(src, dst)
-        os.chmod(dst, os.stat(dst).st_mode | stat.S_IEXEC)
-
-install_requires = [
-    # versions must be manually synced:
-    # - cli/setup.py lists dependencies
-    # - cli/Pipfile lists type hint packages for dev env
-    # - .pre-commit-config.yaml's mypy hooks also list type hint packages
-    #
-    # These version are flexible so semgrep can coexist with other tools.
-    # Flexibility is achieved by, in order of preference:
-    # 1. x.0~= operator pinning to x major version
-    # 2. >=x,<y operator pinning to multiple major versions
-    "attrs>=21.3",
-    "boltons~=21.0",
-    "colorama~=0.4.0",
-    "click~=8.1",
-    "click-option-group~=0.5",
-    "glom~=22.1",
-    "requests~=2.22",
-    "ruamel.yaml>=0.16.0,<0.18",
-    "tqdm~=4.46",
-    "packaging~=21.0",
-    "jsonschema~=4.6",
-    "wcmatch~=8.3",
-    "peewee~=3.14",
-    "defusedxml~=0.7.1",
-    "urllib3~=1.26",
-    "typing-extensions~=4.2",
-    "python-lsp-jsonrpc~=1.0.0",
-    "tomli~=2.0.1",
-    "parsy~=2.0",
-]
-
-extras_require = {"experiments": ["jsonnet~=0.18"]}
+    cmdclass[WHEEL_CMD] = BdistWheel
 
 setuptools.setup(
-    name="semgrep",
-    version="1.3.0",
-    author="Return To Corporation",
-    author_email="support@r2c.dev",
-    description="Lightweight static analysis for many languages. Find bug variants with patterns that look like source code.",
     cmdclass=cmdclass,
-    install_requires=install_requires,
-    extras_require=extras_require,
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    url="https://github.com/returntocorp/semgrep",
-    entry_points={"console_scripts": ["semgrep=semgrep.__main__:main"]},
-    packages=setuptools.find_packages(where="src"),
-    package_dir={"": "src"},
-    package_data={"semgrep": [os.path.join(BIN_DIR, "*")]},
-    include_package_data=True,
-    classifiers=[
-        "Environment :: Console",
-        "License :: OSI Approved :: GNU Lesser General Public License v2 (LGPLv2)",
-        "Operating System :: MacOS",
-        "Operating System :: POSIX :: Linux",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
-        "Topic :: Security",
-        "Topic :: Software Development :: Quality Assurance",
-    ],
-    python_requires=">=3.7",
-    zip_safe=False,
 )

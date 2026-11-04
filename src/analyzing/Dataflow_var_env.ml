@@ -15,8 +15,8 @@
  *)
 
 module C = Dataflow_core
-module VarMap = Map.Make (String)
-module VarSet = Set.Make (String)
+module VarMap = Maps.String_map
+module VarSet = Sets.String_set
 
 (* The comparison function uses only the name of a variable (a string), so
  * two variables at different positions in the code will be agglomerated

@@ -1,7 +1,6 @@
-(* Yoann Padioleau
- * Iago Abal
+(* Yoann Padioleau, Iago Abal
  *
- * Copyright (C) 2019-2022 r2c
+ * Copyright (C) 2019-2022 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -18,66 +17,69 @@ module G = AST_generic
 (*****************************************************************************)
 (* Prelude *)
 (*****************************************************************************)
-(* Intermediate Language (IL) for static analysis.
- *
- * Just like for the CST -> AST, the goal of an AST -> IL transformation
- * is to simplify things even more for program analysis purposes.
- *
- * Here are the simplifications done compared to the generic AST:
- *  - intermediate 'instr' type (instr for instruction), for expressions with
- *    side effects and statements without any control flow,
- *    moving Assign/Seq/Call/Conditional out of 'expr' and
- *    moving Assert out of 'stmt'
- *  - new expression type 'exp' for side-effect free expressions
- *  - intermediate 'lvalue' type; expressions are split into
- *    lvalue vs regular expressions, moved Dot/Index out of expr
- *
- *  - Assign/Calls are now instructions, not expressions, and no more Seq
- *  - no AssignOp, or Decr/Incr, just Assign
- *  - Lambdas are now instructions (not nested again)
- *
- *  - no For/Foreach/DoWhile/While, converted all to Loop,
- *  - no Foreach, converted to a Loop and 2 new special
- *  - no Switch, converted to Ifs
- *  - no Continue/Break, converted to goto
- *  - less use of expr option (in Return/Assert/...), use Unit in those cases
- *
- *  - no Sgrep constructs
- *  - Naming has been performed, no more ident vs name
- *
- * TODO:
- *   - TODO? have all arguments of Calls be variables?
- *
- *
- * Note that we still want to be close to the original code so that
- * error reported on the IL can be mapped back to error on the original code
- * (source "maps"), or more importantly semantic information computed
- * on the IL (e.g., types, svalue, match range, taint) can be mapped back
- * to the generic AST.
- * This is why you will see some 'eorig', 'iorig' fields below and the use of
- * refs such as svalue shared with the generic AST.
- * TODO? alt: store just the range and id_info_id, so easy to propagate back
- * info to generic AST or to return match ranges to semgrep.
- *
- * history:
- *  - cst_php.ml (was actually called ast_php.ml)
- *  - ast_php.ml (was called ast_php_simple.ml)
- *  - pil.ml, still for PHP
- *  - IL.ml for AST generic
- *
- * related work:
- *  - CIL, C Intermediate Language, Necula et al, CC'00
- *  - RIL, The Ruby Intermediate Language, Furr et al, DLS'09
- *  - SIL? in Infer? or more a generic AST than a generic IL?
- *  - Rust IL?
- *  - C-- in OCaml? too low-level?
- *  - LLVM IR (but too far away from original code? complicated
- *    source maps)
- *  - BRIL https://capra.cs.cornell.edu/bril/ used for teaching
- *  - gcc RTL (too low-level? similar to 3-address code?)
- *  - SiMPL language in BAP/BitBlaze dynamic analysis libraries
- *    but probably too close to assembly/bytecode
- *  - Jimpl in Soot/Wala
+(** Intermediate Language (IL) for static analysis.
+
+  = Key Design Principles =
+
+  1. 3-address-code intermediate representation inspired by CIL.
+      Complex expressions with side effects are broken down into
+      sequences of simpler statements.
+     Example: f(g()) becomes: tmp1 = g(); tmp2 = f(tmp1)
+
+  2. Control Flow de-sugaring: control structures are translated into
+     plain loops and ifs.
+
+  3. Error Recovery: Unsupported or problematic constructs are wrapped in
+     {!fixme} nodes ({!FixmeExp}, {!FixmeInstr}, {!FixmeStmt}.
+     Please refer to {!fixme_kind} for kinds of Fixme nodes.
+
+  4. Connection to original source code.
+     To generate findings, IL and semantic information computed
+     on the IL (e.g., types, svalue, match range, taint) can be mapped back
+     to the generic AST (source "maps").
+     To do this, IL records have 'eorig', 'iorig' fields and use of refs to
+     generic AST objects such as svalue.
+
+  = Additional simplifications =
+   - instruction type: {!instr}, for expressions with
+     side effects and statements without any control flow,
+     moving Assign/Seq/Call/Conditional out of 'expr' and
+     moving Assert out of 'stmt'
+   - expression type: {!exp} for side-effect free expressions
+   - intermediate {!lvalue} type; expressions are split into
+     lvalue vs regular expressions, moved Dot/Index out of expr
+   - Assign/Calls are instructions, not expressions, and no more Seq
+   - no AssignOp, or Decr/Incr, just Assign
+   - Lambdas are instructions (not nested again)
+   - less use of expr option (in Return/Assert/...), use Unit in those cases
+
+   - no Sgrep constructs
+   - Naming has been performed, no more ident vs name
+
+  = TODO =
+    - Have all arguments of Calls be variables?
+    - Store just the range and id_info_id, so easy to propagate back
+      info to generic AST or to return match ranges to semgrep?
+
+  history:
+   - cst_php.ml (was actually called ast_php.ml)
+   - ast_php.ml (was called ast_php_simple.ml)
+   - pil.ml, still for PHP
+   - IL.ml for AST generic
+
+  related work:
+   - CIL, C Intermediate Language, Necula et al, CC'00
+   - RIL, The Ruby Intermediate Language, Furr et al, DLS'09
+   - SIL? in Infer? or more a generic AST than a generic IL?
+   - Rust IL?
+   - C-- in OCaml? too low-level?
+   - LLVM IR (but too far away from original code? complicated
+     source maps)
+   - BRIL https://capra.cs.cornell.edu/bril/ used for teaching
+   - gcc RTL (too low-level? similar to 3-address code?)
+   - SiMPL language in BAP/BitBlaze dynamic analysis libraries
+     but probably too close to assembly/bytecode
+   - Jimpl in Soot/Wala
  *)
 
 (*****************************************************************************)
@@ -97,16 +99,78 @@ type 'a bracket = tok * 'a * tok [@@deriving show]
 
 type ident = G.ident [@@deriving show]
 
-(* 'sid' below is the result of name resolution and variable disambiguation
- * using a gensym (see Naming_AST.ml). A name is guaranteed to be
- * global and unique (no need to handle variable shadowing, block scoping,
- * etc; this has been done already).
+(*
  * TODO: use it to also do SSA! so some control-flow insensitive analysis
  * can become control-flow sensitive? (e.g., DOOP)
  *
  *)
-type name = { ident : ident; sid : G.sid; id_info : G.id_info }
+type name = {
+  ident : ident;  (** In-code identifier *)
+  sid : G.sid;
+      (** Globally unique identifier for analysis.
+          Result of name resolution and variable disambiguation using a gensym (see Naming_AST.ml).
+          No need to handle variable shadowing, block scoping, etc; this has been done already).
+          {!Gensym.MkId.unsafe_default} if unresolved. *)
+  id_info : G.id_info;  (** Additional information about this identifier *)
+}
 [@@deriving show]
+
+(* This function is called for each variable access in the dataflow analyses.
+ * We avoid [G.SId.show] and [Printf] here because both are slow: the derived
+ * [show] goes through [Format]. The result is the same string. *)
+let str_of_name name =
+  fst name.ident ^ ":" ^ string_of_int (G.SId.to_int name.sid)
+
+let equal_name name1 name2 =
+  let { ident = str1, _tok1; sid = sid1; id_info = _ } = name1 in
+  let { ident = str2, _tok2; sid = sid2; id_info = _ } = name2 in
+  G.SId.equal sid1 sid2 && String.equal str1 str2
+
+let compare_name name1 name2 =
+  let { ident = str1, _tok1; sid = sid1; id_info = _ } = name1 in
+  let { ident = str2, _tok2; sid = sid2; id_info = _ } = name2 in
+  match G.SId.compare sid1 sid2 with
+  | 0 -> String.compare str1 str2
+  | cmp -> cmp
+
+module NameOrdered = struct
+  type t = name
+
+  let compare = compare_name
+end
+
+module NameSet : sig
+  include Set.S with type elt = name
+
+  val show : t -> string
+end = struct
+  include Set.Make (NameOrdered)
+
+  let show nameset =
+    "{"
+    ^ (nameset |> elements |> List.map str_of_name |> String.concat ", ")
+    ^ "}"
+end
+
+module NameMap = struct
+  include Map.Make (NameOrdered)
+
+  (* Guarantees physical equality if nothing changes. *)
+  let filter_map_endo f m =
+    let changed = ref false in
+    let m' =
+      m
+      |> filter_map (fun _k x ->
+          let res = f x in
+          (match f x with
+          | Some y when Eq.phys_equal x y -> ()
+          | None
+          | Some _ (* x != y *) ->
+              changed := true);
+          res)
+    in
+    if !changed then m' else m
+end
 
 (*****************************************************************************)
 (* Fixme constructs *)
@@ -120,6 +184,8 @@ type fixme_kind =
   | Sgrep_construct (* some Sgrep construct shows up in the code, e.g. `...' *)
   | Impossible (* something we thought impossible happened *)
 [@@deriving show]
+
+type fixme_field = G.any [@@deriving show]
 
 (*****************************************************************************)
 (* Mapping back to Generic *)
@@ -139,7 +205,7 @@ type fixme_kind =
  * annotated with NoOrig. This also helps making -dump_il more readable.
  *)
 type orig = SameAs of G.expr | Related of G.any | NoOrig
-[@@deriving show { with_path = false }]
+[@@deriving eq, ord, show { with_path = false }]
 
 let related_tok tok = Related (G.Tk tok)
 let related_exp exp_gen = Related (G.E exp_gen)
@@ -148,6 +214,63 @@ let any_of_orig = function
   | SameAs e -> G.E e
   | Related any -> any
   | NoOrig -> G.Anys []
+
+(*****************************************************************************)
+(* Parameters and arguments *)
+(*****************************************************************************)
+
+type 'a argument = Unnamed of 'a | Named of ident * 'a
+[@@deriving show { with_path = false }]
+
+(*****************************************************************************)
+(* Parent iterator *)
+(*****************************************************************************)
+
+(* NOTE: We don't want visitors to automatically visit any AST_generic type. *)
+class virtual ['self] iter_parent =
+  object (self : 'self)
+    method visit_tok _env _tok = ()
+    method visit_sid _env _sid = ()
+    method visit_ident _env _ident = ()
+    method visit_name _env _name = ()
+
+    method visit_bracket :
+        'a. ('env -> 'a -> unit) -> 'env -> 'a bracket -> unit =
+      fun f env (left, x, right) ->
+        self#visit_tok env left;
+        f env x;
+        self#visit_tok env right
+
+    method visit_wrap : 'a. ('env -> 'a -> unit) -> 'env -> 'a wrap -> unit =
+      fun f env (x, tok) ->
+        f env x;
+        self#visit_tok env tok
+
+    method visit_orig _env _orig = ()
+
+    method visit_argument :
+        'a. ('env -> 'a -> unit) -> 'env -> 'a argument -> unit =
+      fun f env arg ->
+        match arg with
+        | Unnamed x -> f env x
+        | Named (ident, x) ->
+            self#visit_ident env ident;
+            f env x
+
+    method visit_pattern _env (_pattern : G.pattern) = ()
+    method visit_literal _env _literal = ()
+    method visit_operator _env _operator = ()
+    method visit_type_ _env _typ = ()
+    method visit_fixme_kind _env _fixme_kind = ()
+    method visit_any _env _any = ()
+    method visit_attribute _env _attr = ()
+    method visit_type_parameters _env _typarams = ()
+    method visit_function_kind _env _fkind = ()
+    method visit_class_kind _env _ckind = ()
+    method visit_class_parent _env _cparents = ()
+    method visit_fixme_field _env _gfield = ()
+    method visit_directive _env _directive = ()
+  end
 
 (*****************************************************************************)
 (* Lvalue *)
@@ -175,14 +298,14 @@ and offset = {
   o : offset_kind;
   oorig : orig;
       (** `oorig' should be a DotAccess expression and gives us the corresponding
-      * Generic expression for a sub-lvalue. Now that we represent `x.a.b.c` as
-      * { base = "x"; rev_offsets = ["c"; "b"; "a"]}, it makes it very easy to
-      * check whether a sub-lvalue is a source/santizer/sink by just checking
-      * the range of the `oorig'.
-      *
-      * alt: We could compute the range of the sub-lvalue from the ranges of all
-      *      the offsets in the sub-lvalue, but this is probably less efficent
-      *      unless we cache the range here. So it seems better to have `oorig'.
+        Generic expression for a sub-lvalue. Now that we represent `x.a.b.c` as
+        { base = "x"; rev_offsets = ["c"; "b"; "a"]}, it makes it very easy to
+        check whether a sub-lvalue is a source/santizer/sink by just checking
+        the range of the `oorig'.
+
+        alt: We could compute the range of the sub-lvalue from the ranges of all
+             the offsets in the sub-lvalue, but this is probably less efficent
+             unless we cache the range here. So it seems better to have `oorig'.
       *)
 }
 
@@ -220,14 +343,16 @@ and exp_kind =
   | Fetch of lval (* lvalue used in a rvalue context *)
   | Literal of G.literal
   | Composite of composite_kind * exp list bracket
-  (* Record could be a Composite where the arguments are CTuple with
-   * the Literal (String) as a key, but they are pretty important I think
-   * for some analysis so better to support them more directly.
-   * TODO should we transform that in a New followed by a series of Assign
-   * with Dot? simpler?
-   * This could also be used for Dict.
+  (* Records and dictionaries could also be 'Composite's, encoded as lists of
+   * tuples, with the first element of the tuple being the field name or key.
+   * (Python dictionary expressions are encoded this way in Generic.) But, for
+   * analyses that are field- and index-sensitive (such as taint), it is more
+   * convenient to have a separate representation as in here.
+   *
+   * THINK: should we transform Generic records/dict expressions into an empty
+   *     constructor, followed by a series of Assign with Dot? simpler?
    *)
-  | Record of field list
+  | RecordOrDict of field_or_entry list
   | Cast of G.type_ * exp
   (* This could be put in call_special, but dumped IL are then less readable
    * (they are too many intermediate _tmp variables then) *)
@@ -237,19 +362,19 @@ and exp_kind =
       * G.any (* fixme source *)
       * exp (* partial translation *) option
 
-and field = Field of ident * exp | Spread of exp
+(* THINK: Extend to better represent object literals ? *)
+and field_or_entry =
+  | Field of name * exp  (** struct field *)
+  | Entry of exp * exp  (** dictionary entry, key and value *)
+  | Spread of exp
 
 and composite_kind =
   | CTuple
   | CArray
   | CList
   | CSet
-  | CDict (* could be merged with Record *)
   | Constructor of name (* OCaml *)
   | Regexp
-
-and 'a argument = Unnamed of 'a | Named of ident * 'a
-[@@deriving show { with_path = false }]
 
 (*****************************************************************************)
 (* Instruction *)
@@ -258,29 +383,35 @@ and 'a argument = Unnamed of 'a | Named of ident * 'a
 (* Easier type to compute lvalue/rvalue set of a too general 'expr', which
  * is now split into  instr vs exp vs lval.
  *)
-type instr = { i : instr_kind; iorig : orig }
+and instr = { i : instr_kind; iorig : orig }
 
 and instr_kind =
   (* was called Set in CIL, but a bit ambiguous with Set module *)
   | Assign of lval * exp
-  | AssignAnon of lval * anonymous_entity
-  | Call of lval option * exp (* less: enforce lval? *) * exp argument list
-  | CallSpecial of lval option * call_special wrap * exp argument list
+  | AssignCall of lval option * call
+  | New of lval * G.type_ * exp option (* constructor *) * exp argument list
   (* todo: PhiSSA! *)
   | FixmeInstr of fixme_kind * G.any
+
+and call = { c : call_kind; corig : orig }
+
+and call_kind =
+  | Call of exp * exp argument list
+  | CallSpecial of call_special wrap * exp argument list
 
 and call_special =
   | Eval
   (* TODO: lift up like in AST_generic *)
-  | New
   | Typeof
   | Instanceof
   | Sizeof
   (* old: better in exp: | Operator of G.arithmetic_operator *)
   | Concat (* THINK: Normalize as a Operator G.Concat ? *)
-  | Spread
+  | SpreadFn
   | Yield
   | Await
+  (* C++ *)
+  | Delete
   (* was in stmt before, but with a new clean 'instr' type, better here *)
   | Assert
   (* was in expr before (only in C/PHP) *)
@@ -298,7 +429,7 @@ and call_special =
 *)
 and anonymous_entity =
   | Lambda of function_definition
-  | AnonClass of G.class_definition
+  | AnonClass of class_definition
 
 (*****************************************************************************)
 (* Statement *)
@@ -309,6 +440,7 @@ and stmt_kind =
   | Instr of instr
   (* Switch are converted to a series of If *)
   | If of tok * exp * stmt list * stmt list
+  | Match of pattern_match
   (* While/DoWhile/For are converted in a unified Loop construct.
    * Break/Continue are handled via Label.
    * alt: we could go further and transform in If+Goto, but nice to
@@ -322,57 +454,153 @@ and stmt_kind =
   | Try of
       stmt list
       * (name * stmt list) list (* catches *)
-      * stmt list (* finally *)
+      * stmt list (* else *)
+      * stmt list
+    (* finally / THINK: no finally vs empty finally ? use `option` ? *)
   | Throw of tok * exp (* less: enforce lval here? *)
+  (* Lambdas and (with Pro-naming) nested function definitions, and annon classes.
+
+    THINK:
+      Eventually we may want to lift all nested definitions and have a `type top` for
+      these rather than using 'stmt' like in Generic. However, it may complicate
+      taint propagation from the outer function into the nested function/lambda.
+    *)
+  | NestedDef of definition
   | MiscStmt of other_stmt
   | FixmeStmt of fixme_kind * G.any
 
 and other_stmt =
-  (* everything except VarDef (which is transformed in an Assign instr) *)
-  | DefStmt of G.definition
+  (* Top-level definititions and (for now, for OSS-naming) also nested ones. *)
+  | DefStmt of definition
   | DirectiveStmt of G.directive
   | Noop of (* for debugging purposes *) string
 
 and label = ident * G.sid
+and pattern_match = { scrutinee : name; branches : pattern_branch list }
+
+and pattern_branch = {
+  patterns : pattern_spec list;
+      (** Patterns any one of which leads to executing [body] (e.g. ML-style
+          or-patterns [A | B | C -> ...], or Ruby's [when a, b, c]). Non-empty,
+          and all patterns must bind the same variables. *)
+  body : stmt list;  (** The statements to execute on a successful match. *)
+}
+
+and pattern_spec =
+  | PatLiteral of G.literal
+  | PatWildcard
+  | PatVariable of name
+  | PatConstructor of
+      name * name list (* name option list? for internal wildcards? *)
 
 (*****************************************************************************)
 (* Defs *)
 (*****************************************************************************)
+(* THINK: Attach a "fake name" to FixmeEntity *)
+and entity_name = EN of name | FixmeEntity of G.any
+
+and entity = {
+  name : entity_name;
+  attrs : G.attribute list;
+  tparams : G.type_parameters option;
+}
+
+and variable_definition = { vtype : G.type_ option; vinit : exp option }
+
 (* See AST_generic.ml *)
 and function_definition = {
-  fparams : name list;
+  fkind : G.function_kind wrap;
+  fparams : param list;
   frettype : G.type_ option;
   fbody : stmt list;
 }
-[@@deriving show { with_path = false }]
+
+(* THINK: Need an initialization section? Note that side-effects in class fields
+  end up as statements outside of the class declaration. *)
+and class_definition = {
+  ckind : G.class_kind wrap;
+  cextends : G.class_parent list;
+  cimplements : G.type_ list;
+  cmixins : G.type_ list;
+  cfields : class_field list;
+  (* TODO: We probably want to separate constructors from regular methods. *)
+  (* cconstructors : class_constructor list; *)
+  cmethods : class_method list;
+  cfixmes : fixme_field list;
+}
+
+and class_field = entity * variable_definition
+and class_constructor = entity * function_definition
+and class_method = entity * function_definition
+and definition = entity * definition_kind
+(* THINK: Need an orig for definitions so that we can check if the def itself is a
+    source/sink/etc ? *)
+
+and definition_kind =
+  (* THINK: When translating a top-level VarDef, we may want to keep it as is ? *)
+  (* | VarDef of variable_definition *)
+  | FuncDef of function_definition
+  | ClassDef of class_definition
+  | FixmeDef
+
+(*****************************************************************************)
+(* Program *)
+(*****************************************************************************)
+and program = stmt list
 
 (*****************************************************************************)
 (* Control-flow graph (CFG) *)
 (*****************************************************************************)
 (* Similar to controlflow.ml, but with a simpler node_kind.
  * See controlflow.ml for more information. *)
-type node = {
+and node = {
   n : node_kind;
       (* old: there are tok in the nodes anyway
        * t: Parse_info.t option;
        *)
+  mutable at_exit : bool;
 }
 
 and node_kind =
   | Enter
   | Exit
-  | TrueNode
-  | FalseNode (* for Cond *)
-  | Join (* after Cond *)
+  (* 'TrueNode' and 'FalseNode' follow 'NCond', and the 'exp' is the same
+   * condition as in 'NCond'. *)
+  | TrueNode of exp (* same as in Cond *)
+  | FalseNode of exp (* same as in Cond *)
+  | Join
   | NInstr of instr
   | NCond of tok * exp
   | NGoto of tok * label
   | NReturn of tok * exp
   | NThrow of tok * exp
-  | NLambda of name list (* just the params, the body nodes follow this one *)
+  | NMatch of name
+  (* NCase follows NMatch, and the pattern spec is some condition to
+     test against the scrutinee. The scrutinee is stored redundantly here
+     to allow the transfer function to operate locally without looking at
+     predecessor nodes. *)
+  | NCase of name * pattern_spec
+  | NNestedDef of entity
   | NOther of other_stmt
   | NTodo of stmt
-[@@deriving show { with_path = false }]
+
+and param_default = {
+  dinit : stmt list;
+      (** Stmts to evaluate at call time in the callee's scope, when the caller
+          does not provide an argument for this parameter. *)
+  dexp : exp;
+}
+
+and name_param = { pname : name; pdefault : param_default option }
+
+and param =
+  | Param of name_param
+  | PatternParam of G.pattern
+  | ParamRest of name  (** variadic, or "the rest of the remaining arguments" *)
+  | FixmeParam
+[@@deriving
+  show { with_path = false },
+  visitors { variety = "iter"; ancestors = [ "iter_parent" ] }]
 
 (* For now there is just one kind of edge.
  * (we may use more? the "ShadowNode" idea of Julia Lawall?)
@@ -382,6 +610,8 @@ type cfg = (node, edge) CFG.t
 
 (* an int representing the index of a node in the graph *)
 type nodei = Ograph_extended.nodei
+
+let mk_node n = { n; at_exit = false }
 
 (*****************************************************************************)
 (* Any *)
@@ -398,5 +628,19 @@ type any = L of lval | E of exp | I of instr | S of stmt | Ss of stmt list
 (*****************************************************************************)
 (* Helpers *)
 (*****************************************************************************)
-let str_of_name name = fst name.ident
+
+let ident_str_of_name name = fst name.ident
 let str_of_label ((n, _), _) = n
+
+let rec equal_base base1 base2 =
+  match (base1, base2) with
+  | Var name1, Var name2 -> compare_name name1 name2 = 0
+  | VarSpecial (This, _), VarSpecial (This, _) -> true
+  | VarSpecial (Super, _), VarSpecial (Super, _) -> true
+  | VarSpecial (Self, _), VarSpecial (Self, _) -> true
+  | VarSpecial (Parent, _), VarSpecial (Parent, _) -> true
+  | ( Mem { e = Fetch { base = base1; rev_offset = [] }; _ },
+      Mem { e = Fetch { base = base2; rev_offset = [] }; _ } ) ->
+      (* Deref e.g. *base *)
+      equal_base base1 base2
+  | _ -> false

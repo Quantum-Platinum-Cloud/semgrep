@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2021-2025 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 type nodei = int
 
 (* A set of nodes (via their indices),
@@ -42,12 +54,16 @@ end
 module Make (F : Flow) : sig
   (* main entry point *)
   val fixpoint :
+    timeout:float
+      (** We set a "soft" timeout to guard against insanely complex/large functions,
+      and potential bugs. The timeout condition is checked only after each call to
+      the 'trans' function, so there is no strict time guarantee for completion. *) ->
     eq_env:('env -> 'env -> bool) ->
     init:'env mapping ->
     trans:'env transfn ->
     flow:F.flow ->
     forward:bool ->
-    'env mapping
+    'env mapping * [ `Ok | `Timeout ]
 
   val new_node_array : F.flow -> 'a -> 'a array
 

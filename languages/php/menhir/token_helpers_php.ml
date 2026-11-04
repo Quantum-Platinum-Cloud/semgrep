@@ -12,9 +12,8 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * license.txt for more details.
  *)
-
 open Parser_php
-module PI = Parse_info
+module PI = Lib_ast_fuzzy
 
 (*****************************************************************************)
 (* Token Helpers *)
@@ -77,7 +76,7 @@ let visitor_info_of_tok f = function
   | TNewline ii -> TNewline (f ii)
   | TCommentPP ii -> TCommentPP (f ii)
   | T_BOOL (s, ii) -> T_BOOL (s, f ii)
-  | T_LNUMBER (s, ii) -> T_LNUMBER (s, f ii)
+  | T_LNUMBER pi -> T_LNUMBER (Parsed_int.map_tok f pi)
   | T_DNUMBER (s, ii) -> T_DNUMBER (s, f ii)
   | T_IDENT (s, ii) -> T_IDENT (s, f ii)
   | T_METAVAR (s, ii) -> T_METAVAR (s, f ii)
@@ -258,7 +257,7 @@ let info_of_tok tok =
   |> ignore;
   match !res with
   | Some x -> x
-  | None -> Parse_info.unsafe_fake_info "NOTOK"
+  | None -> Tok.unsafe_fake_tok "NOTOK"
 
 (*****************************************************************************)
 (* Accessors *)
@@ -266,4 +265,4 @@ let info_of_tok tok =
 
 let line_of_tok tok =
   let info = info_of_tok tok in
-  PI.line_of_info info
+  Tok.line_of_tok info

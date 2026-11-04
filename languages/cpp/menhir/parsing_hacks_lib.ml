@@ -15,12 +15,10 @@
  *)
 open Common
 module Flag_cpp = Flag_parsing_cpp
-module PI = Parse_info
 module TH = Token_helpers_cpp
 open Parser_cpp
 open Token_views_cpp
-
-let logger = Logging.get_logger [ __MODULE__ ]
+module Log = Log_parser_cpp.Log
 
 (*****************************************************************************)
 (* Helpers  *)
@@ -39,15 +37,19 @@ let msg_gen is_known printer s =
   if not !Flag_cpp.filter_msg then printer s
   else if not (is_known s) then printer s
 
-let pos ii = Parse_info.string_of_info ii
+let pos ii = Tok.stringpos_of_tok ii
 
 (*****************************************************************************)
 (* Some debugging functions  *)
 (*****************************************************************************)
 
-let pr2_pp s = if !Flag_cpp.debug_pp then logger#sinfo ("PP-" ^ s)
-let pr2_cplusplus s = if !Flag_cpp.debug_cplusplus then logger#sinfo ("C++-" ^ s)
-let pr2_typedef s = if !Flag_cpp.debug_typedef then logger#sinfo ("TYPEDEF-" ^ s)
+let pr2_pp s = if !Flag_cpp.debug_pp then Log.debug (fun m -> m "PP-%s" s)
+
+let pr2_cplusplus s =
+  if !Flag_cpp.debug_cplusplus then Log.debug (fun m -> m "C++-%s" s)
+
+let pr2_typedef s =
+  if !Flag_cpp.debug_typedef then Log.debug (fun m -> m "TYPEDEF-%s" s)
 
 let msg_change_tok tok =
   match tok with
@@ -91,7 +93,7 @@ let msg_change_tok tok =
   (* mostly in parsing_hacks_pp.ml *)
   (* cppext: *)
   | TComment_Pp (directive, ii) -> (
-      let s = PI.str_of_info ii in
+      let s = Tok.content_of_tok ii in
       match (directive, s) with
       | Token_cpp.CppMacro, _ -> pr2_pp (spf "MACRO: commented at %s" (pos ii))
       | Token_cpp.CppDirective, _ when s =~ "#define.*" ->
@@ -109,7 +111,7 @@ let msg_change_tok tok =
           ())
   | TOBrace_DefineInit ii -> pr2_pp (spf "DEFINE: initializer at %s" (pos ii))
   | TIdent_MacroString ii ->
-      let s = PI.str_of_info ii in
+      let s = Tok.content_of_tok ii in
       s
       |> msg_gen
            (fun s ->
@@ -160,7 +162,7 @@ let msg_change_tok tok =
   (* mostly in parsing_hacks_cpp.ml *)
   (* c++ext: *)
   | TComment_Cpp (directive, ii) -> (
-      let s = PI.str_of_info ii in
+      let s = Tok.content_of_tok ii in
       match (directive, s) with
       | Token_cpp.CplusplusTemplate, _ ->
           pr2_cplusplus (spf "COM-TEMPLATE: commented at %s" (pos ii))
@@ -217,7 +219,7 @@ let change_tok extended_tok tok =
    * some ifdef-exp?
    *)
   if TH.is_eof extended_tok.t then
-    logger#error "PB: wierd, I try to tag an EOF token as something else"
+    Log.warn (fun m -> m "WEIRD, I try to tag an EOF token as something else")
   else extended_tok.t <- tok
 
 let fresh_tok tok =

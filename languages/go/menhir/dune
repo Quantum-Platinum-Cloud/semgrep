@@ -3,8 +3,10 @@
  (name pfff_lang_go)
  (wrapped false)
  (libraries
+   base
+   collections
    commons
-   pfff-h_program-lang
+   lib_parsing
    parser_go.ast
  )
  (preprocess (pps ppx_deriving.show))

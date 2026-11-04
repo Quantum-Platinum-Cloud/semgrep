@@ -15,8 +15,7 @@
 open Common
 open Cst_php
 module A = Ast_php
-module PI = Parse_info
-module G = AST_generic_
+module G = AST_generic
 
 (*****************************************************************************)
 (* Prelude *)
@@ -31,16 +30,16 @@ module G = AST_generic_
 type _env = unit
 
 let empty_env () = ()
-let error tok s = raise (Parse_info.Ast_builder_error (s, tok))
+let error tok s = raise (Parsing_error.Ast_builder_error (s, tok))
 
 (* old: opti: to get www from 380MB to 190MB marshalled, but not worth it
  *  if !store_position then Some tok else None
  *)
 let wrap tok = tok
-let fake tok s = Parse_info.fake_info tok s
-let unsafe_fake s = Parse_info.unsafe_fake_info s
-let fb = PI.fake_bracket
-let unsafe_fb = PI.unsafe_fake_bracket
+let fake tok s = Tok.fake_tok tok s
+let unsafe_fake s = Tok.unsafe_fake_tok s
+let fb = Tok.fake_bracket
+let unsafe_fb = Tok.unsafe_fake_bracket
 
 let stmt1_with b xs =
   match xs with
@@ -62,13 +61,13 @@ let opt f env x =
 
 let rec comma_list = function
   | [] -> []
-  | Common.Left x :: rl -> x :: comma_list rl
-  | Common.Right _ :: rl -> comma_list rl
+  | Either.Left x :: rl -> x :: comma_list rl
+  | Either.Right _ :: rl -> comma_list rl
 
 let rec comma_list_dots = function
   | [] -> []
-  | Common.Left3 x :: rl -> x :: comma_list_dots rl
-  | (Common.Middle3 _ | Common.Right3 _) :: rl -> comma_list_dots rl
+  | Either_.Left3 x :: rl -> x :: comma_list_dots rl
+  | (Either_.Middle3 _ | Either_.Right3 _) :: rl -> comma_list_dots rl
 
 let brace (_, x, _) = x
 let bracket f (a, b, c) = (a, f b, c)
@@ -84,7 +83,7 @@ let rec program top_l =
 
 and any x =
   let env = empty_env () in
-  Common.save_excursion Flag_parsing.sgrep_mode true (fun () -> any_aux env x)
+  Hook.with_hook_set Flag_parsing.sgrep_mode true (fun () -> any_aux env x)
 
 and partial env = function
   | PartialIf (t, e) ->
@@ -133,12 +132,12 @@ and toplevels env xs =
       | NamespaceDef (t, qi, _) ->
           let xs, rest =
             xs
-            |> Common.span (function
-                 (* less: actually I'm not sure you can mix NamespaceDef and BracketDef*)
-                 | NamespaceDef _
-                 | NamespaceBracketDef _ ->
-                     false
-                 | _ -> true)
+            |> List_.span (function
+              (* less: actually I'm not sure you can mix NamespaceDef and BracketDef*)
+              | NamespaceDef _
+              | NamespaceBracketDef _ ->
+                  false
+              | _ -> true)
           in
           let body = toplevels env xs in
           let rest = toplevels env rest in
@@ -167,13 +166,13 @@ and toplevel env st =
   | NamespaceUse (tok, _kwdopt, xs, _) ->
       xs |> uncomma
       |> List.map (fun (qu, alias_opt) ->
-             let qu = qualified_ident env qu in
-             let alias_opt =
-               match alias_opt with
-               | None -> None
-               | Some (_t, id) -> Some (ident env id)
-             in
-             A.NamespaceUse (tok, qu, alias_opt))
+          let qu = qualified_ident env qu in
+          let alias_opt =
+            match alias_opt with
+            | None -> None
+            | Some (_t, id) -> Some (ident env id)
+          in
+          A.NamespaceUse (tok, qu, alias_opt))
 
 (* ------------------------------------------------------------------------- *)
 (* Names *)
@@ -206,14 +205,14 @@ and qualified_ident env xs =
   in
   leading
   @ (rest
-    |> Common.map_filter (function
-         | QITok _ -> None
-         | QI id -> Some (ident env id)))
+    |> List.filter_map (function
+      | QITok _ -> None
+      | QI id -> Some (ident env id)))
 
 and dname = function
   | DName (s, tok) ->
       if s.[0] =$= '$' then
-        if !Flag_parsing.sgrep_mode then (s, wrap tok)
+        if Hook.get Flag_parsing.sgrep_mode then (s, wrap tok)
         else failwith "dname: the string has a dollar, weird"
       else
         (* We abuse Id to represent both variables and functions/classes
@@ -233,16 +232,16 @@ and stmt env st acc =
   (* Why not just acc? because we abuse noop in the abstract interpreter? *)
   | EmptyStmt t -> noop t :: acc
   | Block (lb, stdl, rb) ->
-      A.Block (lb, List.fold_right (stmt_and_def env) stdl [], rb) :: acc
+      A.Block (lb, List_.fold_right (stmt_and_def env) stdl [], rb) :: acc
   | If (tok, (_, e, _), st, il, io) ->
       let e = expr env e in
       let st = stmt1 tok (stmt env st []) in
-      let il = List.fold_right (if_elseif env) il (if_else tok env io) in
+      let il = List_.fold_right (if_elseif env) il (if_else tok env io) in
       A.If (tok, e, st, il) :: acc
   | IfColon (tok, (_, e, _), _, st, il, io, _, _) ->
       let e = expr env e in
-      let st = stmt1 tok (List.fold_right (stmt_and_def env) st []) in
-      let il = List.fold_right (new_elseif env) il (new_else tok env io) in
+      let st = stmt1 tok (List_.fold_right (stmt_and_def env) st []) in
+      let il = List_.fold_right (new_elseif env) il (new_else tok env io) in
       A.If (tok, e, st, il) :: acc
   | While (tok, (_, e, _), cst) ->
       let cst = colon_stmt tok env cst in
@@ -272,7 +271,7 @@ and stmt env st acc =
   | Return (tok, eopt, _) -> A.Return (tok, opt expr env eopt) :: acc
   | Throw (tok, e, sc) -> A.Expr (A.Throw (tok, expr env e), sc) :: acc
   | Try (tok, (lb, stl, rb), cl, fl) ->
-      let stl = List.fold_right (stmt_and_def env) stl [] in
+      let stl = List_.fold_right (stmt_and_def env) stl [] in
       let cl = List.map (catch env) cl in
       let fl = List.map (finally env) fl in
       A.Try (tok, A.Block (lb, stl, rb), cl, fl) :: acc
@@ -305,29 +304,19 @@ and stmt env st acc =
       match (args, colon_st) with
       (* declare(strict=1); (or 0) can be skipped,
        * See 'i wiki/index.php/Pfff/Declare_strict' *)
-      | ( ( _,
-            [
-              Common.Left
-                (Name ("strict", _), (_, Sc (C (Int ((Some 1 | Some 0), _)))));
-            ],
-            _ ),
+      | ( (_, [ Either.Left (Name ("strict", _), (_, Sc (C (Int pi)))) ], _),
           SingleStmt (EmptyStmt _) )
       | ( ( _,
-            [
-              Common.Left
-                ( Name ("strict_types", _),
-                  (_, Sc (C (Int ((Some 1 | Some 0), _)))) );
-            ],
+            [ Either.Left (Name ("strict_types", _), (_, Sc (C (Int pi)))) ],
             _ ),
           SingleStmt (EmptyStmt _) )
-      (* declare(ticks=1); can be skipped too.
-       * http://www.php.net/manual/en/control-structures.declare.php#control-structures.declare.ticks
-       *) ->
+        when Parsed_int.eq_const pi 0 || Parsed_int.eq_const pi 1
+             (* declare(ticks=1); can be skipped too.
+              * http://www.php.net/manual/en/control-structures.declare.php#control-structures.declare.ticks
+              *) ->
           acc
-      | ( ( _,
-            [ Common.Left (Name ("ticks", _), (_, Sc (C (Int (Some 1, _))))) ],
-            _ ),
-          _ ) ->
+      | (_, [ Either.Left (Name ("ticks", _), (_, Sc (C (Int pi)))) ], _), _
+        when Parsed_int.eq_const pi 1 ->
           let cst = colon_stmt tok env colon_st in
           cst :: acc
       | _ -> error tok "TODO: declare")
@@ -337,24 +326,22 @@ and stmt env st acc =
 and if_elseif env (tok, (_, e, _), st) acc =
   let e = expr env e in
   let st = stmt1 tok (stmt env st []) in
-  A.If (tok, e, st, acc)
+  Some (A.If (tok, e, st, acc))
 
 and if_else tok env = function
-  | None -> noop tok
-  | Some (_, (If _ as st)) -> (
-      match stmt env st [] with
-      | [ x ] -> x
-      | _l -> assert false)
-  | Some (tok, st) -> stmt1 tok (stmt env st [])
+  | None -> None
+  | Some (_, (If _ as st)) -> Some (stmt1 tok (stmt env st []))
+  | Some (tok, st) -> Some (stmt1 tok (stmt env st []))
 
 and new_elseif env (tok, (_, e, _), _, stl) acc =
   let e = expr env e in
-  let st = stmt1 tok (List.fold_right (stmt_and_def env) stl []) in
-  A.If (tok, e, st, acc)
+  let st = stmt1 tok (List_.fold_right (stmt_and_def env) stl []) in
+  Some (A.If (tok, e, st, acc))
 
-and new_else tok env = function
-  | None -> noop tok
-  | Some (tok, _, st) -> stmt1 tok (List.fold_right (stmt_and_def env) st [])
+and new_else _tok env = function
+  | None -> None
+  | Some (tok, _, st) ->
+      Some (stmt1 tok (List_.fold_right (stmt_and_def env) st []))
 
 and stmt_and_def env st acc = stmt env st acc
 
@@ -426,7 +413,7 @@ and expr env = function
       A.CondExpr (expr env e1, expr env e2, expr env e3)
   | AssignList (_, (t1, la, t2), tokeq, e) ->
       let la = comma_list la in
-      let la = List.fold_right (list_assign env) la [] in
+      let la = List_.fold_right (list_assign env) la [] in
       let e = expr env e in
       A.Assign (A.List (t1, la, t2), tokeq, e)
   | ArrayLong (_, (t1, apl, t2))
@@ -541,7 +528,7 @@ and arith_op = function
   | Mod -> G.Mod
   | Pow -> G.Pow
   | DecLeft -> G.LSL
-  | DecRight -> G.LSR
+  | DecRight -> G.ASR (* PHP ints are signed; >> is arithmetic *)
   | And -> G.BitAnd
   | Or -> G.BitOr
   | Xor -> G.BitXor
@@ -628,7 +615,7 @@ and hint_type env = function
       A.HintTuple (t1, List.map (hint_type env) (comma_list v1), t2)
   | HintCallback (_, (_, args, ret), _) ->
       let args = List.map (hint_type env) (comma_list_dots (brace args)) in
-      let ret = Common2.fmap (fun (_, t) -> hint_type env t) ret in
+      let ret = Option.map (fun (_, t) -> hint_type env t) ret in
       A.HintCallback (args, ret)
   | HintTypeConst (lhs, tok, rhs) ->
       A.HintTypeConst (hint_type env lhs, tok, hint_type env rhs)
@@ -648,10 +635,10 @@ and constant_def env
 and comma_list_dots_params f xs =
   match xs with
   | [] -> []
-  | Common.Left3 x :: rl -> A.ParamClassic (f x) :: comma_list_dots_params f rl
+  | Either_.Left3 x :: rl -> A.ParamClassic (f x) :: comma_list_dots_params f rl
   (* less: guard by sgrep_mode? *)
-  | Common.Middle3 t :: rl -> A.ParamEllipsis t :: comma_list_dots_params f rl
-  | Common.Right3 _ :: rl -> comma_list_dots_params f rl
+  | Either_.Middle3 t :: rl -> A.ParamEllipsis t :: comma_list_dots_params f rl
+  | Either_.Right3 _ :: rl -> comma_list_dots_params f rl
 
 and func_def env f =
   let _, params, _ = f.f_params in
@@ -662,9 +649,8 @@ and func_def env f =
     A.f_name = ident env f.f_name;
     A.f_attrs = attributes env f.f_attrs;
     A.f_params = params;
-    A.f_return_type =
-      Common2.fmap (fun (_, t) -> hint_type env t) f.f_return_type;
-    A.f_body = A.Block (lb, List.fold_right (stmt_and_def env) body [], rb);
+    A.f_return_type = Option.map (fun (_, t) -> hint_type env t) f.f_return_type;
+    A.f_body = A.Block (lb, List_.fold_right (stmt_and_def env) body [], rb);
     A.f_kind = (A.Function, f.f_tok);
     A.m_modifiers = [];
     A.l_uses = [];
@@ -679,8 +665,8 @@ and lambda_def env (l_use, ld) =
     A.f_name = (A.special "_lambda", wrap ld.f_tok);
     A.f_params = params;
     A.f_return_type =
-      Common2.fmap (fun (_, t) -> hint_type env t) ld.f_return_type;
-    A.f_body = A.Block (lb, List.fold_right (stmt_and_def env) body [], rb);
+      Option.map (fun (_, t) -> hint_type env t) ld.f_return_type;
+    A.f_body = A.Block (lb, List_.fold_right (stmt_and_def env) body [], rb);
     A.f_kind = (A.AnonLambda, ld.f_tok);
     A.m_modifiers = [];
     A.f_attrs = attributes env ld.f_attrs;
@@ -690,7 +676,7 @@ and lambda_def env (l_use, ld) =
       | Some (_, (_lp, xs, _rp)) ->
           comma_list xs
           |> List.map (function LexicalVar (is_ref, name) ->
-                 (is_ref <> None, dname name)));
+              (is_ref <> None, dname name)));
   }
 
 and short_lambda_def env def =
@@ -710,9 +696,9 @@ and short_lambda_def env def =
     f_return_type = None;
     f_body =
       (match def.sl_body with
-      | SLExpr e -> A.Expr (expr env e, PI.sc sl_tok)
+      | SLExpr e -> A.Expr (expr env e, Tok.sc sl_tok)
       | SLBody (lb, body, rb) ->
-          Block (lb, List.fold_right (stmt_and_def env) body [], rb));
+          Block (lb, List_.fold_right (stmt_and_def env) body [], rb));
     f_kind = (A.ShortLambda, sl_tok);
     m_modifiers = [];
     f_attrs = [];
@@ -728,7 +714,7 @@ and type_def_kind env = function
 and class_def env c =
   let t1, body, t2 = c.c_body in
   let methods, implicit_fields =
-    List.fold_right (class_body env) body ([], [])
+    List_.fold_right (class_body env) body ([], [])
   in
   let kind, modifiers = class_type env c.c_type in
   {
@@ -740,14 +726,14 @@ and class_def env c =
       (match c.c_extends with
       | None -> None
       | Some (_, x) -> Some (hint_type env x));
-    A.c_uses = List.fold_right (class_traits env) body [];
+    A.c_uses = List_.fold_right (class_traits env) body [];
     A.c_implements =
       (match c.c_implements with
       | None -> []
       | Some x -> interfaces env x);
-    A.c_constants = List.fold_right (class_constants env) body [];
+    A.c_constants = List_.fold_right (class_constants env) body [];
     A.c_variables =
-      implicit_fields @ List.fold_right (class_variables env) body [];
+      implicit_fields @ List_.fold_right (class_variables env) body [];
     A.c_methods = methods;
     A.c_enum_type =
       (match c.c_enum_type with
@@ -784,7 +770,7 @@ and class_traits env x acc =
 and class_constants env st acc =
   match st with
   | ClassConstants (_, tok, _, cl, _) ->
-      List.fold_right
+      List_.fold_right
         (fun (n, ss) acc ->
           let body = static_scalar_affect env ss in
           let cst =
@@ -847,7 +833,7 @@ and method_def env m =
   let params = comma_list_dots_params (parameter env) params in
   (*
   let implicits =
-    params |> Common.map_filter (fun p ->
+    params |> List.filter_map (fun p ->
       match p.p_modifier with
       | None -> None
       | Some modifier -> Some (p.p_name, modifier, p.p_type)
@@ -886,7 +872,7 @@ and method_def env m =
       A.f_attrs = attributes env m.f_attrs;
       A.f_params = params;
       A.f_return_type =
-        Common2.fmap (fun (_, t) -> hint_type env t) m.f_return_type;
+        Option.map (fun (_, t) -> hint_type env t) m.f_return_type;
       A.f_body = (* implicit_assigns @ *) method_body env m.f_body;
       A.f_kind = (A.Method, m.f_tok);
       A.l_uses = [];
@@ -894,7 +880,7 @@ and method_def env m =
     implicit_flds )
 
 and method_body env (lb, stl, rb) =
-  A.Block (lb, List.fold_right (stmt_and_def env) stl [], rb)
+  A.Block (lb, List_.fold_right (stmt_and_def env) stl [], rb)
 
 and parameter env
     {
@@ -938,7 +924,7 @@ and for_expr env el = List.map (expr env) (comma_list el)
 and colon_stmt tok env = function
   | SingleStmt st -> stmt1 tok (stmt env st [])
   | ColonStmt (tok, stl, _, _) ->
-      stmt1 tok (List.fold_right (stmt_and_def env) stl [])
+      stmt1 tok (List_.fold_right (stmt_and_def env) stl [])
 (*of tok (* : *) * stmt_and_def list * tok (* endxxx *) * tok (* ; *) *)
 
 and switch_case_list env = function
@@ -947,10 +933,10 @@ and switch_case_list env = function
 
 and case env = function
   | Case (tok, e, _, stl) ->
-      let stl = List.fold_right (stmt_and_def env) stl [] in
+      let stl = List_.fold_right (stmt_and_def env) stl [] in
       A.Case (tok, expr env e, stl)
   | Default (tok, _, stl) ->
-      let stl = List.fold_right (stmt_and_def env) stl [] in
+      let stl = List_.fold_right (stmt_and_def env) stl [] in
       A.Default (tok, stl)
 
 and foreach_variable tok env (r, lv) =
@@ -965,17 +951,17 @@ and foreach_pattern tok env pat =
       A.Arrow (foreach_pattern tok env v1, tok, foreach_pattern tok env v2)
   | ForeachList (_, (t1, xs, t2)) ->
       let xs = comma_list xs in
-      let xs = List.fold_right (list_assign env) xs [] in
+      let xs = List_.fold_right (list_assign env) xs [] in
       A.List (t1, xs, t2)
 
 and catch env (t, (_, (fq, dn), _), (lb, stdl, rb)) =
-  let stdl = A.Block (lb, List.fold_right (stmt_and_def env) stdl [], rb) in
+  let stdl = A.Block (lb, List_.fold_right (stmt_and_def env) stdl [], rb) in
   let fq = hint_type env fq in
   let dn = dname dn in
   (t, fq, dn, stdl)
 
 and finally env (t, (lb, stdl, rb)) =
-  let stdl = A.Block (lb, List.fold_right (stmt_and_def env) stdl [], rb) in
+  let stdl = A.Block (lb, List_.fold_right (stmt_and_def env) stdl [], rb) in
   (t, stdl)
 
 and static_var env (x, e) = (dname x, opt static_scalar_affect env e)
@@ -985,7 +971,7 @@ and list_assign env x acc =
   | ListVar lv -> lvalue env lv :: acc
   | ListList (_, (t1, la, t2)) ->
       let la = comma_list la in
-      let la = List.fold_right (list_assign env) la [] in
+      let la = List_.fold_right (list_assign env) la [] in
       A.List (t1, la, t2) :: acc
   | ListEmpty -> acc
 
@@ -1013,12 +999,12 @@ and attributes env = function
       let xs = comma_list xs in
       xs
       |> List.map (function
-           | Attribute (s, tok) -> A.Id [ (s, wrap tok) ]
-           | AttributeWithArgs ((s, tok), (lp, xs, rp)) ->
-               A.Call
-                 ( A.Id [ (s, wrap tok) ],
-                   ( lp,
-                     List.map
-                       (fun e -> A.Arg (static_scalar env e))
-                       (comma_list xs),
-                     rp ) ))
+        | Attribute (s, tok) -> A.Id [ (s, wrap tok) ]
+        | AttributeWithArgs ((s, tok), (lp, xs, rp)) ->
+            A.Call
+              ( A.Id [ (s, wrap tok) ],
+                ( lp,
+                  List.map
+                    (fun e -> A.Arg (static_scalar env e))
+                    (comma_list xs),
+                  rp ) ))

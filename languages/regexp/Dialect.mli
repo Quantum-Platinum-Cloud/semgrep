@@ -1,10 +1,22 @@
 (*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(*
    Some predefined dialects. They can be used as a base for further dialects
    using the 'with' syntax, e.g.
 
      open Regexp.Conf
      let perl_xx = {
-       Regex.Dialect.perl with
+       Pcre2_.Dialect.perl with
        ignore_whitespace = true;
        ignore_whitespace_in_char_classes = true;
      }

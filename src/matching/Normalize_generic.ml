@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2019-2021 r2c
+ * Copyright (C) 2019-2021 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -12,7 +12,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * LICENSE for more details.
  *)
-open Common (* >>= *)
+open Common
 open AST_generic
 
 (*****************************************************************************)
@@ -20,7 +20,7 @@ open AST_generic
 (*****************************************************************************)
 (* Various helper functions to normalize AST elements.
  *
- * TODO: merge with pfff/.../normalize_ast.ml at some point
+ * TODO: merge with normalize_ast.ml from pfff at some point
  *
  *)
 
@@ -38,7 +38,7 @@ let full_module_names is_pattern from_module_name imports_opt =
   match (from_module_name, imports_opt) with
   | DottedName idents, Some import_ident_names ->
       let new_module_names : module_name list =
-        Common.map
+        List.map
           (fun import_ident_name -> DottedName (idents @ [ import_ident_name ]))
           import_ident_names
       in
@@ -57,17 +57,23 @@ let full_module_names is_pattern from_module_name imports_opt =
 
 let normalize_import_opt is_pattern i =
   match i with
-  | ImportFrom (t, module_name, imports) ->
+  | ImportFrom (t, module_name, import_from_kinds) ->
       let imports =
         (* Drop the local aliases *)
-        Common.map fst imports
+        List.map
+          (function
+            | Direct (id, _id_info) -> id
+            | Aliased (id, _) -> id)
+          import_from_kinds
       in
-      full_module_names is_pattern module_name (Some imports) >>= fun x ->
+      let* x = full_module_names is_pattern module_name (Some imports) in
       Some (t, x)
   | ImportAs (t, module_name, _alias_opt) ->
-      full_module_names is_pattern module_name None >>= fun x -> Some (t, x)
+      let* x = full_module_names is_pattern module_name None in
+      Some (t, x)
   | ImportAll (t, module_name, _t2) ->
-      full_module_names is_pattern module_name None >>= fun x -> Some (t, x)
+      let* x = full_module_names is_pattern module_name None in
+      Some (t, x)
   | Package _
   | PackageEnd _
   | Pragma _

@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2021-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 class SemgrepVariant:
     def __init__(self, name: str, semgrep_core_extra: str, semgrep_extra: str = ""):
         # name for the input corpus (rules and targets)
@@ -21,11 +33,6 @@ from constants import STD
 SEMGREP_VARIANTS = [
     # default settings
     SemgrepVariant(STD, ""),
-    # removing optimisations
-    SemgrepVariant("no-cache", "-no_opt_cache"),
-    SemgrepVariant("max-cache", "-opt_max_cache"),
-    SemgrepVariant("no-bloom", "-no_bloom_filter"),
-    SemgrepVariant("no-gc-tuning", "-no_gc_tuning"),
     SemgrepVariant("no-filter-irrelevant-rules", "-no_filter_irrelevant_rules"),
 ]
 

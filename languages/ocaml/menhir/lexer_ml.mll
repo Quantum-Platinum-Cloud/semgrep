@@ -14,7 +14,7 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * license.txt for more details.
  *)
-module Ast = Ast_ml
+module Ast = AST_ocaml
 module Flag = Flag_parsing
 
 open Parser_ml
@@ -30,14 +30,14 @@ open Parser_ml
 (*****************************************************************************)
 (* shortcuts *)
 let tok = Lexing.lexeme
-let tokinfo = Parse_info.tokinfo
-let error = Parse_info.lexical_error
+let tokinfo = Tok.tok_of_lexbuf
+let error = Parsing_error.lexical_error
 
 (* ---------------------------------------------------------------------- *)
 (* Keywords *)
 (* ---------------------------------------------------------------------- *)
 (* src: http://caml.inria.fr/pub/docs/manual-ocaml/lex.html *)
-let keyword_table = Common.hash_of_list [
+let keyword_table = Hashtbl_.Base.hash_of_list [
 
   "fun", (fun ii -> Tfun ii);
   "function", (fun ii -> Tfunction ii);
@@ -169,7 +169,7 @@ rule token = parse
   | "(*" {
       let info = tokinfo lexbuf in
       let com = comment lexbuf in
-      TComment(info |> Parse_info.tok_add_s com)
+      TComment(info |> Tok.tok_add_s com)
     }
 
   (* ext: fsharp *)
@@ -293,7 +293,7 @@ rule token = parse
   | ident {
       let info = tokinfo lexbuf in
       let s = tok lexbuf in
-      match Common2.optionise (fun () -> Hashtbl.find keyword_table s) with
+      match Base.Hashtbl.find keyword_table s with
       | Some f -> f info
       | None -> TLowerIdent (s, info)
     }
@@ -340,7 +340,8 @@ rule token = parse
   | '-'? ("0b" | "0B")   ['0'-'1']
                        ( ['0'-'1'] | '_')*
    { let s = tok lexbuf in
-     TInt (int_of_string_opt s, tokinfo lexbuf)
+     let t = tokinfo lexbuf in
+     TInt (Parsed_int.parse (s, t))
    }
 
   | '-'?
@@ -361,7 +362,7 @@ rule token = parse
       let buf = Buffer.create 100 in
       string buf lexbuf;
       let s = Buffer.contents buf in
-      TString (s, info |> Parse_info.tok_add_s (s ^ "\""))
+      TString (s, info |> Tok.tok_add_s (s ^ "\""))
     }
 
   (* new feature I discovered thx to McPeak.
@@ -372,7 +373,7 @@ rule token = parse
       let buf = Buffer.create 100 in
       quoted_string buf lexbuf;
       let s = Buffer.contents buf in
-      TString (s, info |> Parse_info.tok_add_s (s ^ "|}"))
+      TString (s, info |> Tok.tok_add_s (s ^ "|}"))
   }
   (* ----------------------------------------------------------------------- *)
   (* Chars *)

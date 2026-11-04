@@ -3,15 +3,19 @@
  (name semgrep_engine)
  (wrapped false)
  (libraries
-   pcre
-   comby-kernel
+   base
+   collections
    alcotest
+   calendar
 
    commons
+   telemetry
+   parallelism
    pfff-lang_GENERIC-analyze
 
    parser_regexp
    spacegrep
+   aliengrep
 
    semgrep_core
    semgrep_fixing
@@ -23,7 +27,9 @@
    ; call Parse_pattern from Eval_generic)
    semgrep_parsing
    ; TODO: we should get rid of this dependency
-   semgrep_targeting ; for Input_to_core.atd
+   semgrep_targeting
+   semgrep_reporting; for Test_engine.ml, we should split in tests/ separate dir
  )
- (preprocess (pps ppx_deriving.show ppx_profiling))
+ (inline_tests)
+ (preprocess (pps ppx_deriving.show ppx_profiling ppx_inline_test telemetry.ppx commons.ppx))
 )

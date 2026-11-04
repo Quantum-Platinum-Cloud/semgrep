@@ -1,0 +1,30 @@
+File: semgrep-grammars/src/tree-sitter-go/LICENSE
+Git repo name: tree-sitter-go
+Latest commit in repo: 3c3775faa968158a8b4ac190a7fda867fd5fb748
+Last change in file:
+  commit d29ad53a4310a943880ae40c7050f8562bf84f33
+  Author: Max Brunsfeld <maxbrunsfeld@gmail.com>
+  Date:   Tue Aug 16 21:02:37 2016 -0700
+  
+      Start on top-level constructs, const declarations
+---
+File: semgrep-grammars/src/tree-sitter-go/grammar.js
+Git repo name: tree-sitter-go
+Latest commit in repo: 3c3775faa968158a8b4ac190a7fda867fd5fb748
+Last change in file:
+  commit 658507ecbbe4991fa2c655da17b5d63d07215bfd
+  Author: Amaan Qureshi <amaanq12@gmail.com>
+  Date:   Sun Nov 24 14:23:08 2024 -0500
+  
+      fix: correct raw string literal parsing
+---
+File: semgrep-grammars/src/semgrep-go/grammar.js
+Git repo name: nouakchott
+Latest commit in repo: e2140c03b13f562d3f6cd3803a3d087ef8f4b00c
+Last change in file:
+  commit 3bf8c544484c75150e293f84d51ca222e0613f38
+  Author: t <t@example.com>
+  Date:   Thu Sep 24 12:09:17 2026 -0600
+  
+      chore: remove unrelated grammar automation changes
+---

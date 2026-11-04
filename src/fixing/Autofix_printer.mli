@@ -1,3 +1,15 @@
+(*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* Print the given AST to a string, using the original text of nodes from the
  * fix pattern or target file wherever possible *)
 val print_ast :
@@ -9,7 +21,7 @@ val print_ast :
   (* Needed so that when printing, we can lift the original text for AST nodes
    * that came from the target source via metavariable bindings. Lazy because in
    * practice, computing this requires a disk read, and it may not be needed. *)
-  target_contents:string Lazy.t ->
+  target_contents:string Lazy_safe.t ->
   (* The original AST of the fix pattern written in the rule. Needed so that we
    * can identify nodes that came from the fix pattern, so that we can use their
    * original text instead of printing from scratch. *)

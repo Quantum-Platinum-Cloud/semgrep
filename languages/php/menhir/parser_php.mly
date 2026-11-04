@@ -57,10 +57,10 @@
   *)
  *)
 open Common
+open Either_
 module Flag = Flag_parsing
 
 open Cst_php
-module PI = Parse_info
 
 let mk_param s =
   { p_type = None;
@@ -79,18 +79,18 @@ let mk_var (s, tok) =
 
 let rec validate_parameter_list = function
   | [] -> ()
-  | Middle3 _ :: params  -> validate_parameter_list_empty params
-  | Left3 param :: params ->
+  | Either_.Middle3 _ :: params  -> validate_parameter_list_empty params
+  | Either_.Left3 param :: params ->
       if param.p_variadic <> None
       then validate_parameter_list_empty params
       else validate_parameter_list params
-  | Right3 _ :: params -> validate_parameter_list params
+  | Either_.Right3 _ :: params -> validate_parameter_list params
 
 and validate_parameter_list_empty = function
   | [] -> ()
-  | Right3 _ :: params -> validate_parameter_list_empty params
+  | Either_.Right3 _ :: params -> validate_parameter_list_empty params
   | _ ->
-      if !Flag.sgrep_mode
+      if Hook.get Flag.sgrep_mode
       then ()
       else raise Parsing.Parse_error
 
@@ -106,47 +106,49 @@ let mk_Toplevel x =
   | [] -> raise Impossible
   | [x] -> Toplevel x
   | xs -> Toplevels xs
+
+let str_of_info x = Tok.content_of_tok x
 %}
 
 (*************************************************************************)
 (* Tokens *)
 (*************************************************************************)
 
-%token <Parse_info.t> TUnknown (* unrecognized token *)
-%token <Parse_info.t> EOF
+%token <Tok.t> TUnknown (* unrecognized token *)
+%token <Tok.t> EOF
 
 (*-----------------------------------------*)
 (* The space/comment tokens *)
 (*-----------------------------------------*)
 (* coupling: Token_helpers.is_real_comment *)
-%token <Parse_info.t> TSpaces TNewline
+%token <Tok.t> TSpaces TNewline
 
 (* not mentionned in this grammar. filtered in parse_php.ml *)
-%token <Parse_info.t> T_COMMENT T_DOC_COMMENT
+%token <Tok.t> T_COMMENT T_DOC_COMMENT
 
 (* when use preprocessor and want to mark removed tokens as commented *)
-%token <Parse_info.t> TCommentPP
+%token <Tok.t> TCommentPP
 
 (*-----------------------------------------*)
 (* The normal tokens *)
 (*-----------------------------------------*)
-%token <bool * Parse_info.t> T_BOOL
-%token <int option * Parse_info.t> T_LNUMBER
-%token <float option * Parse_info.t> T_DNUMBER
-%token <string * Parse_info.t>
+%token <bool * Tok.t> T_BOOL
+%token <Parsed_int.t> T_LNUMBER
+%token <float option * Tok.t> T_DNUMBER
+%token <string * Tok.t>
  (* T_IDENT is for a regular ident and  T_VARIABLE is for a dollar ident. *)
  T_IDENT T_VARIABLE
  T_CONSTANT_ENCAPSED_STRING   T_ENCAPSED_AND_WHITESPACE  T_INLINE_HTML
  (* used only for offset of array access inside strings *)
  T_NUM_STRING
  T_STRING_VARNAME
-(*in original: %token <Parse_info.t> T_CHARACTER T_BAD_CHARACTER *)
+(*in original: %token <Tok.t> T_CHARACTER T_BAD_CHARACTER *)
 
 (*-----------------------------------------*)
 (* Keyword tokens *)
 (*-----------------------------------------*)
 
-%token <Parse_info.t>
+%token <Tok.t>
  T_IF T_ELSE T_ELSEIF T_ENDIF
  T_DO  T_WHILE   T_ENDWHILE  T_FOR     T_ENDFOR T_FOREACH T_ENDFOREACH
  T_SWITCH  T_ENDSWITCH T_CASE T_DEFAULT    T_BREAK T_CONTINUE
@@ -178,7 +180,7 @@ let mk_Toplevel x =
 (* Punctuation tokens *)
 (*-----------------------------------------*)
 
-%token <Parse_info.t>
+%token <Tok.t>
  T_OBJECT_OPERATOR "->" T_ARROW "=>" T_DOUBLE_ARROW "==>"
  T_OPEN_TAG  T_CLOSE_TAG T_OPEN_TAG_WITH_ECHO T_CLOSE_TAG_OF_ECHO
  T_START_HEREDOC    T_END_HEREDOC
@@ -219,20 +221,20 @@ let mk_Toplevel x =
 (*-----------------------------------------*)
 (* PHP language extensions: *)
 (*-----------------------------------------*)
-%token <Parse_info.t> T_YIELD T_FROM T_AWAIT
-%token <Parse_info.t> T_SUPER
+%token <Tok.t> T_YIELD T_FROM T_AWAIT
+%token <Tok.t> T_SUPER
 
 (* phpext: for hack and also for semgrep *)
-%token <Parse_info.t> T_ELLIPSIS "..."
+%token <Tok.t> T_ELLIPSIS "..."
 (* semgrep-ext: *)
-%token <Parse_info.t> LDots "<..." RDots "...>"
-%token <string * Parse_info.t> T_METAVAR
+%token <Tok.t> LDots "<..." RDots "...>"
+%token <string * Tok.t> T_METAVAR
 
 
 (* lexing hack to parse lambda params properly *)
-%token <Parse_info.t> T_LAMBDA_OPAR T_LAMBDA_CPAR
+%token <Tok.t> T_LAMBDA_OPAR T_LAMBDA_CPAR
 
-%token <Parse_info.t> T_ENUM
+%token <Tok.t> T_ENUM
 
 (*************************************************************************)
 (* Priorities *)
@@ -397,7 +399,7 @@ statement:
      additional_catch* finally_clause?
      { let try_block = ($2,$3,$4) in
        let catch_block = ($10, $11, $12) in
-       let t = List.hd $7 in (* TODO: return a list of types *)
+       let t = List_.hd_exn "unexpected empty list" $7 in (* TODO: return a list of types *)
        let catch = ($5, ($6, (t, DName $8), $9), catch_block) in
        Try($1, try_block, [catch] @ $13, o2l $14)
      }
@@ -612,7 +614,7 @@ parameter_bis:
      { let p = mk_param $3 in Left3 {p with p_ref=Some $1; p_variadic=Some $2; p_type=Some(HintVariadic ($2, None))} }
  (* varargs extension, and semgrep-ext: *)
  | "..."
-     { Middle3 $1 }
+     { Either_.Middle3 $1 }
 
 (* semgrep-ext: there are places where we expect a T_VARIABLE and we
  * also want to accept metavariables.
@@ -877,11 +879,11 @@ type_php_or_dots_list:
  | (*empty*)                     { [] }
  | non_empty_type_php_or_dots_list   { $1 }
  (* php-facebook-ext: trailing comma *)
- | non_empty_type_php_or_dots_list "," { $1 @ [Right3 $2] }
+ | non_empty_type_php_or_dots_list "," { $1 @ [Either_.Right3 $2] }
 
 type_php_or_dots:
- | type_php { Left3 $1 }
- | "..."    { Middle3 $1 }
+ | type_php { Either_.Left3 $1 }
+ | "..."    { Either_.Middle3 $1 }
 
 (* Do not confuse type_parameters and type_arguments. Type parameters
    * can only be simple identifiers, as in class Foo<T1, T2> { ... },
@@ -903,7 +905,9 @@ return_type: ":" type_php                 { $1, $2 }
 (* Attributes *)
 (*************************************************************************)
 (* PHP 8 extension (was using << >> in HPHP) *)
-attributes: "#[" listc(attribute) "]" { ($1, $2, $3) }
+attributes:
+| "#[" listc(attribute) "]" { ($1, $2, $3) }
+| attributes attributes {match ($1, $2) with ((lp,xs1,_),(_,xs2,rp)) -> (lp,xs1@xs2,rp)}
 
 attribute:
  | ident                                  { Attribute $1 }
@@ -939,10 +943,10 @@ expr:
 
  | simple_expr T_CONCAT_EQUAL expr { AssignOp($1,(AssignConcat,$2),$3) }
 
- | expr T_INC { Postfix($1, (AST_generic_.Incr, $2)) }
- | expr T_DEC { Postfix($1, (AST_generic_.Decr, $2)) }
- | T_INC expr { Infix((AST_generic_.Incr, $1), $2) }
- | T_DEC expr { Infix((AST_generic_.Decr, $1), $2) }
+ | expr T_INC { Postfix($1, (AST_generic.Incr, $2)) }
+ | expr T_DEC { Postfix($1, (AST_generic.Decr, $2)) }
+ | T_INC expr { Infix((AST_generic.Incr, $1), $2) }
+ | T_DEC expr { Infix((AST_generic.Decr, $1), $2) }
 
  | expr T_BOOLEAN_OR   expr { Binary($1,(Logical OrBool ,$2),$3) }
  | expr T_BOOLEAN_AND  expr { Binary($1,(Logical AndBool,$2),$3) }
@@ -990,7 +994,7 @@ expr:
 
  (* less: it would be nicer to have "(" TTypename ")"
   * but this would require some parsing tricks to sometimes return
-  * a TIdent and TTypename like in pfff/lang_cpp/parsing/.
+  * a TIdent and TTypename like in cpp/menhir/.
   *)
  | T_BOOL_CAST   expr   { Cast((BoolTy,$1),$2) }
  | T_INT_CAST    expr   { Cast((IntTy,$1),$2) }
@@ -1327,9 +1331,9 @@ exit_expr:
 ident:
  | T_IDENT { $1 }
 
- | T_ENUM      { PI.str_of_info $1, $1 }
- | T_TYPE      { PI.str_of_info $1, $1 }
- | T_SUPER     { PI.str_of_info $1, $1 }
+ | T_ENUM      { str_of_info $1, $1 }
+ | T_TYPE      { str_of_info $1, $1 }
+ | T_SUPER     { str_of_info $1, $1 }
  (* semgrep-ext: *)
  | T_METAVAR   { $1 }
 
@@ -1342,7 +1346,7 @@ ident_encaps:
 ident_in_name:
  | ident { $1 }
  (* can't use keyword_as_ident here, too many conflicts *)
- | T_INSTANCEOF { PI.str_of_info $1, $1 }
+ | T_INSTANCEOF { str_of_info $1, $1 }
 
 (* used in class definitions *)
 ident_class_name:
@@ -1360,10 +1364,10 @@ ident_method_name:
 ident_constant_name: ident_method_name { $1 }
 
 keyword_as_ident:
- | T_PARENT      { PI.str_of_info $1, $1 }
- | T_SELF        { PI.str_of_info $1, $1 }
- | T_INSTANCEOF  { PI.str_of_info $1, $1 }
- | T_ARRAY       { PI.str_of_info $1, $1 }
+ | T_PARENT      { str_of_info $1, $1 }
+ | T_SELF        { str_of_info $1, $1 }
+ | T_INSTANCEOF  { str_of_info $1, $1 }
+ | T_ARRAY       { str_of_info $1, $1 }
  | keyword_as_ident_for_field { $1 }
 
 (* This is used in 'keyword_as_ident' above, as well as in 'member_expr' via:
@@ -1372,17 +1376,17 @@ keyword_as_ident:
  * in primary_expr, hence the move in keyword_as_ident instead.
  *)
 keyword_as_ident_for_field:
- | T_ASYNC       { PI.str_of_info $1, $1 }
- | T_INCLUDE     { PI.str_of_info $1, $1 }
- | T_PUBLIC      { PI.str_of_info $1, $1 }
- | T_DEFAULT     { PI.str_of_info $1, $1 }
- | T_LIST        { PI.str_of_info $1, $1 }
- | T_LOGICAL_AND { PI.str_of_info $1, $1 }
- | T_NEW         { PI.str_of_info $1, $1 }
- | T_FROM        { PI.str_of_info $1, $1 }
- | T_GLOBAL       { PI.str_of_info $1, $1 }
- | T_AS       { PI.str_of_info $1, $1 }
- | T_FOR       { PI.str_of_info $1, $1 }
+ | T_ASYNC       { str_of_info $1, $1 }
+ | T_INCLUDE     { str_of_info $1, $1 }
+ | T_PUBLIC      { str_of_info $1, $1 }
+ | T_DEFAULT     { str_of_info $1, $1 }
+ | T_LIST        { str_of_info $1, $1 }
+ | T_LOGICAL_AND { str_of_info $1, $1 }
+ | T_NEW         { str_of_info $1, $1 }
+ | T_FROM        { str_of_info $1, $1 }
+ | T_GLOBAL       { str_of_info $1, $1 }
+ | T_AS       { str_of_info $1, $1 }
+ | T_FOR       { str_of_info $1, $1 }
 
 (*************************************************************************)
 (* Namespace *)

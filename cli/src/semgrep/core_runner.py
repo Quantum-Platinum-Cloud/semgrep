@@ -1,11 +1,24 @@
+#
+# Copyright (c) 2020-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import asyncio
 import collections
 import contextlib
+import heapq
 import json
-import multiprocessing
-import resource
-import shlex
-import subprocess
+import logging
+import math
+import os
+import shutil
 import sys
 import tempfile
 from datetime import datetime
@@ -20,41 +33,109 @@ from typing import Optional
 from typing import Sequence
 from typing import Set
 from typing import Tuple
-from typing import TYPE_CHECKING
+from typing import Union
 
-from attr import asdict
-from attr import field
-from attr import frozen
+from rich.progress import BarColumn
+from rich.progress import Progress
+from rich.progress import TaskID
+from rich.progress import TaskProgressColumn
+from rich.progress import TextColumn
+from rich.progress import TimeElapsedColumn
 from ruamel.yaml import YAML
-from tqdm import tqdm
 
-import semgrep.fork_subprocess as fork_subprocess
-import semgrep.output_from_core as core
+import semgrep.semgrep_interfaces.semgrep_output_v1 as out
+from semgrep import telemetry
 from semgrep.app import auth
 from semgrep.config_resolver import Config
+from semgrep.console import console
 from semgrep.constants import Colors
+from semgrep.constants import MemoryPolicy
 from semgrep.constants import PLEASE_FILE_ISSUE_TEXT
 from semgrep.core_output import core_error_to_semgrep_error
 from semgrep.core_output import core_matches_to_rule_matches
-from semgrep.core_output import parse_core_output
+from semgrep.core_targets_plan import Plan
+from semgrep.core_targets_plan import Task
+from semgrep.engine import EngineType
 from semgrep.error import SemgrepCoreError
 from semgrep.error import SemgrepError
 from semgrep.error import with_color
+from semgrep.output_extra import OutputExtra
 from semgrep.parsing_data import ParsingData
-from semgrep.profiling import ProfilingData
-from semgrep.profiling import Times
 from semgrep.rule import Rule
 from semgrep.rule_match import OrderedRuleMatchList
 from semgrep.rule_match import RuleMatchMap
-from semgrep.semgrep_core import SemgrepCore
 from semgrep.semgrep_types import Language
+from semgrep.simple_profiling import enabled_simple_profiling
+from semgrep.simple_profiling import import_simple_profiling
+from semgrep.simple_profiling import simple_profiling
 from semgrep.state import get_state
 from semgrep.target_manager import TargetManager
-from semgrep.util import sub_check_output
-from semgrep.util import unit_str
+from semgrep.target_mode import TargetModeConfig
+from semgrep.types import fpaths_of_targets
+from semgrep.types import Target
+from semgrep.types import target_info_acc_of_target_acc
+from semgrep.types import TargetAccumulator
+from semgrep.util import IS_WINDOWS
 from semgrep.verbose_logging import getLogger
 
 logger = getLogger(__name__)
+
+# Sharding costs a fixed amount per file, so keep small scans single-file --
+# but only when they are small in bytes too, since a few enormous rules are
+# what the byte budget below exists to bound.
+RULE_FILE_SHARD_MIN_RULES = 128
+
+# Target serialized size of one shard. Parsing holds a large multiple of a
+# shard's bytes as live heap and major-GC work scales with the live set, so
+# capping shard size caps both peak memory and parse time. Measured optimum on
+# a 10,240-rule / 114MiB ruleset; smaller shards were slower but did keep
+# lowering peak memory.
+RULE_FILE_SHARD_TARGET_BYTES = 2 * 1024 * 1024
+
+# Backstop on shard count. Shards are written and closed one at a time, so fds
+# do not bound this; the command line does, at ~80 chars per `-rules <path>`
+# against Windows' 32767 limit. Beyond this shards just exceed the target,
+# which degrades gracefully.
+RULE_FILE_SHARD_MAX_COUNT = 256
+
+
+def _shard_count(rules: int, jobs: Optional[int], total_bytes: int) -> int:
+    """Pick how many files to split the serialized ruleset across."""
+    if rules < RULE_FILE_SHARD_MIN_RULES and total_bytes <= (
+        RULE_FILE_SHARD_TARGET_BYTES
+    ):
+        return 1
+    # An explicit `--jobs 1` really does mean a single domain in core. Anything
+    # else runs multicore and benefits from sharding -- including no `--jobs`
+    # at all, where we pass no `-j` and core picks its own domain count.
+    if jobs is not None and jobs <= 1:
+        return 1
+    size_based = math.ceil(total_bytes / RULE_FILE_SHARD_TARGET_BYTES)
+    jobs_floor = min(rules, jobs) if jobs is not None else 1
+    return max(1, min(rules, RULE_FILE_SHARD_MAX_COUNT, max(jobs_floor, size_based)))
+
+
+def _shard_rules(sizes: Sequence[int], shard_count: int) -> List[List[int]]:
+    """Partition rule indices into `shard_count` shards of even serialized size.
+
+    Balances by bytes, not rule count: heavy rules cluster, so equal-count
+    slices leave one shard well above the median and the parse phase finishes
+    no sooner than its largest shard. A shard cannot be smaller than its
+    largest rule, so this evens shards out rather than bounding them.
+
+    Rule order is preserved within a shard but not across them; concatenating
+    the shards no longer reproduces the original order.
+    """
+    if shard_count <= 1:
+        return [list(range(len(sizes)))]
+    shards: List[List[int]] = [[] for _ in range(shard_count)]
+    # (bytes assigned so far, shard index); the index keeps ties deterministic.
+    heap = [(0, shard_index) for shard_index in range(shard_count)]
+    for index in sorted(range(len(sizes)), key=lambda i: (-sizes[i], i)):
+        assigned, shard_index = heapq.heappop(heap)
+        shards[shard_index].append(index)
+        heapq.heappush(heap, (assigned + sizes[index], shard_index))
+    return [sorted(shard) for shard in shards]
 
 
 # Size in bytes of the input buffer for reading analysis outputs.
@@ -70,12 +151,15 @@ INPUT_BUFFER_LIMIT: int = 1024 * 1024 * 1024
 # test/e2e/test_performance.py is one test that exercises this risk.
 LARGE_READ_SIZE: int = 1024 * 1024 * 512
 
+if not IS_WINDOWS:
+    import resource
 
-def get_cpu_count() -> int:
-    try:
-        return multiprocessing.cpu_count()
-    except NotImplementedError:
-        return 1  # CPU count is not implemented on Windows
+
+def parse_core_output_json(output_json: Any) -> out.CoreOutput:
+    """Convert JSON tree into CoreOutput and import profiling data"""
+    res = out.CoreOutput.from_json(output_json)
+    import_simple_profiling(res.profiling_results)
+    return res
 
 
 def setrlimits_preexec_fn() -> None:
@@ -90,9 +174,26 @@ def setrlimits_preexec_fn() -> None:
     Note this is intended to run as a preexec_fn before semgrep-core in a subprocess
     so all code here runs in a child fork before os switches to semgrep-core binary
     """
+    # since this logging is inside the child core processes,
+    # which have their own output requirements so that CLI can parse its stdout,
+    # we use a different logger than the usual "semgrep" one
+    core_logger = getLogger("semgrep_core")
+
+    handler = logging.StreamHandler(stream=sys.stderr)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    handler.setLevel(logging.WARNING)
+    core_logger.addHandler(handler)
+    core_logger.propagate = False
+
+    if IS_WINDOWS:
+        core_logger.info("Skipping setting stack limits on Windows")
+        return
+
     # Get current soft and hard stack limits
     old_soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_STACK)
-    logger.info(f"Existing stack limits: Soft: {old_soft_limit}, Hard: {hard_limit}")
+    core_logger.info(
+        f"Existing stack limits: Soft: {old_soft_limit}, Hard: {hard_limit}"
+    )
 
     # Have candidates in case os unable to set certain limit
     potential_soft_limits = [
@@ -114,17 +215,19 @@ def setrlimits_preexec_fn() -> None:
     potential_soft_limits.sort(reverse=True)
     for soft_limit in potential_soft_limits:
         try:
-            logger.info(f"Trying to set soft limit to {soft_limit}")
+            core_logger.info(f"Trying to set soft limit to {soft_limit}")
             resource.setrlimit(resource.RLIMIT_STACK, (soft_limit, hard_limit))
-            logger.info(f"Successfully set stack limit to {soft_limit}, {hard_limit}")
+            core_logger.info(
+                f"Successfully set stack limit to {soft_limit}, {hard_limit}"
+            )
             return
         except Exception as e:
-            logger.info(
+            core_logger.info(
                 f"Failed to set stack limit to {soft_limit}, {hard_limit}. Trying again."
             )
-            logger.verbose(str(e))
+            core_logger.verbose(str(e))
 
-    logger.info("Failed to change stack limits")
+    core_logger.info("Failed to change stack limits")
 
 
 # This is used only to dedup errors from validate_configs(). For dedupping errors
@@ -133,27 +236,32 @@ def dedup_errors(errors: List[SemgrepCoreError]) -> List[SemgrepCoreError]:
     return list({uniq_error_id(e): e for e in errors}.values())
 
 
-def uniq_error_id(
-    error: SemgrepCoreError,
-) -> Tuple[int, Path, core.Position, core.Position, str]:
-    return (
-        error.code,
-        Path(error.core.location.path),
-        error.core.location.start,
-        error.core.location.end,
-        error.core.message,
-    )
+def uniq_error_id(error: SemgrepCoreError) -> Any:
+    if error.core.location:
+        return (
+            error.code,
+            Path(error.core.location.path.value),
+            error.core.location.start,
+            error.core.location.end,
+            error.core.message,
+        )
+    else:
+        return (
+            error.code,
+            error.core.message,
+        )
 
 
+@telemetry.trace()
 def open_and_ignore(fname: str) -> None:
     """
     Attempt to open 'fname' simply so a record of having done so will
     be seen by 'strace'.
     """
     try:
-        with open(fname, "rb") as in_file:
+        with open(fname, "rb"):
             pass  # Not expected, but not a problem.
-    except BaseException:
+    except BaseException:  # noqa: B036
         pass  # Expected outcome
 
 
@@ -162,15 +270,22 @@ class StreamingSemgrepCore:
     Handles running semgrep-core in a streaming fashion
 
     This behavior is assumed to be that semgrep-core:
-    - prints a "." on a newline for every file it finishes scanning
-    - prints a number on a newline for any extra targets produced during a scan
-    - prints a single json blob of all results
+    - prints on stdout a "." on a newline for every file it finishes scanning
+    - prints on stdout a number on a newline for any extra targets produced
+      during a scan
+    - prints on stdout a single json blob of all results
 
     Exposes the subprocess.CompletedProcess properties for
     expediency in integrating
+
+    capture_stderr is to capture the stderr of semgrep-core in a pipe; if set
+    to false then the stderr of semgrep-core is reusing the one of pysemgrep
+    allowing to show the logs of semgrep-core as soon as they are produced.
     """
 
-    def __init__(self, cmd: List[str], total: int) -> None:
+    def __init__(
+        self, cmd: List[str], total: int, engine_type: EngineType, capture_stderr: bool
+    ) -> None:
         """
         cmd: semgrep-core command to run
         total: how many rules to run / how many "." we expect to see a priori
@@ -180,11 +295,10 @@ class StreamingSemgrepCore:
         self._total = total
         self._stdout = ""
         self._stderr = ""
-        self._progress_bar: Optional[tqdm] = None  # type: ignore
-
-        # Map from file name to contents, to be checked before the real
-        # file system when servicing requests from semgrep-core.
-        self.vfs_map: Dict[str, bytes] = {}
+        self._capture_stderr = capture_stderr
+        self._progress_bar: Optional[Progress] = None
+        self._progress_bar_task_id: Optional[TaskID] = None
+        self._engine_type: EngineType = engine_type
 
     @property
     def stdout(self) -> str:
@@ -210,39 +324,130 @@ class StreamingSemgrepCore:
         """
         stdout_lines: List[bytes] = []
         num_total_targets: int = self._total
-        num_scanned_targets: int = 0
+        completed_targets: int = 0
 
-        # Start out reading two bytes at a time (".\n")
+        # Progress indicator bytes that we see from semgrep-core stdout
+        progress_bytes = b".\r\n" if IS_WINDOWS else b".\n"
+        # Start out reading two (or three on Windows) bytes at a time
         get_input: Callable[
             [asyncio.StreamReader], Coroutine[Any, Any, bytes]
-        ] = lambda s: s.readexactly(2)
+        ] = lambda s: s.readexactly(len(progress_bytes))
         reading_json = False
+        # Read the progress_bytes repeatedly until we reach the JSON output.
+        # TODO: read progress from one channel and JSON data from another.
+        # or at least write/read progress as a stream of JSON objects so that
+        # we don't have to hack a parser together.
+        has_started = False
         while True:
             # blocking read if buffer doesnt contain any lines or EOF
-            line_bytes = await get_input(stream)
+            try:
+                line_bytes = await get_input(stream)
+            except asyncio.IncompleteReadError:
+                logger.debug(self._stderr)
+                # happens if the data that follows a sequence of zero
+                # or more progress_bytes has fewer than two bytes, such as:
+                # "", "3", ".\n.\n3", ".\n.\n.\n.", etc.
+
+                # Hack: the exact wording of parts this message may be used in metrics queries
+                # that are looking for it. Make sure `semgrep-core exited with unexpected output`
+                # and `interfile analysis` are both in the message, or talk to Emma.
+                raise SemgrepError(
+                    f"""
+                    You are seeing this because the engine was killed.
+
+                    The most common reason this happens is because it used too much memory.
+                    If your repo is large (~10k files or more), you have three options:
+                    1. Increase the amount of memory available to semgrep
+                    2. Reduce the number of jobs semgrep runs with via `-j <jobs>`.
+                    3. Scan the repo in parts (contact us for help)
+
+                    Otherwise, it is likely that semgrep is hitting the limit on only some
+                    files. In this case, you can try to set the limit on the amount of memory
+                    semgrep can use on each file with `--max-memory <memory>`. We recommend
+                    lowering this to a limit 70% of the available memory. For CI runs with
+                    interfile analysis, the default max-memory is 5000MB. Without, the default
+                    is unlimited.
+
+                    If you have tried all these steps and still are seeing this error, please
+                    contact us.
+
+                       Error: semgrep-core exited with unexpected output
+                    """,
+                )
+
+            if (
+                not has_started
+                and self._progress_bar
+                and self._progress_bar_task_id is not None
+            ):
+                has_started = True
+                self._progress_bar.start_task(self._progress_bar_task_id)
 
             # read returns empty when EOF
             if not line_bytes:
                 self._stdout = b"".join(stdout_lines).decode("utf-8", "replace")
                 break
 
-            if line_bytes == b".\n" and not reading_json:
-                num_scanned_targets += 1
-                if self._progress_bar:
-                    self._progress_bar.update()
+            if line_bytes == progress_bytes and not reading_json:
+                # We expect to see 3 dots for each target, when running interfile analysis:
+                # - once when finishing phase 4, name resolution, on that target
+                # - once when finishing phase 5, taint configs, on that target
+                # - once when finishing analysis on that target as usual
+                #
+                # However, for regular OSS Semgrep, we only print one dot per
+                # target, that being the last bullet point listed above.
+                #
+                # So a dot counts as 1 progress if running Pro, but 3 progress if
+                # running the OSS engine.
+                advanced_targets = 1 if self._engine_type.is_interfile else 3
+                completed_targets += advanced_targets
+
+                if self._progress_bar and self._progress_bar_task_id is not None:
+                    self._progress_bar.update(
+                        self._progress_bar_task_id, advance=advanced_targets
+                    )
             elif chr(line_bytes[0]).isdigit() and not reading_json:
                 if not line_bytes.endswith(b"\n"):
                     line_bytes = line_bytes + await stream.readline()
                 extra_targets = int(line_bytes)
                 num_total_targets += extra_targets
-                if self._progress_bar:
-                    self._progress_bar.total += extra_targets
+                if self._progress_bar and self._progress_bar_task_id is not None:
+                    self._progress_bar.update(
+                        self._progress_bar_task_id, total=num_total_targets
+                    )
             else:
                 stdout_lines.append(line_bytes)
                 # Once we see a non-"." char it means we are reading a large json blob
                 # so increase the buffer read size.
                 reading_json = True
                 get_input = lambda s: s.read(n=LARGE_READ_SIZE)
+
+        # Check to make sure all targets were reported by semgrep-core as completed. See
+        # SAF-2079 for a discussion of when they haven't all been.
+        #
+        # NOTE: If you change this error message, please also change the message in
+        # test_progress_report_when_errors in
+        # e2e/test_semgrep_core_parse_error.py. (Should there instead be a shared
+        # constant?)
+        if completed_targets < num_total_targets:
+            logger.debug(
+                "Not all targets were reported by semgrep-core as completed, only %d/%d",
+                completed_targets,
+                num_total_targets,
+            )
+            # It's hard to get progress reporting totally correct, but we're all done now,
+            # so force the progress bar to 100%.
+            if self._progress_bar and self._progress_bar_task_id is not None:
+                self._progress_bar.update(
+                    self._progress_bar_task_id,
+                    advance=num_total_targets - completed_targets,
+                )
+        elif completed_targets > num_total_targets:
+            logger.debug(
+                "More targets were reported by semgrep-core as completed than total registered, %d/%d",
+                completed_targets,
+                num_total_targets,
+            )
 
     async def _core_stderr_processor(
         self, stream: Optional[asyncio.StreamReader]
@@ -253,6 +458,9 @@ class StreamingSemgrepCore:
         Basically works synchronously and combines output to
         stderr to self._stderr
         """
+        if not self._capture_stderr:
+            return
+
         stderr_lines: List[str] = []
 
         if stream is None:
@@ -270,26 +478,8 @@ class StreamingSemgrepCore:
             line = line_bytes.decode("utf-8", "replace")
             stderr_lines.append(line)
 
-    def _handle_read_file(self, fname: str) -> Tuple[bytes, int]:
-        """
-        Handler for semgrep_analyze 'read_file' callback.
-        """
-        try:
-            if fname in self.vfs_map:
-                contents = self.vfs_map[fname]
-                logger.debug(f"read_file: in memory {fname}: {len(contents)} bytes")
-                return (contents, 0)
-            with open(fname, "rb") as in_file:
-                contents = in_file.read()
-                logger.debug(f"read_file: disk read {fname}: {len(contents)} bytes")
-                return (contents, 0)
-        except BaseException as e:
-            logger.debug(f"read_file: reading {fname}: exn: {e!r}")
-            exnClass = type(e).__name__
-            return (f"{fname}: {exnClass}: {e}".encode(), 1)
-
     async def _handle_process_outputs(
-        self, stdout: asyncio.StreamReader, stderr: asyncio.StreamReader
+        self, stdout: asyncio.StreamReader, stderr: Optional[asyncio.StreamReader]
     ) -> None:
         """
         Wait for both output streams to reach EOF, processing and
@@ -304,7 +494,12 @@ class StreamingSemgrepCore:
         # Raise any exceptions from processing stdout/err
         for r in results:
             if isinstance(r, Exception):
-                raise SemgrepError(f"Error while running rules: {r}")
+                # wait until after we have finished gathering stderr before
+                # sticking it in the error. Previously we had it in the "You are
+                # seeing this because the engine was killed." but that relied on
+                # the async io reader to have read before we got to that point,
+                # which in practice never happened
+                raise SemgrepError(f"Error while running rules: {r}\n{self._stderr}")
 
     async def _stream_exec_subprocess(self) -> int:
         """
@@ -313,69 +508,61 @@ class StreamingSemgrepCore:
 
         Return its exit code when it terminates.
         """
-        process = await asyncio.create_subprocess_exec(
-            *self._cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            limit=INPUT_BUFFER_LIMIT,
-            preexec_fn=setrlimits_preexec_fn,
-        )
+        stderr_arg = asyncio.subprocess.PIPE if self._capture_stderr else None
+
+        # Set parent span id as close to fork as possible to ensure core
+        # spans nest under the correct pysemgrep parent span.
+        get_state().telemetry.inject()
+        if IS_WINDOWS:
+            process = await asyncio.create_subprocess_exec(
+                *self._cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=stderr_arg,
+                limit=INPUT_BUFFER_LIMIT,
+                # preexec_fn is not supported on Windows
+            )
+        else:
+            process = await asyncio.create_subprocess_exec(
+                *self._cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=stderr_arg,
+                limit=INPUT_BUFFER_LIMIT,
+                preexec_fn=setrlimits_preexec_fn,
+            )
 
         # Ensured by passing stdout/err named parameters above.
         assert process.stdout
-        assert process.stderr
+        if self._capture_stderr:
+            assert process.stderr
 
-        await self._handle_process_outputs(process.stdout, process.stderr)
+        try:
+            await self._handle_process_outputs(process.stdout, process.stderr)
+        # Usually happens when the process is killed by the OS
+        except SemgrepError as e:
+            # Since this is error handling code, it's extra important to be
+            # defensive. As such, let's not have this be a straight wait call
+            # which will wait indefinitely for the subprocess to complete. let's
+            # instead just wait for a second so we don't risk getting stuck.
+            # This is fine since this is expected to only happen when the
+            # semgrep-core process was killed
+            try:
+                exit_code = await asyncio.wait_for(process.wait(), timeout=1.0)
+            except TimeoutError:
+                logger.error(
+                    "semgrep timed out waiting for the semgrep-core process to exit after an exception was raised"
+                )
+                raise e
+
+            # let's log this and reraise as if we got a non zero exit code with
+            # a semgrep error then we segfaulted or OOMd and so should
+            # immediately exit instead of assuming we got something usuable
+            logger.error(f"semgrep-core exited with {exit_code}!")
+            raise e
 
         # Return exit code of cmd. process should already be done
         return await process.wait()
 
-    def _run_forked_analysis_in_child(self) -> None:
-        """
-        Run semgrep_analyze from within the child process.
-        """
-        # Like in the exec case, try to expand limits in the child.
-        setrlimits_preexec_fn()
-
-        # TYPE_CHECKING is always false at run time, but by doing this,
-        # mypy will know which module 'semgrep_bridge_python' refers to,
-        # and hence check the calls to it.
-        if TYPE_CHECKING:
-            import semgrep_bridge_python
-        else:
-            semgrep_bridge_python = SemgrepCore.get_bridge_module()
-
-        # Currently, we delay initializing the OCaml runtime until we
-        # are in the forked child.  Later, we may want to hoist this to
-        # the parent somewhere so multiple queries can be more
-        # efficiently performed in the context of a Snowflake UDF.
-        semgrep_bridge_python.startup()
-
-        # Invoke the semgrep_bridge_python module.
-        err = semgrep_bridge_python.semgrep_analyze(self._cmd, self._handle_read_file)
-
-        if err != None:
-            # Convey an error back to the parent.
-            print(err, file=sys.stderr)
-            sys.exit(2)
-
-        semgrep_bridge_python.shutdown()
-
-    async def _stream_fork_subprocess(self) -> int:
-        """
-        Run semgrep_bridge_python.so in a forked (but not exec'd) child
-        process, consuming its output asynchronously.
-
-        Return its exit code when it terminates.
-        """
-        process = await fork_subprocess.start_fork_subprocess(
-            lambda: self._run_forked_analysis_in_child(), limit=INPUT_BUFFER_LIMIT
-        )
-
-        await self._handle_process_outputs(process.stdout, process.stderr)
-
-        return process.wait()
-
+    @telemetry.trace()
     def execute(self) -> int:
         """
         Run semgrep-core and listen to stdout to update
@@ -383,129 +570,33 @@ class StreamingSemgrepCore:
 
         Blocks til completion and returns exit code
         """
-        open_and_ignore("/tmp/core-runner-semgrep-BEGIN")
+        open_and_ignore(f"{tempfile.gettempdir()}/core-runner-semgrep-BEGIN")
 
         terminal = get_state().terminal
-        if (
-            sys.stderr.isatty()
-            and self._total > 1
-            and not terminal.is_quiet
-            and not terminal.is_debug
-        ):
-            # cf. for bar_format: https://tqdm.github.io/docs/tqdm/
-            self._progress_bar = tqdm(  # typing: ignore
-                total=self._total,
-                file=sys.stderr,
-                bar_format="  {l_bar}{bar}|{n_fmt}/{total_fmt} tasks",
+        with Progress(
+            # align progress bar to output by indenting 2 spaces
+            # (the +1 space comes from column gap)
+            TextColumn(" "),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
+            console=console,
+            disable=(
+                not sys.stderr.isatty()
+                or self._total <= 1
+                or terminal.is_quiet
+                or terminal.is_debug
+            ),
+        ) as progress_bar:
+            self._progress_bar = progress_bar
+            self._progress_bar_task_id = self._progress_bar.add_task(
+                "", total=self._total, start=False
             )
 
-        if SemgrepCore.using_bridge_module():
-            rc = asyncio.run(self._stream_fork_subprocess())
-        else:
             rc = asyncio.run(self._stream_exec_subprocess())
 
-        if self._progress_bar:
-            self._progress_bar.close()
-
-        open_and_ignore("/tmp/core-runner-semgrep-END")
+        open_and_ignore(f"{tempfile.gettempdir()}/core-runner-semgrep-END")
         return rc
-
-
-@frozen
-class Task:
-    path: str = field(converter=str)
-    language: Language
-    rule_nums: Sequence[int]
-
-
-class TargetMappings(List[Task]):
-    @property
-    def rule_count(self) -> int:
-        return len({rule for task in self for rule in task.rule_nums})
-
-    @property
-    def file_count(self) -> int:
-        return len(self)
-
-
-class Plan:
-    """
-    Saves and displays knowledge of what will be run
-
-    to_json: creates the json passed to semgrep_core - see Input_to_core.atd
-    log: outputs a summary of how many files will be scanned for each file
-    """
-
-    def __init__(self, mappings: List[Task], rule_ids: List[str]):
-        self.target_mappings = TargetMappings(mappings)
-        # important: this is a list of rule_ids, not a set
-        # target_mappings relies on the index of each rule_id in rule_ids
-        self.rule_ids = rule_ids
-
-    def split_by_lang_label(self) -> Dict[str, "TargetMappings"]:
-        result: Dict[str, TargetMappings] = collections.defaultdict(TargetMappings)
-        for task in self.target_mappings:
-            label = (
-                "<multilang>"
-                if task.language in {Language("regex"), Language("generic")}
-                else task.language
-            )
-            result[label].append(task)
-        return result
-
-    def to_json(self) -> Dict[str, Any]:
-        return {
-            "target_mappings": [asdict(task) for task in self.target_mappings],
-            "rule_ids": self.rule_ids,
-        }
-
-    @property
-    def num_targets(self) -> int:
-        return len(self.target_mappings)
-
-    def log(self) -> None:
-        metrics = get_state().metrics
-
-        if self.target_mappings.rule_count == 0:
-            logger.info("Nothing to scan.")
-            return
-
-        if self.target_mappings.rule_count == 1:
-            logger.info(f"Scanning {unit_str(len(self.target_mappings), 'file')}.")
-            return
-
-        plans_by_language = sorted(
-            self.split_by_lang_label().items(),
-            key=lambda x: (x[1].file_count, x[1].rule_count),
-            reverse=True,
-        )
-        if len(plans_by_language) == 1:
-            logger.info(
-                f"Scanning {unit_str(self.target_mappings.file_count, 'file')} with {unit_str(self.target_mappings.rule_count, f'{plans_by_language[0][0]} rule')}."
-            )
-            return
-
-        logger.info("\nScanning across multiple languages:")
-        for language, plan in plans_by_language:
-            metrics.add_feature("language", language)
-
-            lang_chars = max(len(lang) for lang, _ in plans_by_language)
-            rules_chars = max(
-                len(str(plan.rule_count)) for _, plan in plans_by_language
-            ) + len(" rules")
-            files_chars = max(
-                len(str(plan.file_count)) for _, plan in plans_by_language
-            ) + len(" files")
-
-            lang_field = language.rjust(lang_chars)
-            rules_field = unit_str(plan.rule_count, "rule", pad=True).rjust(rules_chars)
-            files_field = unit_str(plan.file_count, "file", pad=True).rjust(files_chars)
-
-            logger.info(f"    {lang_field} | {rules_field} × {files_field}")
-        logger.info("")
-
-    def __str__(self) -> str:
-        return f"<Plan of {len(self.target_mappings)} tasks for {list(self.split_by_lang_label())}>"
 
 
 class CoreRunner:
@@ -518,19 +609,49 @@ class CoreRunner:
     def __init__(
         self,
         jobs: Optional[int],
-        deep: bool,
+        engine_type: EngineType,
         timeout: int,
         max_memory: int,
         timeout_threshold: int,
+        interfile_timeout: int,
+        trace: bool,
+        trace_endpoint: Optional[str],
+        profile: bool,
+        capture_stderr: bool,
         optimizations: str,
-        core_opts_str: Optional[str],
+        allow_untrusted_validators: bool,
+        secrets_timeout: Optional[int] = None,
+        respect_rule_paths: bool = True,
+        path_sensitive: bool = False,
+        symbol_analysis: bool = False,
+        fips_mode: bool = False,
+        use_pro_naming_for_intrafile: bool = False,
+        run_taint_just_once: bool = True,
+        group_taint_rules: bool = False,
+        mem_policy: Optional[MemoryPolicy] = None,
     ):
-        self._jobs = jobs if jobs else 1 if deep else get_cpu_count()
+        self._binary_path = engine_type.get_binary_path()
+        self._jobs = jobs
+        self._engine_type = engine_type
         self._timeout = timeout
         self._max_memory = max_memory
         self._timeout_threshold = timeout_threshold
+        self._interfile_timeout = interfile_timeout
+        self._trace = trace
+        self._trace_endpoint = trace_endpoint
+        self._profile = profile
         self._optimizations = optimizations
-        self._core_opts = shlex.split(core_opts_str) if core_opts_str else []
+        self._allow_untrusted_validators = allow_untrusted_validators
+        self._secrets_timeout = secrets_timeout
+        self._path_sensitive = path_sensitive
+        self._respect_rule_paths = respect_rule_paths
+        self._capture_stderr = capture_stderr
+        self._symbol_analysis = symbol_analysis
+        self._fips_mode = fips_mode
+        self._use_pro_naming_for_intrafile = use_pro_naming_for_intrafile
+        self._run_taint_just_once = run_taint_just_once
+        self._group_taint_rules = group_taint_rules
+        self.mem_policy = mem_policy
 
     def _extract_core_output(
         self,
@@ -545,35 +666,34 @@ class CoreRunner:
                 "<semgrep-core stderr not captured, should be printed above>\n"
             )
 
-        # By default, we print semgrep-core's error output, which includes
-        # semgrep-core's logging if it was requested via --debug.
-        #
-        # If semgrep-core prints anything on stderr when running with default
-        # flags, it's a bug that should be fixed in semgrep-core.
-        #
-        logger.debug(
-            f"--- semgrep-core stderr ---\n"
-            f"{core_stderr}"
-            f"--- end semgrep-core stderr ---"
-        )
-
+        # All paths in this block should call self._fail() to raise a
+        # SemgrepError, as something is wrong if semgrep-core's exit code is non zero!!
         if returncode != 0:
             output_json = self._parse_core_output(
                 shell_command, core_stdout, core_stderr, returncode
             )
 
             if "errors" in output_json:
-                parsed_output = parse_core_output(output_json)
+                parsed_output = parse_core_output_json(output_json)
                 errors = parsed_output.errors
+                fail_msg = (
+                    "non-zero exit status with one or more errors in json response"
+                )
+                semgrep_errors = None
                 if len(errors) < 1:
-                    self._fail(
-                        "non-zero exit status errors array is empty in json response",
-                        shell_command,
-                        returncode,
-                        core_stdout,
-                        core_stderr,
+                    fail_msg = (
+                        "non-zero exit status errors array is empty in json response"
                     )
-                raise core_error_to_semgrep_error(errors[0])
+                else:
+                    semgrep_errors = [core_error_to_semgrep_error(e) for e in errors]
+                self._fail(
+                    fail_msg,
+                    shell_command,
+                    returncode,
+                    core_stdout,
+                    core_stderr,
+                    semgrep_errors,
+                )
             else:
                 self._fail(
                     'non-zero exit status with missing "errors" field in json response',
@@ -583,9 +703,32 @@ class CoreRunner:
                     core_stderr,
                 )
 
+        # By default, we print semgrep-core's error output, which includes
+        # semgrep-core's logging if it was requested via --debug.
+        #
+        # If semgrep-core prints anything on stderr when running with default
+        # flags, it's a bug that should be fixed in semgrep-core.
+        #
+        # NOTE: We print the stderr here, AFTER the above if block, as all
+        # branches of the above if block result in self._fail. self._fail always
+        # prints the stderr and never returns, so by doing this we avoid
+        # printing stderr twice
+        logger.debug(
+            f"--- semgrep-core stderr ---\n{core_stderr}--- end semgrep-core stderr ---"
+        )
+
+        # else:
         output_json = self._parse_core_output(
             shell_command, core_stdout, core_stderr, returncode
         )
+        # old: the JSON is sometimes more than 100MB, so better not log it
+        # logger.debug(
+        #     f"--- semgrep-core JSON answer ---\n"
+        #     f"{output_json}"
+        #     f"--- end semgrep-core JSON answer ---"
+        # )
+        # alt: save it in ~/.semgrep/logs/semgrep_core.json?
+        # alt: reduce the size of the core json output
         return output_json
 
     def _parse_core_output(
@@ -600,20 +743,13 @@ class CoreRunner:
             return cast(Dict[str, Any], json.loads(semgrep_output))
         except ValueError as exn:
             if returncode == -11 or returncode == -9:
-                # Killed by signal 11 (segmentation fault), this could be a
-                # stack overflow that was not intercepted by the OCaml runtime.
-                soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_STACK)
                 tip = f"""
                 Semgrep exceeded system resources. This may be caused by
-                    1. Stack overflow. Try increasing the stack limit to
-                       `{soft_limit}` by running `ulimit -s {soft_limit}`
-                       before running Semgrep.
+                    1. Stack overflow.
                     2. Out of memory. Try increasing the memory available to
-                       your container (if running in CI). If that is not
-                       possible, run `semgrep` with `--max-memory
-                       $YOUR_MEMORY_LIMIT`.
-                    3. Some extremely niche compiler/c-bindings bug. (We've
-                       never seen this, but it's always possible.)
+                       your container (if running in CI).
+                    3. Some extremely niche compiler/native code bug.
+
                     You can also try reducing the number of processes Semgrep
                     uses by running `semgrep` with `--jobs 1` (or some other
                     number of jobs). If you are running in CI, please try
@@ -637,14 +773,31 @@ class CoreRunner:
         returncode: int,
         semgrep_output: str,
         semgrep_error_output: str,
+        semgrep_errors: Optional[List[SemgrepCoreError]] = None,
     ) -> None:
+        """Raise a Semgrep Error that indicates semgrep-core ran into an error and exited
+        abnormally. It will print the reason, shell_command, return code, and stdout/stderr of semgrep-core
+
+        By default we assume that no json response was produced/was produced
+        incorrectly, and therefore could not extract any core errors, and this
+        message will indicate so
+
+        If core errors are passed, i.e. we were able to extract core errors from
+        a response json, this method will print those out also
+
+        """
+        expected_json_msg = "unexpected non-json output while invoking semgrep-core:"
+        if semgrep_errors:
+            errors_str = "\n".join([f"   {error}" for error in semgrep_errors])
+            expected_json_msg = f"unexpected errors in json output after invoking semgrep-core:\n{errors_str}"
+
         # Once we require python >= 3.8, switch to using shlex.join instead
         # for proper quoting of the command line.
         details = with_color(
             Colors.white,
             f"semgrep-core exit code: {returncode}\n"
             f"semgrep-core command: {shell_command}\n"
-            f"unexpected non-json output while invoking semgrep-core:\n"
+            f"{expected_json_msg}\n"
             "--- semgrep-core stdout ---\n"
             f"{semgrep_output}"
             "--- end semgrep-core stdout ---\n"
@@ -653,227 +806,405 @@ class CoreRunner:
             "--- end semgrep-core stderr ---\n",
         )
         raise SemgrepError(
-            f"Error while matching: {reason}\n{details}" f"{PLEASE_FILE_ISSUE_TEXT}"
+            f"Error while matching: {reason}\n{details}{PLEASE_FILE_ISSUE_TEXT}"
         )
 
-    def _add_match_times(
-        self,
-        profiling_data: ProfilingData,
-        timing: core.CoreTiming,
-    ) -> None:
-        if timing.rules_parse_time:
-            profiling_data.set_rules_parse_time(timing.rules_parse_time)
-
-        for t in timing.targets:
-            rule_timings = {
-                rt.rule_id: Times(rt.parse_time, rt.match_time) for rt in t.rule_times
-            }
-            profiling_data.set_file_times(Path(t.path), rule_timings, t.run_time)
-
-    def _add_max_memory_bytes(
-        self, profiling_data: ProfilingData, max_memory_bytes: int
-    ) -> None:
+    def _check_pyro_caml_preconditions(self) -> bool:
         """
-        This represents the maximum amount of memory used by the OCaml side of
-        Semgrep during its execution.
+        Checks if pyro-caml can be used for profiling.
+        Returns True if pyro-caml can be used, False otherwise.
 
-        This is useful for telemetry purposes.
+        We want to add these checks since pyro-caml will fail otherwise
+
+        What we need are:
+        - PYRO_CAML_SERVER_ADDRESS is set
+        - pyro-caml is installed
         """
-        profiling_data.set_max_memory_bytes(max_memory_bytes)
 
-    def _plan_core_run(
-        self, rules: List[Rule], target_manager: TargetManager, all_targets: Set[Path]
+        pyro_caml_on_path = shutil.which("pyro-caml")
+
+        profile_env_set = os.environ.get("SEMGREP_PROFILE", "") != ""
+        pyro_caml_requested = self._profile or (profile_env_set)
+        pyro_caml = (pyro_caml_on_path is not None) and pyro_caml_requested
+
+        # debug message for pyro-caml
+        if not pyro_caml:
+            reasons = []
+            if pyro_caml_on_path is None:
+                reasons.append("pyro-caml is not in PATH")
+            if not (self._profile or profile_env_set):
+                reasons.append("profile is not enabled")
+            if reasons:
+                logger.debug(
+                    "pyro-caml will not be used for profiling. Reason(s): "
+                    + "; ".join(reasons)
+                    + "."
+                )
+        return pyro_caml
+
+    @staticmethod
+    @telemetry.trace()
+    def plan_core_run(
+        rules: List[Rule],
+        target_manager: TargetManager,
+        all_subprojects: List[Union[out.ResolvedSubproject, out.UnresolvedSubproject]],
+        *,
+        all_targets: Optional[TargetAccumulator] = None,
+        product: Optional[out.Product] = None,
+        make_target_info_and_unused_rules: bool = True,
     ) -> Plan:
         """
         Gets the targets to run for each rule
 
         Returns this information as a list of rule ids and a list of targets with
         language + index of the rule ids for the rules to run each target on.
-        Semgrep-core will use this to determine what to run (see Input_to_core.atd).
-        Also updates all_targets, used by core_runner
+        Semgrep-core will use this to determine what to run
+        (see semgrep_output_v1.atd and the target types).
+        Also updates all_targets if set, used by core_runner
 
         Note: this is a list because a target can appear twice (e.g. Java + Generic)
+
+        Computing target info and unused rules is expensive (num_rules * num_targets) so this
+        function provides an option to skip it if the data will not be used. Doing so makes it
+        impossible to compute the unused rules accurately, so if make_target_info_and_unused_rules is False,
+        unused rules will be set to the empty list.
         """
-        target_info: Dict[Tuple[Path, Language], List[int]] = collections.defaultdict(
-            list
+        current_span = telemetry.get_current_span()
+        # add product as attribute so we can tell what product this was called for
+        current_span.set_attribute(
+            "product", product.value.kind if product else "unset"
         )
 
-        for i, rule in enumerate(rules):
-            for language in rule.languages:
-                targets = list(
-                    target_manager.get_files_for_rule(
-                        language, rule.includes, rule.excludes, rule.id
+        if all_targets is None:
+            all_targets = TargetAccumulator()
+        # The range of target_info is (index into rules x product as json)
+        target_info: Dict[
+            Tuple[Target, Language], Tuple[List[int], Set[out.Product]]
+        ] = collections.defaultdict(lambda: (list(), set()))
+
+        unused_rules = []
+
+        if make_target_info_and_unused_rules:
+            for rule_num, rule in enumerate(rules):
+                some_target = False
+                for language in rule.languages:
+                    selection = target_manager.get_files_for_rule(
+                        language, rule.includes, rule.excludes, rule.id, rule.product
                     )
-                )
 
-                for target in targets:
-                    all_targets.add(target)
-                    target_info[target, language].append(i)
+                    targets = selection.targets
+                    all_targets.targets.update(targets)
 
+                    some_target = some_target or len(targets) > 0
+
+                    for target in targets:
+                        rules_nums, products = target_info[target, language]
+                        rules_nums.append(rule_num)
+                        products.add(rule.product)
+
+                if not some_target:
+                    unused_rules.append(rule)
+
+        phase_targets = [target for (target, _language) in target_info.keys()]
+        telemetry.record_phase_data(
+            telemetry.get_current_span(),
+            fpaths_of_targets(phase_targets),
+            rules,
+        )
         return Plan(
             [
                 Task(
                     path=target,
-                    language=language,
-                    rule_nums=target_info[target, language],
+                    analyzer=language,
+                    products=tuple(products),
+                    # tuple conversion makes rule_nums hashable, so usable as cache key
+                    rule_nums=tuple(rule_nums),
                 )
-                for target, language in target_info
+                for ((target, language), (rule_nums, products)) in target_info.items()
             ],
-            [rule.id for rule in rules],
+            rules,
+            product=product,
+            all_subprojects=all_subprojects,
+            unused_rules=unused_rules,
         )
 
+    # TODO: move some of those parameters to CoreRunner.__init__()?
+    @telemetry.trace()
     def _run_rules_direct_to_semgrep_core_helper(
         self,
         rules: List[Rule],
         target_manager: TargetManager,
         dump_command_for_core: bool,
-        deep: bool,
-    ) -> Tuple[
-        RuleMatchMap,
-        List[SemgrepError],
-        Set[Path],
-        ProfilingData,
-        ParsingData,
-        Optional[List[core.MatchingExplanation]],
-    ]:
+        time_flag: bool,
+        matching_explanations: bool,
+        engine: EngineType,
+        strict: bool,
+        run_secrets: bool,
+        disable_secrets_validation: bool,
+        target_mode_config: TargetModeConfig,
+        all_subprojects: List[Union[out.ResolvedSubproject, out.UnresolvedSubproject]],
+        x_parmap: bool,
+    ) -> Tuple[RuleMatchMap, List[SemgrepError], OutputExtra,]:
         state = get_state()
+
         logger.debug(f"Passing whole rules directly to semgrep_core")
 
         outputs: RuleMatchMap = collections.defaultdict(OrderedRuleMatchList)
         errors: List[SemgrepError] = []
-        all_targets: Set[Path] = set()
-        file_timeouts: Dict[Path, int] = collections.defaultdict(lambda: 0)
+        all_targets = TargetAccumulator()
+        file_timeouts: Dict[Path, int] = collections.defaultdict(int)
         max_timeout_files: Set[Path] = set()
+        # TODO this is a quick fix, refactor this logic
 
-        profiling_data: ProfilingData = ProfilingData()
         parsing_data: ParsingData = ParsingData()
 
-        # Create an exit stack context manager to properly handle closing
-        # either the temp files for an actual run or else the dump files for
-        # a future direct run of semgrep-core. This method of file management
-        # is OS-agnostic and should be portable across POSIX and Windows
-        # systems. It also ensures that NamedTemporaryFile objects will delete
-        # their corresponding temp files after closing streams to them.
         exit_stack = contextlib.ExitStack()
-        rule_file = exit_stack.enter_context(
-            (state.env.user_data_folder / "semgrep_rules.json").open("w+")
-            if dump_command_for_core
-            else tempfile.NamedTemporaryFile("w+", suffix=".json")
-        )
-        target_file = exit_stack.enter_context(
-            (state.env.user_data_folder / "semgrep_targets.txt").open("w+")
-            if dump_command_for_core
-            else tempfile.NamedTemporaryFile("w+")
-        )
+
+        # The dumped rule files persist for inspection, and the shard count now
+        # varies by ruleset, so clear the previous run's before writing.
+        if dump_command_for_core:
+            for stale in state.env.user_data_folder.glob("semgrep_rules_*.json"):
+                stale.unlink()
+
+        # Written and closed one at a time: core reads shards back by path, so
+        # holding a handle each would put the shard count under RLIMIT_NOFILE.
+        def write_shard(shard: int, body: str) -> str:
+            if dump_command_for_core:
+                path = state.env.user_data_folder / f"semgrep_rules_{shard}.json"
+                path.write_text(body, encoding="utf-8")
+                return str(path)
+            fd, name = tempfile.mkstemp(suffix=".json")
+            exit_stack.callback(os.unlink, name)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(body)
+            return name
 
         with exit_stack:
+            if self._binary_path is None:
+                if engine.is_pro:
+                    logger.error(
+                        f"""
+Semgrep Pro is either uninstalled or it is out of date.
 
-            plan = self._plan_core_run(rules, target_manager, all_targets)
-            plan.log()
-            parsing_data.add_targets(plan)
-            target_file_contents = json.dumps(plan.to_json())
-            target_file.write(target_file_contents)
-            target_file.flush()
+Try installing Semgrep Pro (`semgrep install-semgrep-pro`).
+                        """
+                    )
+                else:
+                    # This really shouldn't happen, but let's cover our bases
+                    logger.error(
+                        f"""
+Could not find the semgrep-core executable. Your Semgrep install is likely corrupted. Please uninstall Semgrep and try again.
+                        """
+                    )
+                sys.exit(2)
 
-            rule_file_contents = json.dumps(
-                {"rules": [rule._raw for rule in rules]}, indent=2, sort_keys=True
-            )
-            rule_file.write(rule_file_contents)
-            rule_file.flush()
+            # A historical scan does not create a targeting file since
+            # targeting is performed directly by core.
+            if not target_mode_config.is_historical_scan:
+                target_file = exit_stack.enter_context(
+                    (state.env.user_data_folder / "semgrep_targets.txt").open("w+")
+                    if dump_command_for_core
+                    else tempfile.NamedTemporaryFile("w+")
+                )
 
-            # Create a map to feed to semgrep-core as an alternative to
-            # having it actually read the files.
-            vfs_map: Dict[str, bytes] = {
-                target_file.name: target_file_contents.encode("UTF-8"),
-                rule_file.name: rule_file_contents.encode("UTF-8"),
-            }
-
-            # Run semgrep
-            cmd = [SemgrepCore.path()] + [
+            use_pyro_caml = self._check_pyro_caml_preconditions()
+            if use_pyro_caml:
+                state.telemetry.setup_pyro_caml()
+            cmd = [
+                # bugfix: self._binary_path is an Optional[Path]. The
+                # recommended way to convert a Path to a string is to use the
+                # str function. However, mypy allows the use of str to convert
+                # Optional values to strings. Make sure to check against None
+                # even though mypy won't warn you.
+                *(["pyro-caml", "-vv"] if use_pyro_caml else []),
+                str(self._binary_path),
                 "-json",
-                "-rules",
-                rule_file.name,
-                "-j",
-                str(self._jobs),
-                "-targets",
-                target_file.name,
-                "-timeout",
-                str(self._timeout),
-                "-timeout_threshold",
-                str(self._timeout_threshold),
-                "-max_memory",
-                str(self._max_memory),
-                "-json_time",
             ]
 
-            if self._core_opts:
-                logger.info(
-                    f"Running with user defined core options: {self._core_opts}"
-                )
-                cmd.extend(self._core_opts)
+            # Sharding works in bytes, so every rule is serialized here to
+            # measure it. Compact blobs are also the shard bodies (joined
+            # below), so they are kept; indented ones cannot be concatenated,
+            # so that path measures and discards, and `dumps` re-serializes
+            # whole shards. len() is a byte count: json.dumps escapes
+            # non-ASCII.
+            #
+            # TODO: sort object key order on the OCaml side so we can drop
+            # sort_keys here. (See core_output.py where match.extra.metadata,
+            # emitted by semgrep-core in input order, replaces inner dicts via
+            # dict.update.)
+            rule_blobs: List[str] = []
+            if matching_explanations:
+                rule_sizes = [
+                    len(json.dumps(rule._raw, sort_keys=True, indent=2))
+                    for rule in rules
+                ]
+            else:
+                rule_blobs = [
+                    json.dumps(rule._raw, sort_keys=True, separators=(",", ":"))
+                    for rule in rules
+                ]
+                rule_sizes = [len(blob) for blob in rule_blobs]
+
+            def dumps(shard: Sequence[int]) -> str:
+                if matching_explanations:
+                    return json.dumps(
+                        {"rules": [rules[i]._raw for i in shard]},
+                        sort_keys=True,
+                        indent=2,
+                    )
+                return '{"rules":[' + ",".join(rule_blobs[i] for i in shard) + "]}"
+
+            # adding rules option
+
+            num_shards = _shard_count(len(rules), self._jobs, sum(rule_sizes))
+            logger.debug(f"Passing rules to semgrep-core in {num_shards} shards")
+            for shard, rule_shard in enumerate(_shard_rules(rule_sizes, num_shards)):
+                cmd.extend(["-rules", write_shard(shard, dumps(rule_shard))])
+
+            # On disk now; for a large ruleset this is hundreds of megabytes.
+            rule_blobs.clear()
+
+            # Turn on simple profiling. See Profiling.ml and simple_profiling.py
+            if enabled_simple_profiling:
+                cmd.extend(["-simple_profiling"])
+
+            # adding multi-core option
+            # rely on the domains/thread-based impl instead of Parmap
+            if x_parmap:
+                cmd.extend(["-use_parmap"])
+
+            if self._jobs is not None:
+                cmd.extend(["-j", str(self._jobs)])
+
+            if strict:
+                cmd.extend(["-strict"])
+
+            plan = self.plan_core_run(
+                rules,
+                target_manager,
+                all_targets=all_targets,
+                all_subprojects=all_subprojects,
+            )
+
+            plan.record_metrics()
+            telemetry.record_phase_data(
+                telemetry.get_current_span(),
+                fpaths_of_targets(all_targets.targets),
+                rules,
+            )
+            if target_mode_config.is_historical_scan:
+                cmd.extend(["-historical", "-only_validated"])
+            else:
+                parsing_data.add_targets(plan)
+                target_file_contents = plan.to_targets().to_json_string()
+                target_file.write(target_file_contents)
+                target_file.flush()
+                cmd.extend(["-targets", target_file.name])
+
+            # adding limits
+            cmd.extend(
+                [
+                    "-timeout",
+                    str(self._timeout),
+                    "-timeout_threshold",
+                    str(self._timeout_threshold),
+                    "-max_memory",
+                    str(self._max_memory),
+                ]
+            )
+            if matching_explanations:
+                cmd.append("-matching_explanations")
+            if time_flag:
+                cmd.append("-json_time")
+            if not self._respect_rule_paths:
+                cmd.append("-disable_rule_paths")
 
             if self._optimizations != "none":
                 cmd.append("-fast")
 
+            if self._trace:
+                cmd.append("-trace")
+
+            if self._trace_endpoint:
+                cmd.extend(["-trace_endpoint", self._trace_endpoint])
+
+            if run_secrets and not disable_secrets_validation:
+                cmd += ["-secrets"]
+                if not engine.is_pro:
+                    # This should be impossible, but the types don't rule it out so...
+                    raise SemgrepError(
+                        "Secrets post processors tried to run without the pro-engine."
+                    )
+
+            if self._allow_untrusted_validators:
+                cmd.append("-allow-untrusted-validators")
+
+            if self._secrets_timeout is not None:
+                cmd += ["-secrets_timeout", str(self._secrets_timeout)]
+
+            if self._path_sensitive:
+                cmd.append("-path_sensitive")
+
+            if (
+                self._use_pro_naming_for_intrafile
+                and engine is EngineType.PRO_INTRAFILE
+            ):
+                cmd.append("-use_pro_naming_for_intrafile")
+
+            if self._group_taint_rules:
+                cmd += ["-group_taint_rules"]
+
+            # These flags are only in the pro binary, so make sure we're pro
             # TODO: use exact same command-line arguments so just
             # need to replace the SemgrepCore.path() part.
-            if deep:
+            if engine.is_pro:
                 if auth.get_token() is None:
-                    logger.error("!!!This is a proprietary extension of semgrep.!!!")
-                    logger.error("!!!You must be logged in to access this extension!!!")
-                else:
-                    logger.error(
-                        "You are using the Semgrep Pro Engine, our advanced analysis system uniquely designed to refine and enhance your results."
-                    )
-                    logger.error(
-                        "You can expect to see longer scan times - we're taking our time to make sure everything is just right for you. With <3, the Semgrep team."
-                    )
-
-                targets = target_manager.targets
-                if len(targets) == 1 and targets[0].path.is_dir():
-                    root = str(targets[0].path)
-                else:
-                    raise SemgrepError("deep mode needs a single target (root) dir")
-
-                deep_path = SemgrepCore.deep_path()
-                if deep_path is None:
                     raise SemgrepError(
-                        "Could not run deep analysis: DeepSemgrep not installed. Run `semgrep install-deep-semgrep`"
+                        "This is a proprietary extension of semgrep.\n"
+                        "You must log in with `semgrep login` to access this extension."
                     )
 
-                logger.info(f"Using DeepSemgrep installed in {deep_path}")
-                version = sub_check_output(
-                    [deep_path, "--version"],
-                    timeout=10,
-                    encoding="utf-8",
-                    stderr=subprocess.DEVNULL,
-                ).rstrip()
-                logger.info(f"DeepSemgrep Version Info: ({version})")
+                if engine is EngineType.PRO_INTERFILE:
+                    logger.error(
+                        "Semgrep Pro Engine may be slower and show different results than Semgrep OSS."
+                    )
 
-                cmd = [deep_path] + [
-                    "--json",
-                    "--rules",
-                    rule_file.name,
-                    "-j",
-                    str(self._jobs),
-                    "--targets",
-                    target_file.name,
-                    "--root",
-                    root,
-                    "--json_time",
-                    # "--timeout",
-                    # str(self._timeout),
-                    # "--timeout_threshold",
-                    # str(self._timeout_threshold),
-                    "--max_memory",
-                    str(self._max_memory),
-                ]
+                if engine is EngineType.PRO_INTERFILE:
+                    scanning_roots = target_manager.scanning_roots
+                    if len(scanning_roots) == 1:
+                        root = str(scanning_roots[0].path)
+                    else:
+                        raise SemgrepError(
+                            "Inter-file analysis can only take a single target (for multiple files pass a directory)"
+                        )
+                    cmd += ["-pro_inter_file"]
+                    cmd += [
+                        "-timeout_for_interfile_analysis",
+                        str(self._interfile_timeout),
+                    ]
+                    cmd += [root]
+                elif engine is EngineType.PRO_INTRAFILE:
+                    cmd += ["-pro_intra_file"]
 
-            stderr: Optional[int] = subprocess.PIPE
+                # More than needing pro, `symbol_analysis` is only collectible
+                # on interfile scans. So let's only add it if that's the case.
+                # TODO: warn if engine is not interfile?
+                if self._symbol_analysis and engine.is_interfile:
+                    cmd.append("-symbol_analysis")
+
+                if not self._run_taint_just_once:
+                    cmd.append("-no_run_taint_just_once")
+
+                if self.mem_policy:
+                    cmd.extend(["-x-mem-policy", self.mem_policy.cli_value])
+
             if state.terminal.is_debug:
-                cmd += ["--debug"]
+                cmd += ["-debug"]
 
-            logger.debug("Running semgrep-core with command:")
+            # Multiply by 3 for Pro Engine
+            total = plan.num_targets * 3
+
+            logger.debug("Running Semgrep engine with command:")
             logger.debug(" ".join(cmd))
 
             if dump_command_for_core:
@@ -882,16 +1213,17 @@ class CoreRunner:
                 # to copy+paste it to a shell.  (The real command is
                 # still visible in the log message above.)
                 printed_cmd = cmd.copy()
-                printed_cmd[0] = (
-                    deep_path if deep_path and deep else SemgrepCore.executable_path()
-                )
+                printed_cmd[0] = str(self._binary_path)
                 print(" ".join(printed_cmd))
                 sys.exit(0)
 
-            runner = StreamingSemgrepCore(cmd, plan.num_targets)
-            runner.vfs_map = vfs_map
+            runner = StreamingSemgrepCore(
+                cmd,
+                total=total,
+                engine_type=engine,
+                capture_stderr=self._capture_stderr,
+            )
             returncode = runner.execute()
-
             # Process output
             output_json = self._extract_core_output(
                 rules,
@@ -900,48 +1232,56 @@ class CoreRunner:
                 runner.stdout,
                 runner.stderr,
             )
-            core_output = parse_core_output(output_json)
-
-            if ("time" in output_json) and core_output.time:
-                self._add_match_times(profiling_data, core_output.time)
-                self._add_max_memory_bytes(
-                    profiling_data, core_output.time.max_memory_bytes
-                )
+            core_output = parse_core_output_json(output_json)
+            if core_output.paths.skipped:
+                for skip in core_output.paths.skipped:
+                    if skip.rule_id:
+                        rule_info = f"rule {skip.rule_id}"
+                    else:
+                        rule_info = "all rules"
+                        logger.verbose(
+                            f"skipped '{skip.path}' [{rule_info}]: {skip.reason}: {skip.details}"
+                        )
 
             # end with tempfile.NamedTemporaryFile(...) ...
-            outputs = core_matches_to_rule_matches(rules, core_output)
+            outputs = core_matches_to_rule_matches(
+                rules, core_output, fips_mode=self._fips_mode
+            )
             parsed_errors = [core_error_to_semgrep_error(e) for e in core_output.errors]
             for err in core_output.errors:
-                if isinstance(err.error_type.value, core.Timeout):
-                    assert err.location.path is not None
+                if isinstance(err.error_type.value, out.Timeout):
+                    assert err.location and err.location.path is not None
 
-                    file_timeouts[Path(err.location.path)] += 1
+                    file_timeouts[Path(err.location.path.value)] += 1
                     if (
                         self._timeout_threshold != 0
-                        and file_timeouts[Path(err.location.path)]
+                        and file_timeouts[Path(err.location.path.value)]
                         >= self._timeout_threshold
                     ):
-                        max_timeout_files.add(Path(err.location.path))
+                        max_timeout_files.add(Path(err.location.path.value))
                 if isinstance(
                     err.error_type.value,
                     (
-                        core.LexicalError,
-                        core.ParseError,
-                        core.PartialParsing,
-                        core.SpecifiedParseError,
-                        core.AstBuilderError,
+                        out.LexicalError,
+                        out.ParseError,
+                        out.PartialParsing,
+                        out.OtherParseError,
+                        out.AstBuilderError,
                     ),
                 ):
                     parsing_data.add_error(err)
             errors.extend(parsed_errors)
 
+        output_extra = OutputExtra(
+            core=core_output,
+            all_targets=target_info_acc_of_target_acc(all_targets),
+            parsing_data=parsing_data,
+        )
+
         return (
             outputs,
             errors,
-            all_targets,
-            profiling_data,
-            parsing_data,
-            core_output.explanations,
+            output_extra,
         )
 
     def _run_rules_direct_to_semgrep_core(
@@ -949,15 +1289,16 @@ class CoreRunner:
         rules: List[Rule],
         target_manager: TargetManager,
         dump_command_for_core: bool,
-        deep: bool,
-    ) -> Tuple[
-        RuleMatchMap,
-        List[SemgrepError],
-        Set[Path],
-        ProfilingData,
-        ParsingData,
-        Optional[List[core.MatchingExplanation]],
-    ]:
+        time_flag: bool,
+        matching_explanations: bool,
+        engine: EngineType,
+        strict: bool,
+        run_secrets: bool,
+        disable_secrets_validation: bool,
+        target_mode_config: TargetModeConfig,
+        all_subprojects: List[Union[out.ResolvedSubproject, out.UnresolvedSubproject]],
+        x_parmap: bool,
+    ) -> Tuple[RuleMatchMap, List[SemgrepError], OutputExtra]:
         """
         Sometimes we may run into synchronicity issues with the latest DeepSemgrep binary.
         These issues may possibly cause a failure if a user, for instance, updates their
@@ -968,115 +1309,151 @@ class CoreRunner:
         """
         try:
             return self._run_rules_direct_to_semgrep_core_helper(
-                rules, target_manager, dump_command_for_core, deep
+                rules,
+                target_manager,
+                dump_command_for_core,
+                time_flag,
+                matching_explanations,
+                engine,
+                strict,
+                run_secrets,
+                disable_secrets_validation,
+                target_mode_config,
+                all_subprojects,
+                x_parmap=x_parmap,
             )
+        except SemgrepError as e:
+            # Handle Semgrep errors normally
+            raise e
         except Exception as e:
-            if deep:
+            # Unexpected error, output a warning that the engine might be out of date
+            if engine.is_pro:
                 logger.error(
                     f"""
 
-DeepSemgrep crashed during execution (unknown reason).
-This can sometimes happen because either DeepSemgrep or Semgrep is out of date.
+Semgrep Pro crashed during execution (unknown reason).
+This can sometimes happen because either Semgrep Pro or Semgrep is out of date.
 
-Try updating your version of DeepSemgrep (`semgrep install-deep-semgrep`) or your version of Semgrep (`pip install semgrep/brew install semgrep`).
+Try updating your version of Semgrep Pro (`semgrep install-semgrep-pro`) or your version of Semgrep (`pip install semgrep/brew install semgrep`).
 If both are up-to-date and the crash persists, please contact support to report an issue!
+When reporting the issue, please re-run the semgrep command with the
+`--debug` flag so as to print more details about what happened, if you can.
 
 Exception raised: `{e}`
                     """
                 )
+                # replace the sys.exit below with `raise e` to help debug
                 sys.exit(2)
             raise e
 
     # end _run_rules_direct_to_semgrep_core
 
-    def invoke_semgrep(
+    @simple_profiling
+    def invoke_semgrep_core(
         self,
         target_manager: TargetManager,
         rules: List[Rule],
         dump_command_for_core: bool,
-        deep: bool,
-    ) -> Tuple[
-        RuleMatchMap,
-        List[SemgrepError],
-        Set[Path],
-        ProfilingData,
-        ParsingData,
-        Optional[List[core.MatchingExplanation]],
-    ]:
+        time_flag: bool,
+        matching_explanations: bool,
+        engine: EngineType,
+        strict: bool,
+        run_secrets: bool,
+        disable_secrets_validation: bool,
+        target_mode_config: TargetModeConfig,
+        all_subprojects: List[Union[out.ResolvedSubproject, out.UnresolvedSubproject]],
+        x_parmap: bool,
+    ) -> Tuple[RuleMatchMap, List[SemgrepError], OutputExtra,]:
         """
-        Takes in rules and targets and retuns object with findings
+        Takes in rules and targets and returns object with findings
         """
         start = datetime.now()
 
         (
             findings_by_rule,
             errors,
-            all_targets,
-            profiling_data,
-            parsing_data,
-            explanations,
+            output_extra,
         ) = self._run_rules_direct_to_semgrep_core(
-            rules, target_manager, dump_command_for_core, deep
+            rules,
+            target_manager,
+            dump_command_for_core,
+            time_flag,
+            matching_explanations,
+            engine,
+            strict,
+            run_secrets,
+            disable_secrets_validation,
+            target_mode_config,
+            all_subprojects,
+            x_parmap,
         )
 
         logger.debug(
-            f"semgrep ran in {datetime.now() - start} on {len(all_targets)} files"
+            f"semgrep ran in {datetime.now() - start} on {len(output_extra.all_targets.targets)} files"
         )
         by_severity = collections.defaultdict(list)
         for rule, findings in findings_by_rule.items():
-            by_severity[rule.severity.value.lower()].extend(findings)
+            by_severity[rule.severity.to_json().lower()].extend(findings)
 
         by_sev_strings = [
             f"{len(findings)} {sev}" for sev, findings in by_severity.items()
         ]
-        logger.debug(f'findings summary: {", ".join(by_sev_strings)}')
+        logger.debug(f"findings summary: {', '.join(by_sev_strings)}")
 
         return (
             findings_by_rule,
             errors,
-            all_targets,
-            profiling_data,
-            parsing_data,
-            explanations,
+            output_extra,
         )
 
-    def validate_configs(self, configs: Tuple[str, ...]) -> Sequence[SemgrepError]:
-        metachecks = Config.from_config_list(["p/semgrep-rule-lints"], None)[
-            0
-        ].get_rules(True)
+    def validate_configs(
+        self,
+        configs: Tuple[str, ...],
+    ) -> Sequence[SemgrepError]:
+        if self._binary_path is None:  # should never happen, doing this for mypy
+            raise SemgrepError("semgrep engine not found.")
+
+        # The metacheck pack is Semgrep-bundled (not user input), so its
+        # loading is always fully validated regardless of how the user asked
+        # us to validate their own rules.
+        metachecks = Config.from_config_list(
+            ["p/semgrep-rule-lints"],
+            None,
+            force_jsonschema=True,
+        )[0].get_rules(True)
 
         parsed_errors = []
-
         with tempfile.NamedTemporaryFile("w", suffix=".yaml") as rule_file:
-
             yaml = YAML()
             yaml.dump(
                 {"rules": [metacheck._raw for metacheck in metachecks]}, rule_file
             )
             rule_file.flush()
 
-            cmd = (
-                [SemgrepCore.path()]
-                + [
-                    "-json",
-                    "-check_rules",
-                    rule_file.name,
-                ]
-                + list(configs)
-            )
+            cmd = [
+                str(self._binary_path),
+                "-json",
+                "-check_rules",
+                rule_file.name,
+                *configs,
+            ]
+            if self._jobs is not None:
+                cmd.extend(["-j", str(self._jobs)])
 
-            runner = StreamingSemgrepCore(cmd, 1)  # only scanning combined rules
+            # only scanning combined rules. Only 1 target, but total is 3 to account for
+            # Pro Engine
+            total = 3
+
+            runner = StreamingSemgrepCore(
+                cmd, total=total, engine_type=self._engine_type, capture_stderr=True
+            )
             returncode = runner.execute()
 
             # Process output
             output_json = self._extract_core_output(
-                metachecks,
-                returncode,
-                " ".join(cmd),
-                runner.stdout,
-                runner.stderr,
+                metachecks, returncode, " ".join(cmd), runner.stdout, runner.stderr
             )
-            core_output = parse_core_output(output_json)
+            core_output = parse_core_output_json(output_json)
 
             parsed_errors += [
                 core_error_to_semgrep_error(e) for e in core_output.errors

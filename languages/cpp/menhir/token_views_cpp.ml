@@ -16,7 +16,6 @@
 open Common
 module Flag = Flag_parsing
 module Flag_cpp = Flag_parsing_cpp
-module PI = Parse_info
 module TH = Token_helpers_cpp
 open Parser_cpp
 
@@ -47,9 +46,9 @@ open Parser_cpp
  *)
 
 (*****************************************************************************)
-(* Some debugging functions  *)
+(* Logging *)
 (*****************************************************************************)
-let pr2, _pr2_once = Common2.mk_pr2_wrappers Flag.verbose_parsing
+let pr2 = Printf.eprintf
 
 (*****************************************************************************)
 (* Types *)
@@ -133,12 +132,12 @@ exception UnclosedSymbol of string
 
 let mk_token_extended x =
   let info = TH.info_of_tok x in
-  let line, col = (PI.line_of_info info, PI.col_of_info info) in
+  let line, col = (Tok.line_of_tok info, Tok.col_of_tok info) in
   {
     t = x;
     line;
     col;
-    (* we use List.hd at a few places, so convenient to have a sentinel *)
+    (* we use Common.hd_exn "unexpected empty list" at a few places, so convenient to have a sentinel *)
     where = [ InTopLevel ];
     new_tokens_before = [];
   }
@@ -150,10 +149,10 @@ let rebuild_tokens_extented toks_ext =
   let _tokens = ref [] in
   toks_ext
   |> List.iter (fun tok ->
-         tok.new_tokens_before |> List.iter (fun x -> push x _tokens);
-         push tok.t _tokens);
+      tok.new_tokens_before |> List.iter (fun x -> Stack_.push x _tokens);
+      Stack_.push tok.t _tokens);
   let tokens = List.rev !_tokens in
-  tokens |> Common2.acc_map mk_token_extended
+  tokens |> List.map mk_token_extended
 
 (*****************************************************************************)
 (* View builders  *)
@@ -261,16 +260,14 @@ let rec mk_ifdef xs =
           let body, extra, xs = mk_ifdef_parameters [ x ] [] xs in
 
           (* if not passing, then consider a #if 0 as an ordinary #ifdef *)
-          if !Flag_cpp.if0_passing then
-            Ifdefbool (b, body, extra) :: mk_ifdef xs
-          else Ifdef (body, extra) :: mk_ifdef xs
+          Ifdefbool (b, body, extra) :: mk_ifdef xs
       | TIfdefMisc (b, _)
       | TIfdefVersion (b, _) ->
           let body, extra, xs = mk_ifdef_parameters [ x ] [] xs in
           Ifdefbool (b, body, extra) :: mk_ifdef xs
       | _ ->
           (* todo? can have some Ifdef in the line ? *)
-          let line, xs = Common.span (fun y -> y.line =|= x.line) (x :: xs) in
+          let line, xs = List_.span (fun y -> y.line =|= x.line) (x :: xs) in
           NotIfdefLine line :: mk_ifdef xs)
 
 and mk_ifdef_parameters extras acc_before_sep xs =
@@ -294,14 +291,9 @@ and mk_ifdef_parameters extras acc_before_sep xs =
       | TIfdefBool (b, _) ->
           let body, extrasnest, xs = mk_ifdef_parameters [ x ] [] xs in
 
-          if !Flag_cpp.if0_passing then
-            mk_ifdef_parameters extras
-              (Ifdefbool (b, body, extrasnest) :: acc_before_sep)
-              xs
-          else
-            mk_ifdef_parameters extras
-              (Ifdef (body, extrasnest) :: acc_before_sep)
-              xs
+          mk_ifdef_parameters extras
+            (Ifdefbool (b, body, extrasnest) :: acc_before_sep)
+            xs
       | TIfdefMisc (b, _)
       | TIfdefVersion (b, _) ->
           let body, extrasnest, xs = mk_ifdef_parameters [ x ] [] xs in
@@ -313,7 +305,7 @@ and mk_ifdef_parameters extras acc_before_sep xs =
           let body, extras, xs = mk_ifdef_parameters (x :: extras) [] xs in
           (List.rev acc_before_sep :: body, extras, xs)
       | _ ->
-          let line, xs = Common.span (fun y -> y.line =|= x.line) (x :: xs) in
+          let line, xs = List_.span (fun y -> y.line =|= x.line) (x :: xs) in
           mk_ifdef_parameters extras (NotIfdefLine line :: acc_before_sep) xs)
 
 (* ------------------------------------------------------------------------- *)
@@ -394,7 +386,7 @@ let rec mk_body_function_grouped xs =
             | { t = TCBrace _; col = 0; _ } -> true
             | _ -> false
           in
-          let body, xs = Common.span (fun x -> not (is_closing_brace x)) xs in
+          let body, xs = List_.span (fun x -> not (is_closing_brace x)) xs in
           match xs with
           | { t = TCBrace _; col = 0; _ } :: xs ->
               BodyFunction body :: mk_body_function_grouped xs
@@ -403,7 +395,7 @@ let rec mk_body_function_grouped xs =
               [ NotBodyLine body ]
           | _ -> raise Impossible)
       | _ ->
-          let line, xs = Common.span (fun y -> y.line =|= x.line) (x :: xs) in
+          let line, xs = List_.span (fun y -> y.line =|= x.line) (x :: xs) in
           NotBodyLine line :: mk_body_function_grouped xs)
 
 (* ------------------------------------------------------------------------- *)
@@ -488,8 +480,8 @@ let mk_multi xs =
 let split_comma xs =
   xs
   |> Common2.split_gen_when (function
-       | Tok { t = TComma _; _ } :: xs -> Some xs
-       | _ -> None)
+    | Tok { t = TComma _; _ } :: xs -> Some xs
+    | _ -> None)
 
 (*****************************************************************************)
 (* View iterators  *)
@@ -498,50 +490,50 @@ let split_comma xs =
 let rec iter_token_paren f xs =
   xs
   |> List.iter (function
-       | PToken tok -> f tok
-       | Parenthised (xxs, info_parens) ->
-           info_parens |> List.iter f;
-           xxs |> List.iter (fun xs -> iter_token_paren f xs))
+    | PToken tok -> f tok
+    | Parenthised (xxs, info_parens) ->
+        info_parens |> List.iter f;
+        xxs |> List.iter (fun xs -> iter_token_paren f xs))
 
 let rec iter_token_brace f xs =
   xs
   |> List.iter (function
-       | BToken tok -> f tok
-       | Braceised (xxs, tok1, tok2opt) ->
-           f tok1;
-           Option.iter f tok2opt;
-           xxs |> List.iter (fun xs -> iter_token_brace f xs))
+    | BToken tok -> f tok
+    | Braceised (xxs, tok1, tok2opt) ->
+        f tok1;
+        Option.iter f tok2opt;
+        xxs |> List.iter (fun xs -> iter_token_brace f xs))
 
 let rec iter_token_ifdef f xs =
   xs
   |> List.iter (function
-       | NotIfdefLine xs -> xs |> List.iter f
-       | Ifdefbool (_, xxs, info_ifdef)
-       | Ifdef (xxs, info_ifdef) ->
-           info_ifdef |> List.iter f;
-           xxs |> List.iter (iter_token_ifdef f))
+    | NotIfdefLine xs -> xs |> List.iter f
+    | Ifdefbool (_, xxs, info_ifdef)
+    | Ifdef (xxs, info_ifdef) ->
+        info_ifdef |> List.iter f;
+        xxs |> List.iter (iter_token_ifdef f))
 
 let rec iter_token_multi f xs =
   xs
   |> List.iter (function
-       | Tok t -> f t
-       | Braces (t1, xs, t2)
-       | Parens (t1, xs, t2)
-       | Angle (t1, xs, t2) ->
-           f t1;
-           iter_token_multi f xs;
-           Option.iter f t2)
+    | Tok t -> f t
+    | Braces (t1, xs, t2)
+    | Parens (t1, xs, t2)
+    | Angle (t1, xs, t2) ->
+        f t1;
+        iter_token_multi f xs;
+        Option.iter f t2)
 
 let tokens_of_paren xs =
   let g = ref [] in
-  xs |> iter_token_paren (fun tok -> push tok g);
+  xs |> iter_token_paren (fun tok -> Stack_.push tok g);
   List.rev !g
 
 let tokens_of_paren_ordered xs =
   let g = ref [] in
 
   let rec aux_tokens_ordered = function
-    | PToken tok -> push tok g
+    | PToken tok -> Stack_.push tok g
     | Parenthised (xxs, info_parens) ->
         let opar, cpar, commas =
           match info_parens with
@@ -551,16 +543,16 @@ let tokens_of_paren_ordered xs =
               | _ -> raise Impossible)
           | _ -> raise Impossible
         in
-        push opar g;
+        Stack_.push opar g;
         aux_args (xxs, commas);
-        push cpar g
+        Stack_.push cpar g
   and aux_args (xxs, commas) =
     match (xxs, commas) with
     | [], [] -> ()
     | [ xs ], [] -> xs |> List.iter aux_tokens_ordered
     | xs :: ys :: xxs, comma :: commas ->
         xs |> List.iter aux_tokens_ordered;
-        push comma g;
+        Stack_.push comma g;
         aux_args (ys :: xxs, commas)
     | _ -> raise Impossible
   in
@@ -571,18 +563,18 @@ let tokens_of_paren_ordered xs =
 let tokens_of_multi_grouped xs =
   let res = ref [] in
 
-  let add x = Common.push x res in
+  let add x = Stack_.push x res in
 
   let rec aux xs =
     xs
     |> List.iter (function
-         | Tok t1 -> add t1
-         | Braces (t1, xs, t2)
-         | Parens (t1, xs, t2)
-         | Angle (t1, xs, t2) ->
-             add t1;
-             aux xs;
-             Option.iter add t2)
+      | Tok t1 -> add t1
+      | Braces (t1, xs, t2)
+      | Parens (t1, xs, t2)
+      | Angle (t1, xs, t2) ->
+          add t1;
+          aux xs;
+          Option.iter add t2)
   in
   aux xs;
   List.rev !res
@@ -606,7 +598,7 @@ let vof_context = function
 
 let vof_token_extended t =
   let info = TH.info_of_tok t.t in
-  let str = PI.str_of_info info in
+  let str = Tok.content_of_tok info in
   let xs = List.map vof_context t.where in
   OCaml.VTuple [ OCaml.VString str; OCaml.VList xs ]
 

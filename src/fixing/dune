@@ -3,9 +3,13 @@
  (name semgrep_fixing)
  (wrapped false)
  (libraries
+   base
+   collections
    commons
    semgrep.parsing
    semgrep.printing
+   semgrep.reporting
  )
- (preprocess (pps ppx_deriving.show ppx_profiling))
+ (inline_tests)
+ (preprocess (pps ppx_deriving.show ppx_profiling ppx_inline_test commons.ppx))
 )

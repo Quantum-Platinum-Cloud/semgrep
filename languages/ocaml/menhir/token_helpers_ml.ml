@@ -14,7 +14,7 @@
  *)
 
 open Parser_ml
-module PI = Parse_info
+module PI = Lib_ast_fuzzy
 
 (*****************************************************************************)
 (* Token Helpers *)
@@ -67,7 +67,7 @@ let visitor_info_of_tok f = function
   | TUnknown ii -> TUnknown (f ii)
   | EOF ii -> EOF (f ii)
   | TSharpDirective ii -> TSharpDirective (f ii)
-  | TInt (s, ii) -> TInt (s, f ii)
+  | TInt pi -> TInt (Parsed_int.map_tok f pi)
   | TFloat (s, ii) -> TFloat (s, f ii)
   | TChar (s, ii) -> TChar (s, f ii)
   | TString (s, ii) -> TString (s, f ii)
@@ -192,7 +192,7 @@ let info_of_tok tok =
       ii)
     tok
   |> ignore;
-  Common2.some !res
+  Option.get !res
 
 (*****************************************************************************)
 (* Accessors *)
@@ -200,4 +200,4 @@ let info_of_tok tok =
 
 let line_of_tok tok =
   let info = info_of_tok tok in
-  PI.line_of_info info
+  Tok.line_of_tok info

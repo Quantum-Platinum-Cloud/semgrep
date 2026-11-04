@@ -4,14 +4,15 @@
 #
 # This script relies on the SEMGREP_RELEASE_NEXT_VERSION env variable being set.
 # This script is usually called by 'make release', which is itself called by
-# .github/workflows/start-release.yml which sets SEMGREP_RELEASE_NEXT_VERSION.
+# .github/workflows/start-release.jsonnet which sets SEMGREP_RELEASE_NEXT_VERSION.
 
 case "$(uname -s)" in
-  Linux)
-    os_type=linux
-    ;;
-  *)
-    os_type=Darwin
+Linux)
+  os_type=linux
+  ;;
+*)
+  os_type=Darwin
+  ;;
 esac
 
 sed_in_place() {
@@ -36,10 +37,15 @@ update_init_py() {
   git add "$target"
 }
 
+# coupling: .github/workflows/pro-release.jsonnet
+# coupling: OSS/.github/workflows/start-release.jsonnet
 update_version_ml() {
-  target=semgrep-core/src/core_cli/version.ml
+  # The coupled files check for this exact path for the presence
+  # of the version string below.
+  target=src/core/Version.ml
   targets+=" $target"
   echo "Updating $target"
+  # The coupled files check for this exact string formatting.
   sed_in_place 's/let version = ".*"/let version = "'"$release"'"/g' "$target"
   git add "$target"
 }
@@ -57,13 +63,44 @@ update_setup_py() {
   git add "$target"
 }
 
-update_cli_setup_py() {
-  target=cli/setup.py
+update_pyproject_toml() {
+  target=cli/pyproject.toml
   targets+=" $target"
   echo "Updating $target"
   sed_in_place \
-    's/^    version=".*",$/    version="'"$release"'",/g' \
+    's/^version = ".*"$/version = "'"$release"'"/g' \
     "$target"
+  git add "$target"
+}
+
+update_uv_lock() {
+  target=cli/uv.lock
+  targets+=" $target"
+  echo "Updating $target"
+  (
+    cd cli
+    uv lock
+  )
+  numstat_output=$(git diff --numstat -- "$target")
+  IFS=$'\t' read -r added_lines removed_lines _ <<<"$numstat_output"
+  # Expect only the Semgrep version line to change.
+  if [ "$added_lines" != "1" ] || [ "$removed_lines" != "1" ]; then
+    printf '%s\n' "$numstat_output" >&2
+    git diff "$target" >&2
+    error <<EOF
+uv lock changed $target beyond the expected one-line replacement.
+EOF
+  fi
+  git add "$target"
+}
+
+update_interfaces_version() {
+  target=cli/src/semgrep/semgrep_interfaces/.semgrep-version
+  targets+=" $target"
+  echo "Updating $target"
+  sed_in_place \
+      's/^Tracking Semgrep version is v.*.$/Tracking Semgrep version is v'"$release"'./g' \
+      "$target"
   git add "$target"
 }
 
@@ -74,23 +111,25 @@ update_cli_setup_py() {
 bump() {
   update_init_py
   update_setup_py
-  update_cli_setup_py
+  update_pyproject_toml
+  update_uv_lock
   update_version_ml
+  update_interfaces_version
 }
 
 release="${SEMGREP_RELEASE_NEXT_VERSION}"
 
 case "$release" in
-  *.*.*)
-    ;;
-  '')
-    error "empty release ID"
-    ;;
-  *)
-    error "suspicious release ID"
+*.*.*) ;;
+'')
+  error "empty release ID"
+  ;;
+*)
+  error "suspicious release ID"
+  ;;
 esac
 
-rel_branch=release-$release
+rel_branch="${SEMGREP_RELEASE_BRANCH}"
 cur_branch=$(git branch --show-current)
 
 if [[ "$cur_branch" = "$rel_branch" ]]; then
@@ -106,7 +145,7 @@ fi
 
 bump
 
-if git status -s | grep -vq 'cli/src/semgrep/__init__.py\|cli/setup.py\|setup.py\|semgrep-core/src/core_cli/version.ml'; then
+if git status -s | grep -vq 'cli/src/semgrep/__init__.py\|cli/setup.py\|setup.py\|src/core/Version.ml\|../scripts/run-pro-benchmarks.sh\|cli/pyproject.toml\|cli/uv.lock\|cli/src/semgrep/semgrep_interfaces/\.semgrep-version'; then
   error <<EOF
 The release branch contains unexpected changes, cancelling release.
 EOF

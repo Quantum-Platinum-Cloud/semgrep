@@ -1,6 +1,18 @@
+(*
+   Copyright (c) 2022-2024 Semgrep Inc.
+
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
 (* tokens *)
 open Parser_cpp
-module PI = Parse_info
+module PI = Lib_ast_fuzzy
 
 (*****************************************************************************)
 (* Is_xxx, categories *)
@@ -396,7 +408,7 @@ let visitor_info_of_tok f = function
   | TAssign (x, i) -> TAssign (x, f i)
   | TIdent (s, i) -> TIdent (s, f i)
   | TIdent_Typedef (s, i) -> TIdent_Typedef (s, f i)
-  | TInt (s, i) -> TInt (s, f i)
+  | TInt pi -> TInt (Parsed_int.map_tok f pi)
   (* cppext: *)
   | TDefine i1 -> TDefine (f i1)
   | TUndef (s, i1) -> TUndef (s, f i1)
@@ -415,6 +427,8 @@ let visitor_info_of_tok f = function
   | TIdent_MacroIterator (s, i) -> TIdent_MacroIterator (s, f i)
   | TIdent_MacroDecl (s, i) -> TIdent_MacroDecl (s, f i)
   | Tconst_MacroDeclConst i -> Tconst_MacroDeclConst (f i)
+  | Tfinal i -> Tfinal (f i)
+  | Toverride i -> Toverride (f i)
   (*  | TMacroTop          (s,i) -> TMacroTop             (s,f i) *)
   | TCPar_EOL i -> TCPar_EOL (f i)
   | TAny_Action i -> TAny_Action (f i)
@@ -574,7 +588,7 @@ let info_of_tok tok =
   |> ignore;
   match !res with
   | Some x -> x
-  | None -> Parse_info.unsafe_fake_info "NOTOK"
+  | None -> Tok.unsafe_fake_tok "NOTOK"
 
 (*****************************************************************************)
 (* Accessors *)
@@ -582,4 +596,4 @@ let info_of_tok tok =
 
 let line_of_tok tok =
   let info = info_of_tok tok in
-  PI.line_of_info info
+  Tok.line_of_tok info

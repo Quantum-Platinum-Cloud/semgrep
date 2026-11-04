@@ -15,19 +15,13 @@
  *)
 open Common
 module Flag = Flag_parsing
-module PI = Parse_info
 module T = Parser_cpp
 module TH = Token_helpers_cpp
 
 (*****************************************************************************)
 (* Wrappers *)
 (*****************************************************************************)
-let pr2_err, _pr2_once = Common2.mk_pr2_wrappers Flag.verbose_parsing
-let pr2_err s = pr2_err ("ERROR_RECOV: " ^ s)
-
-(*****************************************************************************)
-(* Helpers *)
-(*****************************************************************************)
+let pr2_err s = Printf.eprintf "ERROR_RECOV: %s" s
 
 (*****************************************************************************)
 (* Skipping stuff, find next "synchronisation" point *)
@@ -62,14 +56,14 @@ let rec find_next_synchro ~next ~already_passed =
   else
     let before, after =
       last_round
-      |> Common.span (fun tok ->
-             match tok with
-             (* by looking at TOBrace we are sure that the "start of something"
-              * will not arrive too early
-              *)
-             | T.TOBrace _ -> false
-             | T.TDefine _ -> false
-             | _ -> true)
+      |> List_.span (fun tok ->
+          match tok with
+          (* by looking at TOBrace we are sure that the "start of something"
+           * will not arrive too early
+           *)
+          | T.TOBrace _ -> false
+          | T.TDefine _ -> false
+          | _ -> true)
     in
     find_next_synchro_orig (after @ next) (List.rev before)
 
@@ -88,8 +82,8 @@ and find_next_synchro_orig next already_passed =
   | [] ->
       pr2_err "end of file while in recovery mode";
       (already_passed, [])
-  | (T.TCBrace i as v) :: xs when PI.col_of_info i =|= 0 -> (
-      pr2_err (spf "found sync '}' at line %d" (PI.line_of_info i));
+  | (T.TCBrace i as v) :: xs when Tok.col_of_tok i =|= 0 -> (
+      pr2_err (spf "found sync '}' at line %d" (Tok.line_of_tok i));
 
       match xs with
       | [] -> raise Impossible (* there is a EOF token normally *)
@@ -108,7 +102,7 @@ and find_next_synchro_orig next already_passed =
       | _ -> (v :: already_passed, xs))
   | v :: xs ->
       let info = TH.info_of_tok v in
-      if PI.col_of_info info =|= 0 && TH.is_start_of_something v then (
-        pr2_err (spf "found sync col 0 at line %d " (PI.line_of_info info));
+      if Tok.col_of_tok info =|= 0 && TH.is_start_of_something v then (
+        pr2_err (spf "found sync col 0 at line %d " (Tok.line_of_tok info));
         (already_passed, v :: xs))
       else find_next_synchro_orig xs (v :: already_passed)

@@ -1,7 +1,14 @@
-exception Error of string * Parse_info.t
+(*
+   Copyright (c) 2022-2024 Semgrep Inc.
 
-(* TODO: at some point we probably would prefer an AST_generic.program
- * which could track the origin of tokens through import, eval, and
- * manifestation and that we could pass to osemgrep to evaluate the rules.
- *)
-val manifest_value : Value_jsonnet.value_ -> JSON.t
+   This library is free software; you can redistribute it and/or
+   modify it under the terms of the GNU Lesser General Public License
+   version 2.1 as published by the Free Software Foundation.
+
+   This library is distributed in the hope that it will be useful, but
+   WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+   LICENSE for more details.
+*)
+(* Now just an alias for Eval_jsonnet.manifest_value() *)
+val manifest_value : Value_jsonnet.t -> JSON.t

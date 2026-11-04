@@ -1,6 +1,6 @@
 (* Yoann Padioleau
  *
- * Copyright (C) 2019-2022 r2c
+ * Copyright (C) 2019-2023 Semgrep Inc.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public License
@@ -12,249 +12,78 @@
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the file
  * LICENSE for more details.
  *)
-
-open Common
+open Fpath_.Operators
+open Pfff_or_tree_sitter
+module Res = Parsing_result2
 module Flag = Flag_semgrep
-module PI = Parse_info
-module E = Semgrep_error_code
-module Out = Output_from_core_t
-module OutH = Output_from_core_util
-
-let logger = Logging.get_logger [ __MODULE__ ]
-
-(* To get a better backtrace, to better debug parse errors *)
-let debug_exn = ref false
+module E = Core_error
+module OutJ = Semgrep_output_v1_t
+module Log = Log_parsing.Log
 
 (*****************************************************************************)
 (* Prelude *)
 (*****************************************************************************)
-(* Mostly a wrapper around pfff Parse_generic, but which can also use
- * tree-sitter parsers when possible.
+(* Parsing a target, using menhir or tree-sitter parsers or both
+ * depending on the language.
  *)
-
-(*****************************************************************************)
-(* Types *)
-(*****************************************************************************)
-
-type parsing_result = {
-  ast : AST_generic.program;
-  (* partial errors tree-sitter was able to recover from *)
-  skipped_tokens : PI.token_location list;
-  stat : Parsing_stat.t;
-}
 
 (*****************************************************************************)
 (* Helpers *)
 (*****************************************************************************)
 
-type 'ast parser =
-  | Pfff of (Common.filename -> 'ast * Parsing_stat.t)
-  | TreeSitter of (Common.filename -> 'ast Tree_sitter_run.Parsing_result.t)
-
-type 'ast internal_result =
-  | Ok of ('ast * Parsing_stat.t)
-  | Partial of 'ast * PI.token_location list * Parsing_stat.t
-  | Error of Exception.t
-
-let loc_of_tree_sitter_error (err : Tree_sitter_run.Tree_sitter_error.t) =
-  let start = err.start_pos in
-  {
-    PI.str = err.substring;
-    charpos = 0;
-    (* fake *)
-    line = start.row + 1;
-    column = start.column;
-    file = err.file.name;
-  }
-
-let exn_of_loc loc =
-  let info = { PI.token = PI.OriginTok loc; transfo = PI.NoTransfo } in
-  PI.Parsing_error info |> Exception.trace
-
-let error_of_tree_sitter_error (err : Tree_sitter_run.Tree_sitter_error.t) =
-  let loc = loc_of_tree_sitter_error err in
-  exn_of_loc loc
-
-let errors_from_skipped_tokens xs =
-  match xs with
-  | [] -> Report.ErrorSet.empty
-  | x :: _ ->
-      let e = exn_of_loc x in
-      let err = E.exn_to_error x.PI.file e in
-      let locs = xs |> Common.map OutH.location_of_token_location in
-      Report.ErrorSet.singleton { err with typ = Out.PartialParsing locs }
-
-let stat_of_tree_sitter_stat file (stat : Tree_sitter_run.Parsing_result.stat) =
-  {
-    Parsing_stat.filename = file;
-    total_line_count = stat.total_line_count;
-    error_line_count = stat.error_line_count;
-    have_timeout = false;
-    commentized = 0;
-    problematic_lines = [];
-    ast_stat = None;
-  }
-
-let (run_parser : 'ast parser -> Common.filename -> 'ast internal_result) =
- fun parser file ->
-  match parser with
-  | Pfff f ->
-      Common.save_excursion Flag_parsing.show_parsing_error false (fun () ->
-          logger#trace "trying to parse with Pfff parser %s" file;
-          try
-            let res = f file in
-            Ok res
-          with
-          | Time_limit.Timeout _ as e -> Exception.catch_and_reraise e
-          | exn ->
-              let e = Exception.catch exn in
-              (* TODO: print where the exception was raised or reraise *)
-              logger#error "exn (%s) with Pfff parser" (Common.exn_to_s exn);
-              Error e)
-  | TreeSitter f -> (
-      logger#trace "trying to parse with TreeSitter parser %s" file;
-      try
-        let res = f file in
-        let stat = stat_of_tree_sitter_stat file res.stat in
-        match (res.program, res.errors) with
-        | None, [] ->
-            let msg =
-              "internal error: failed to recover typed tree from tree-sitter's \
-               untyped tree"
-            in
-            Error (Exception.trace (Failure msg))
-        | Some ast, [] -> Ok (ast, stat)
-        | None, ts_error :: _xs ->
-            let e = error_of_tree_sitter_error ts_error in
-            logger#error "non-recoverable error with TreeSitter parser:\n%s"
-              (Exception.to_string e);
-            Error e
-        | Some ast, x :: xs ->
-            (* Note that the first error is probably the most important;
-             * the following one may be due to cascading effects *)
-            logger#error "partial errors (%d) with TreeSitter parser"
-              (List.length (x :: xs));
-            let locs = x :: xs |> Common.map loc_of_tree_sitter_error in
-            Partial (ast, locs, stat)
-      with
-      | Time_limit.Timeout _ as e -> Exception.catch_and_reraise e
-      (* to get correct stack trace on parse error *)
-      | exn when !debug_exn -> Exception.catch_and_reraise exn
-      | exn ->
-          let e = Exception.catch exn in
-          logger#error "exn (%s) with TreeSitter parser" (Common.exn_to_s exn);
-          Error e)
-
-let rec (run_either :
-          Common.filename -> 'ast parser list -> 'ast internal_result) =
- fun file xs ->
-  match xs with
-  | [] -> Error (Exception.trace (Failure (spf "no parser found for %s" file)))
-  | p :: xs -> (
-      let res = run_parser p file in
-      match res with
-      | Ok ast -> Ok ast
-      | Partial (ast, errs, stat) -> (
-          let res = run_either file xs in
-          match res with
-          | Ok res -> Ok res
-          | Error e2 ->
-              logger#debug "exn again but return Partial:\n%s"
-                (Exception.to_string e2);
-              (* prefer a Partial to an Error *)
-              Partial (ast, errs, stat)
-          | Partial _ ->
-              logger#debug "Partial again but return first Partial";
-              Partial (ast, errs, stat))
-      | Error e1 -> (
-          let res = run_either file xs in
-          match res with
-          | Ok res -> Ok res
-          | Partial (ast, errs, stat) ->
-              logger#debug "Got now a Partial, better than exn:\n%s"
-                (Exception.to_string e1);
-              Partial (ast, errs, stat)
-          | Error e2 ->
-              logger#debug
-                "exn again but return original exn:\n\
-                 --- new exn (ignored) ---\n\
-                 %s\n\
-                 --- original exn (retained) ---\n\
-                 %s"
-                (Exception.to_string e2) (Exception.to_string e1);
-              (* prefer the first error *)
-              Error e1))
-
-let (run :
-      Common.filename ->
-      'ast parser list ->
-      ('ast -> AST_generic.program) ->
-      parsing_result) =
- fun file xs fconvert ->
-  let xs =
-    match () with
-    | _ when !Flag.tree_sitter_only ->
-        xs
-        |> Common.exclude (function
-             | Pfff _ -> true
-             | _ -> false)
-    | _ when !Flag.pfff_only ->
-        xs
-        |> Common.exclude (function
-             | TreeSitter _ -> true
-             | _ -> false)
-    | _ -> xs
-  in
-  match run_either file xs with
-  | Ok (ast, stat) -> { ast = fconvert ast; skipped_tokens = []; stat }
-  | Partial (ast, skipped_tokens, stat) ->
-      { ast = fconvert ast; skipped_tokens; stat }
-  | Error e -> Exception.reraise e
-
-(* Simplified version of 'run' that allows for plugins to hide the
-   intermediate AST type. *)
-let run_external_parser file
-    (parse :
-      Common.filename -> AST_generic.program Tree_sitter_run.Parsing_result.t) :
-    parsing_result =
-  run file [ TreeSitter parse ] (fun ast -> ast)
-
-let throw_tokens f file =
-  let res = f file in
-  (res.Parsing_result.ast, res.Parsing_result.stat)
-
 let lang_to_python_parsing_mode = function
   | Lang.Python -> Parse_python.Python
   | Lang.Python2 -> Parse_python.Python2
   | Lang.Python3 -> Parse_python.Python3
-  | s -> failwith (spf "not a python language:%s" (Lang.to_string s))
+  | s -> failwith (Common.spf "not a python language:%s" (Lang.to_string s))
 
-let rec just_parse_with_lang lang file =
+(* used by Match_search_mode and Match_tainting_mode *)
+let errors_from_skipped_tokens xs =
+  match xs with
+  | [] -> Core_error.ErrorSet.empty
+  | x :: _ ->
+      let e = exn_of_loc x in
+      let err = E.exn_to_error ~file:x.Loc.pos.file e in
+      let locs =
+        xs |> List.map Semgrep_output_utils.location_of_token_location
+      in
+      Core_error.ErrorSet.singleton { err with typ = OutJ.PartialParsing locs }
+
+(*****************************************************************************)
+(* Entry point *)
+(*****************************************************************************)
+
+let just_parse_with_lang lang file : Parsing_result2.t =
+  begin match lang with
+  | Lang.C when Sys_.Fpath.exists !Flag_parsing_cpp.macros_h ->
+      Parse_cpp.init_defs !Flag_parsing_cpp.macros_h
+  | _ -> ()
+  end;
+
   match lang with
-  | Lang.Ruby ->
-      (* for Ruby we start with the tree-sitter parser because the pfff parser
-       * is not great and some of the token positions may be wrong.
-       *)
+  | Lang.Scala ->
       run file
         [
-          TreeSitter Parse_ruby_tree_sitter.parse;
-          (* right now the parser is verbose and the token positions
-           * may be wrong, but better than nothing. *)
-          Pfff (throw_tokens Parse_ruby.parse);
+          TreeSitter Parse_scala_tree_sitter.parse;
+          Pfff
+            (fun x ->
+              x |> throw_tokens Parse_scala.parse |> fun (x, y) ->
+              (Scala_to_generic.program x, y));
         ]
-        Ruby_to_generic.program
-  | Lang.Java ->
-      run file
-        [
-          (* we used to start with the pfff one; it was quite good and faster
-           * than tree-sitter (because we need to wrap tree-sitter inside
-           * an invoke because of a segfault/memory-leak), but when both parsers
-           * fail, it's better to give the tree-sitter parsing error now.
-           *)
-          TreeSitter Parse_java_tree_sitter.parse;
-          Pfff (throw_tokens Parse_java.parse);
-        ]
-        Java_to_generic.program
+        Fun.id
+  | Lang.Yaml ->
+      {
+        ast = Yaml_to_generic.program file;
+        errors = [];
+        skipped_tokens = [];
+        inserted_tokens = [];
+        tolerated_errors = [];
+        stat = Parsing_stat.default_stat !!file;
+      }
+  (* Tree-sitter for C and C++ targets; Menhir is used for patterns. *)
+  | Lang.C
+  | Lang.Cpp ->
+      run file [ TreeSitter Parse_cpp_tree_sitter.parse ] Cpp_to_generic.program
   | Lang.Go ->
       run file
         [
@@ -262,6 +91,10 @@ let rec just_parse_with_lang lang file =
           Pfff (throw_tokens Parse_go.parse);
         ]
         Go_to_generic.program
+  | Lang.Java ->
+      run file
+        [ TreeSitter Parse_java_tree_sitter.parse ]
+        Java_to_generic.program
   | Lang.Js ->
       (* we start directly with tree-sitter here, because
        * the pfff parser is slow on minified files due to its (slow) error
@@ -273,54 +106,6 @@ let rec just_parse_with_lang lang file =
           Pfff (throw_tokens Parse_js.parse);
         ]
         Js_to_generic.program
-  | Lang.Ts ->
-      run file
-        [ TreeSitter (Parse_typescript_tree_sitter.parse ?dialect:None) ]
-        Js_to_generic.program
-  (* there is no pfff parsers for C#/Kotlin/... so let's go directly to
-   *  tree-sitter, and there's no ast_xxx.ml either so we directly generate
-   * a generic AST (no xxx_to_generic here)
-   *)
-  | Lang.Csharp ->
-      run file [ TreeSitter Parse_csharp_tree_sitter.parse ] (fun x -> x)
-  | Lang.Kotlin ->
-      run file [ TreeSitter Parse_kotlin_tree_sitter.parse ] (fun x -> x)
-  | Lang.Solidity ->
-      run file [ TreeSitter Parse_solidity_tree_sitter.parse ] (fun x -> x)
-  | Lang.Swift ->
-      run file [ TreeSitter Parse_swift_tree_sitter.parse ] (fun x -> x)
-  | Lang.Elixir ->
-      run file [ TreeSitter Parse_elixir_tree_sitter.parse ] (fun x -> x)
-  | Lang.Dart ->
-      run file [ TreeSitter Parse_dart_tree_sitter.parse ] (fun x -> x)
-  | Lang.Julia ->
-      run file [ TreeSitter Parse_julia_tree_sitter.parse ] (fun x -> x)
-  | Lang.Lua -> run file [ TreeSitter Parse_lua_tree_sitter.parse ] (fun x -> x)
-  | Lang.Bash ->
-      run file [ TreeSitter Parse_bash_tree_sitter.parse ] (fun x -> x)
-  | Lang.Dockerfile ->
-      run file [ TreeSitter Parse_dockerfile_tree_sitter.parse ] (fun x -> x)
-  | Lang.Rust ->
-      run file [ TreeSitter Parse_rust_tree_sitter.parse ] (fun x -> x)
-  | Lang.C ->
-      run file
-        [
-          (* this internally uses the CST for c++ *)
-          Pfff (throw_tokens Parse_c.parse);
-          TreeSitter Parse_c_tree_sitter.parse;
-        ]
-        C_to_generic.program
-  (* use pfff *)
-  | Lang.Python
-  | Lang.Python2
-  | Lang.Python3 ->
-      let parsing_mode = lang_to_python_parsing_mode lang in
-      run file
-        [
-          Pfff (throw_tokens (Parse_python.parse ~parsing_mode));
-          TreeSitter Parse_python_tree_sitter.parse;
-        ]
-        Python_to_generic.program
   | Lang.Json ->
       run file
         [
@@ -329,29 +114,13 @@ let rec just_parse_with_lang lang file =
               (Parse_json.parse_program file, Parsing_stat.correct_stat file));
         ]
         Json_to_generic.program
-  | Lang.Jsonnet -> failwith "Jsonnet is not supported yet"
-  | Lang.Clojure ->
-      run file [ TreeSitter Parse_clojure_tree_sitter.parse ] (fun x -> x)
-  | Lang.Lisp -> failwith "Lisp is not supported yet"
-  | Lang.Scheme -> failwith "Scheme is not supported yet"
-  | Lang.Cpp ->
-      run file
-        [
-          TreeSitter Parse_cpp_tree_sitter.parse;
-          Pfff (throw_tokens Parse_cpp.parse);
-        ]
-        Cpp_to_generic.program
   | Lang.Ocaml ->
       run file
         [
-          Pfff (throw_tokens Parse_ml.parse);
           TreeSitter Parse_ocaml_tree_sitter.parse;
+          Pfff (throw_tokens Parse_ml.parse);
         ]
-        Ml_to_generic.program
-  | Lang.Scala ->
-      run file
-        [ Pfff (throw_tokens Parse_scala.parse) ]
-        Scala_to_generic.program
+        Ocaml_to_generic.program
   | Lang.Php ->
       run file
         [
@@ -369,81 +138,163 @@ let rec just_parse_with_lang lang file =
           TreeSitter Parse_php_tree_sitter.parse;
         ]
         Php_to_generic.program
+  | Lang.Python
+  | Lang.Python2
+  | Lang.Python3 ->
+      let parsing_mode = lang_to_python_parsing_mode lang in
+      run file
+        [
+          Pfff (throw_tokens (Parse_python.parse ~parsing_mode));
+          TreeSitter Parse_python_tree_sitter.parse;
+        ]
+        Python_to_generic.program
+  (* Tree-sitter only *)
+  | Lang.Bash ->
+      run file
+        [ TreeSitter Parse_bash_tree_sitter.parse ]
+        Bash_to_generic.program
+  | Lang.Dockerfile ->
+      run file
+        [ TreeSitter Parse_dockerfile_tree_sitter.parse ]
+        Dockerfile_to_generic.program
+  | Lang.Jsonnet ->
+      run file
+        [ TreeSitter Parse_jsonnet_tree_sitter.parse ]
+        Jsonnet_to_generic.program
+  | Lang.Terraform ->
+      run file
+        [ TreeSitter Parse_terraform_tree_sitter.parse ]
+        Terraform_to_generic.program
+  | Lang.Ts ->
+      run file
+        [ TreeSitter (Parse_typescript_tree_sitter.parse ?dialect:None) ]
+        Js_to_generic.program
+  | Lang.Vue -> failwith "Vue support has been removed in 1.93.0"
+  (* there is no pfff parsers for C#/Kotlin/... so let's just use
+   * tree-sitter, and there's no ast_xxx.ml either so we directly generate
+   * a generic AST (no calls to an xxx_to_generic() below)
+   *)
+  | Lang.Cairo ->
+      run file [ TreeSitter Parse_cairo_tree_sitter.parse ] (fun x -> x)
+  | Lang.Ruby ->
+      run file
+        [ TreeSitter Parse_ruby_tree_sitter.parse ]
+        Ruby_to_generic.program
+  | Lang.Dart ->
+      run file [ TreeSitter Parse_dart_tree_sitter.parse ] (fun x -> x)
   | Lang.Hack ->
       run file [ TreeSitter Parse_hack_tree_sitter.parse ] (fun x -> x)
-  | Lang.R -> run file [ TreeSitter Parse_r_tree_sitter.parse ] (fun x -> x)
-  | Lang.Yaml ->
-      {
-        ast = Yaml_to_generic.program file;
-        skipped_tokens = [];
-        stat = Parsing_stat.default_stat file;
-      }
-  | Lang.Html ->
+  | Lang.Html
+  (* TODO: there is now https://github.com/ObserverOfTime/tree-sitter-xml
+   * which we could use for XML instead of abusing tree-sitter-html
+   *)
+  | Lang.Xml ->
       (* less: there is an html parser in pfff too we could use as backup *)
       run file [ TreeSitter Parse_html_tree_sitter.parse ] (fun x -> x)
-  | Lang.Vue ->
-      let parse_embedded_js file =
-        let { ast; skipped_tokens; stat = _ } =
-          just_parse_with_lang Lang.Js file
-        in
-        (* TODO: pass the errors down to Parse_vue_tree_sitter.parse
-         * and accumulate with other vue parse errors
-         *)
-        if skipped_tokens <> [] then failwith "parse error in embedded JS";
-        ast
+  | Lang.Julia ->
+      run file [ TreeSitter Parse_julia_tree_sitter.parse ] (fun x -> x)
+  | Lang.Kotlin ->
+      run file [ TreeSitter Parse_kotlin_tree_sitter.parse ] (fun x -> x)
+  | Lang.Fga -> run file [ TreeSitter Parse_fga_tree_sitter.parse ] (fun x -> x)
+  | Lang.Lisp
+  | Lang.Scheme
+  | Lang.Clojure ->
+      run file [ TreeSitter Parse_clojure_tree_sitter.parse ] (fun x -> x)
+  | Lang.Lua -> run file [ TreeSitter Parse_lua_tree_sitter.parse ] (fun x -> x)
+  | Lang.Promql ->
+      run file [ TreeSitter Parse_promql_tree_sitter.parse ] (fun x -> x)
+  | Lang.Protobuf ->
+      run file [ TreeSitter Parse_protobuf_tree_sitter.parse ] (fun x -> x)
+  | Lang.Rust ->
+      run file [ TreeSitter Parse_rust_tree_sitter.parse ] (fun x -> x)
+  | Lang.Solidity ->
+      run file [ TreeSitter Parse_solidity_tree_sitter.parse ] (fun x -> x)
+  | Lang.Swift ->
+      run file [ TreeSitter Parse_swift_tree_sitter.parse ] (fun x -> x)
+  | Lang.Objc ->
+      run file [ TreeSitter Parse_objc_tree_sitter.parse ] (fun x -> x)
+  | Lang.R -> run file [ TreeSitter Parse_r_tree_sitter.parse ] (fun x -> x)
+  | Lang.Move_on_sui ->
+      run file [ TreeSitter Parse_move_on_sui_tree_sitter.parse ] (fun x -> x)
+  | Lang.Move_on_aptos ->
+      run file [ TreeSitter Parse_move_on_aptos_tree_sitter.parse ] (fun x -> x)
+  | Lang.Circom ->
+      run file [ TreeSitter Parse_circom_tree_sitter.parse ] (fun x -> x)
+  (* External proprietary parsers. The parsers need to register themselves
+   * for parsing to take place.
+   *)
+  | Lang.Apex -> run_external_parser file Parsing_plugin.Apex.parse_target
+  | Lang.Csharp ->
+      let parse_target =
+        (* Use the proprietary parser if available *)
+        if Parsing_plugin.Csharp.is_available () then
+          Parsing_plugin.Csharp.parse_target
+        else Parse_csharp_tree_sitter.parse
       in
-      run file
-        [ TreeSitter (Parse_vue_tree_sitter.parse parse_embedded_js) ]
-        (fun x -> x)
-  | Lang.Hcl -> run file [ TreeSitter Parse_hcl_tree_sitter.parse ] (fun x -> x)
-  | Lang.Apex ->
-      (* Proprietary. The actual parser needs to register itself for
-         parsing to take place. *)
-      run_external_parser file Parsing_plugin.Apex.parse_target
-  [@@profiling]
+      run file [ TreeSitter parse_target ] (fun x -> x)
+  | Lang.Elixir -> run_external_parser file Parsing_plugin.Elixir.parse_target
+  | Lang.Gosu -> run_external_parser file Parsing_plugin.Gosu.parse_target
+  | Lang.Powershell ->
+      run_external_parser file Parsing_plugin.Powershell.parse_target
 
-(*****************************************************************************)
-(* Entry point *)
-(*****************************************************************************)
+let run_analyses_after_name_resolution lang ast =
+  Typing.check_program lang ast;
+
+  Implicit_return.mark_implicit_return lang ast;
+
+  (* Flow-insensitive constant propagation. *)
+  Constant_propagation.propagate_basic lang ast;
+
+  (* Flow-sensitive constant propagation. *)
+  Constant_propagation.propagate_dataflow lang ast
+
+let just_resolve_name lang ast =
+  Naming_AST.resolve lang ast;
+  run_analyses_after_name_resolution lang ast
 
 let parse_and_resolve_name lang file =
-  if lang =*= Lang.C && Sys.file_exists !Flag_parsing_cpp.macros_h then
-    Parse_cpp.init_defs !Flag_parsing_cpp.macros_h;
-
   let res = just_parse_with_lang lang file in
   let ast = res.ast in
-
-  (* to be deterministic, reset the gensym; anyway right now semgrep is
-   * used only for local per-file analysis, so no need to have a unique ID
-   * among a set of files in a project like codegraph.
-   *)
-  AST_generic.SId.unsafe_reset_counter ();
-  Naming_AST.resolve lang ast;
-  Constant_propagation.propagate_basic lang ast;
-  Constant_propagation.propagate_dataflow lang ast;
-  if !Flag.use_bloom_filter then Bloom_annotation.annotate_program ast;
-
-  logger#info "Parse_target.parse_and_resolve_name_use_pfff_or_treesitter done";
+  just_resolve_name lang ast;
+  Log.info (fun m -> m "Parse_target.parse_and_resolve_name done");
   res
-  [@@profiling]
+[@@profiling]
 
 (* used in test files *)
 let parse_and_resolve_name_warn_if_partial lang file =
-  let { ast; skipped_tokens; _ } = parse_and_resolve_name lang file in
-  if skipped_tokens <> [] (* nosemgrep *) then
-    pr2 (spf "WARNING: fail to fully parse %s" file);
+  let { ast; errors; _ } : Res.t = parse_and_resolve_name lang file in
+  (match errors with
+  | [] -> ()
+  | _ ->
+      (* nosemgrep: no-logs-in-library *)
+      Logs.warn (fun m -> m "fail to fully parse %s" !!file));
   ast
 
+let fail_on_errors errors =
+  match errors with
+  | [] -> ()
+  | errors ->
+      let error_strs =
+        List.map (fun (Tree_sitter_error err : Res.error) -> err.msg) errors
+      in
+      failwith (String.concat "\n" error_strs)
+
 let parse_and_resolve_name_fail_if_partial lang file =
-  let { ast; skipped_tokens; _ } = parse_and_resolve_name lang file in
-  if skipped_tokens <> [] then failwith (spf "fail to fully parse %s" file);
+  let { ast; errors; _ } : Res.t = parse_and_resolve_name lang file in
+  fail_on_errors errors;
+  ast
+
+let parse_and_resolve_name_strict lang file =
+  let { ast; errors; tolerated_errors; _ } : Res.t =
+    parse_and_resolve_name lang file
+  in
+  fail_on_errors (errors @ tolerated_errors);
   ast
 
 (*****************************************************************************)
 (* For testing purpose *)
 (*****************************************************************************)
-(* was in pfff/.../Parse_generic.ml before *)
 let parse_program file =
-  let lang = List.hd (Lang.langs_of_filename file) in
+  let lang = Lang.lang_of_filename_exn file in
   let res = just_parse_with_lang lang file in
   res.ast

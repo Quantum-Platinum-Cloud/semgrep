@@ -1,3 +1,15 @@
+#
+# Copyright (c) 2022-2025 Semgrep Inc.
+#
+# This library is free software; you can redistribute it and/or
+# modify it under the terms of the GNU Lesser General Public License
+# version 2.1 as published by the Free Software Foundation.
+#
+# This library is distributed in the hope that it will be useful, but
+# WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the file
+# LICENSE for more details.
+#
 import os
 from pathlib import Path
 from typing import Iterable
@@ -14,6 +26,11 @@ from semgrep.constants import SETTINGS_FILENAME
 
 def url(value: str) -> str:
     return value.rstrip("/")
+
+
+def migrate_fail_open_url(value: str) -> str:
+    # Supports the fail_open_url being the hostname without the path even when some folks might set the path
+    return url(value.replace("/failure", ""))
 
 
 @overload
@@ -53,21 +70,24 @@ class Env:
     fail_open_url: str = field(
         default=EnvFactory(
             ["SEMGREP_FAIL_OPEN_URL"],
-            "https://fail-open.prod.semgrep.dev/failure",
+            "https://fail-open.prod.semgrep.dev",
         ),
-        converter=url,
+        converter=migrate_fail_open_url,
     )
     semgrep_url: str = field(
         default=EnvFactory(["SEMGREP_URL", "SEMGREP_APP_URL"], "https://semgrep.dev"),
         converter=url,
     )
-    shouldafound_base_url: str = field(
-        default=EnvFactory(
-            "SEMGREP_SHOULDAFOUND_BASE_URL", "https://shouldafound.semgrep.dev"
-        ),
-        converter=url,
-    )
     app_token: Optional[str] = field(default=EnvFactory("SEMGREP_APP_TOKEN"))
+
+    # Unique identifier for the managed_scan in semgrep-app
+    sms_scan_id: Optional[str] = field(default=EnvFactory("SEMGREP_MANAGED_SCAN_ID"))
+    # Preserve supplied empty values so the backend can distinguish invalid context from absence.
+    job_context: Optional[str] = field()
+
+    @job_context.default
+    def job_context_default(self) -> Optional[str]:
+        return os.getenv("SEMGREP_JOB_CONTEXT")
 
     version_check_url: str = field(
         default=EnvFactory(
@@ -87,8 +107,18 @@ class Env:
     in_docker: bool = field()
     in_gh_action: bool = field()
     in_agent: bool = field()
-    shouldafound_no_email: bool = field()
+    with_new_cli_ux: bool = field()
+    mock_using_registry: bool = field()
     min_fetch_depth: int = field()
+
+    upload_findings_timeout: int = field()
+
+    v2_poll_timeout_seconds: int = field()
+    v2_post_max_attempts: int = field()
+    v2_overall_timeout_minutes: int = field()
+
+    claude_project_dir: Optional[str] = field(default=EnvFactory("CLAUDE_PROJECT_DIR"))
+    cursor_project_dir: Optional[str] = field(default=EnvFactory("CURSOR_PROJECT_DIR"))
 
     @version_check_timeout.default
     def version_check_timeout_default(self) -> int:
@@ -100,7 +130,12 @@ class Env:
         value = os.getenv("SEMGREP_VERSION_CACHE_PATH")
         if value:
             return Path(value)
-        return Path.home() / ".cache" / "semgrep_version"
+        cache_home = os.getenv("XDG_CACHE_HOME")
+        if cache_home and Path(cache_home).is_dir():
+            parent_dir = Path(cache_home)
+        else:
+            parent_dir = Path.home() / ".cache"
+        return parent_dir / "semgrep_version"
 
     @git_command_timeout.default
     def git_command_timeout_default(self) -> int:
@@ -147,11 +182,35 @@ class Env:
     def in_agent_default(self) -> bool:
         return "SEMGREP_AGENT" in os.environ
 
-    @shouldafound_no_email.default
-    def shouldafound_no_email_default(self) -> bool:
-        return "SEMGREP_SHOULDAFOUND_NO_EMAIL" in os.environ
+    @with_new_cli_ux.default
+    def with_new_cli_default(self) -> bool:
+        return os.environ.get("SEMGREP_NEW_CLI_UX", "0") == "1"
+
+    @mock_using_registry.default
+    def with_mock_using_registry(self) -> bool:
+        return "MOCK_USING_REGISTRY" in os.environ
 
     @min_fetch_depth.default
     def min_fetch_depth_default(self) -> int:
         value = os.getenv("SEMGREP_GHA_MIN_FETCH_DEPTH", "0")
+        return int(value)
+
+    @upload_findings_timeout.default
+    def upload_findings_timeout_default(self) -> int:
+        value = os.getenv("SEMGREP_UPLOAD_FINDINGS_TIMEOUT", "300")
+        return int(value)
+
+    @v2_poll_timeout_seconds.default
+    def v2_poll_timeout_seconds_default(self) -> int:
+        value = os.getenv("SEMGREP_V2_POLL_TIMEOUT_SECONDS", "180")
+        return int(value)
+
+    @v2_post_max_attempts.default
+    def v2_post_max_attempts_default(self) -> int:
+        value = os.getenv("SEMGREP_V2_POST_MAX_ATTEMPTS", "3")
+        return int(value)
+
+    @v2_overall_timeout_minutes.default
+    def v2_overall_timeout_minutes_default(self) -> int:
+        value = os.getenv("SEMGREP_V2_OVERALL_TIMEOUT_MINUTES", "9")
         return int(value)
